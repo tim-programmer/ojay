@@ -241,7 +241,8 @@ Implemented:
 * Procedures: default and named arguments, multiple return values,
   variadic `..T` parameters, procedure values, nested (non-capturing)
   procedures, order-independent top-level declarations, `#foreign` /
-  `#c_call` with `#system_library`
+  `#c_call` with `#system_library`, structs and unions by value across the
+  C boundary, `#program_export` (see *C interop* below)
 * Overloading: procedures with the same name in a scope form an overload set
   (also across imported modules; user procedures can overload built-ins such
   as `max`). The best fit wins: exact types, then constants that fit, then
@@ -317,13 +318,74 @@ Implemented:
 Not yet implemented: `#compiler` procedures and the compiler message loop
 (`#run,stallable`), `Code_Node` introspection (`compiler_get_nodes`),
 `#insert,scope(...)`, `#caller_location` / `#location`,
-`#procedure_of_call`, `#foreign`
-procedures that pass or return structs by value, `using` on pointer members
+`#procedure_of_call`, variadic `#foreign` procedures (C varargs), `using` on pointer members
 and at top level, `#as`, Basic's `log` (the context has a logger; call
 `context.logger` directly), threads and thread contexts. Polymorphism does not yet cover `$$` auto-baking,
 `#bake_arguments`, `$T/Interface` constraints, `$R` introduced in a return
 type, `#modify` on structs, or polymorphic procedure values (using a template
 without calling it).
+
+### C interop
+
+```jai
+libc :: #system_library "libc";
+div_t :: struct { quot, rem: s32; }
+div :: (numer: s32, denom: s32) -> div_t #foreign libc;   // a C function
+
+Vec3 :: struct { x, y, z: float32; }
+scale :: (v: Vec3, k: float32) -> Vec3 #c_call { return .{v.x * k, v.y * k, v.z * k}; }
+apply :: (f: (Vec3, float32) -> Vec3 #c_call, v: Vec3) -> Vec3 #foreign;  // C calls f back
+on_event :: (e: Event) -> s32 #c_call #program_export "app_on_event" { ... }  // C calls it by name
+```
+
+* `#foreign` procedures are C functions; `#c_call` procedures are Jai
+  procedures with the C calling convention, which C can call through a
+  function pointer (a procedure value) or, with `#program_export` (optionally
+  `#program_export "symbol"`), by name. Calling a `#c_call` procedure from Jai,
+  directly or through a value of a `#c_call` procedure type, uses the C
+  convention too.
+* Parameters and results can be integers, floats, `bool`, enums, pointers,
+  procedure values, structs (nested, with fixed arrays) and unions. A Jai
+  struct has the C layout of the same members in order: write the C side as
+  `typedef struct { int8_t a; double d; } ID;` for `ID :: struct { a: s8;
+  d: float64; }`; `bool` is C's `bool`, an `enum u8` is a `uint8_t`, `[3]u8` is
+  `uint8_t name[3]`. Inside a struct, a `string` or `[]T` member is
+  `struct { int64_t count; T *data; }` and an `Any` is two pointers.
+* Not C types, so rejected as a parameter or result: `string`, array views,
+  dynamic arrays, `Any`, `Type` and fixed arrays (C passes arrays as
+  pointers; put the array in a struct). Also rejected: more than one return
+  value and variadic `#foreign` procedures (C varargs).
+* Empty structs (`struct {}`) are what GNU C makes of `struct {}`: size 0,
+  and as a parameter or result they take no register or stack slot (as with
+  clang and GCC; C++ would give them size 1).
+* The lowering follows each target's C ABI exactly as clang does, so C code
+  compiled with clang or GCC links with it:
+  * x86-64 Linux, System V AMD64 psABI 3.2.3: each eightbyte of a struct of
+    up to 16 bytes is classified INTEGER or SSE and passed in general or
+    `xmm` registers (`{float, float, float}` becomes `<2 x float>, float`);
+    larger structs, and structs that no longer fit in the remaining
+    registers (6 integer, 8 SSE), are copied to the stack (`byval`); results
+    over 16 bytes are written to memory the caller passes (`sret`).
+  * Arm Cortex-M33 with hard float, AAPCS32 §5.3.5, §6.4-6.5 (VFP variant):
+    homogeneous aggregates of 1 to 4 `float32`s or 1 to 4 `float64`s go in
+    VFP registers (s0-s15 / d0-d7) and come back in them; other structs are
+    passed as 4-byte (or 8-byte, if 8-aligned) words in r0-r3 and then on the
+    stack, split between them if needed (over 64 bytes `byval`). Results of
+    up to 4 bytes come back in r0, larger ones through `sret`.
+  * RISC-V ilp32 (ESP32-C6, soft float), RISC-V psABI integer calling
+    convention: structs of up to 8 bytes in one or two registers (or a
+    register and the stack); larger ones by reference to a copy the caller
+    makes; results up to 8 bytes in a0/a1, larger ones through `sret`.
+  * Integers narrower than 32 bits and `bool` are sign- or zero-extended as
+    C expects (`signext` / `zeroext`).
+* `#c_call` procedures have no context and no hidden parameter, so the C
+  prototype is exactly the Jai signature.
+* The classification is in `src/abi.cpp`. `tools/check_c_abi.py` compiles
+  the same prototypes with clang and with each ojay compiler and compares
+  the signatures (about 100 per target). `tests/run/c_abi.jai` with
+  `c_abi.c` runs both directions against GCC-compiled C.
+* On other targets (a `--target` triple not listed above) only scalars may
+  cross the C boundary.
 
 ### Compile-time execution
 
@@ -526,10 +588,11 @@ add :: (a: $T, b: T) -> T #modify { if T == s16  T = s64; return true; } { retur
 ## Layout
 
 ```
-src/        compiler: lexer, parser, sema (types/checking), interp (#run), codegen (LLVM), driver
+src/        compiler: lexer, parser, sema (types/checking), interp (#run), codegen (LLVM),
+            abi (C calling conventions), driver
 runtime/    C runtime (printing, allocation, startup) and board linker scripts
 tools/      development tools: running images on the MCX N947 and ESP32-C6,
-            converting SVD files / CMSIS headers to Jai
-tests/      run tests (programs + expected output) and error tests
+            converting SVD files / CMSIS headers to Jai, checking the C ABI against clang
+tests/      run tests (programs + expected output, optionally a C file linked in) and error tests
 examples/   sample programs
 ```

@@ -20,7 +20,9 @@
 - [x] The context and custom allocators (not yet: Basic's `log`, threads and thread contexts,
       the `STARTUP` / `CAPS` / ... allocator modes, alignment requests)
 - [x] Named module imports (`Name :: #import "..."`) with a real namespace
-- [ ] `#foreign` procedures that pass or return structs by value (C ABI lowering)
+- [x] `#foreign` procedures that pass or return structs by value (C ABI lowering) for x86-64 SysV,
+      Arm AAPCS (VFP) and RISC-V ilp32, plus `#program_export` (not yet: variadic `#foreign`
+      procedures, other targets' C ABIs, the RISC-V hard-float ABIs ilp32f/ilp32d)
 - [x] `if x == { case ...; }` switches on strings
 
 ## Runtime and modules

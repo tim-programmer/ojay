@@ -30,6 +30,7 @@ add_library(ojay_core STATIC
   src/sema.cpp
   src/interp.cpp
   src/codegen.cpp
+  src/abi.cpp
   src/driver.cpp
 )
 target_include_directories(ojay_core PUBLIC src)

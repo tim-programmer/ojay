@@ -1048,6 +1048,9 @@ class Parser {
         p->c_call = true;
       } else if (d == "no_context") {
         p->no_context = true;
+      } else if (d == "program_export") {
+        p->program_export = true;
+        if (at(Tok::String)) p->export_name = advance().text;
       } else if (d == "symmetric") {
         p->symmetric = true;
       } else if (d == "deprecated") {

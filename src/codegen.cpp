@@ -1,5 +1,8 @@
 #include "codegen.h"
 
+#include "abi.h"
+
+#include <llvm/IR/Attributes.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/DataLayout.h>
 #include <llvm/IR/DerivedTypes.h>
@@ -57,6 +60,8 @@ class CodeGen {
     void_ = llvm::Type::getVoidTy(ctx);
     ti_ty_ = llvm::StructType::create(ctx, {i64_, i64_, i64_, i64_, ptr_, ptr_, i64_, ptr_}, "Type_Info");
     ti_member_ty_ = llvm::StructType::create(ctx, {ptr_, i64_, ptr_, i64_}, "Type_Info_Member");
+    cabi_ = std::make_unique<CAbiLowering>(c_abi_for_triple(triple), ctx, dl, types,
+                                           [this](Type* t) { return lt(t); });
   }
 
   std::unique_ptr<llvm::Module> run() {
@@ -120,6 +125,10 @@ class CodeGen {
   // initially), replaced by push_context. Only programs that use the context
   // (Program::uses_context) have it.
   llvm::GlobalVariable* context_ptr_ = nullptr;
+
+  // C calling convention of #c_call procedure types (abi.h).
+  std::unique_ptr<CAbiLowering> cabi_;
+  std::unordered_map<const Type*, AbiSignature> c_sigs_;
 
   // ------------------------------------------------------------------ types
 
@@ -197,6 +206,176 @@ class CodeGen {
   }
 
   uint64_t size_of(Type* t) { return t->kind == TypeKind::Void ? 0 : dl_.getTypeAllocSize(lt(t)); }
+
+  // ------------------------------------------------------------------ C calling convention
+
+  const AbiSignature& c_sig(Type* pt, SourceLoc loc = {}) {
+    auto it = c_sigs_.find(pt);
+    if (it != c_sigs_.end()) return it->second;
+    try {
+      return c_sigs_.emplace(pt, cabi_->classify(pt)).first->second;
+    } catch (const std::runtime_error& e) {
+      throw CompileError(loc, e.what());
+    }
+  }
+
+  // The LLVM function type of a procedure type: C's for #c_call ones.
+  llvm::FunctionType* proc_fn_type(Type* pt, SourceLoc loc = {}) {
+    return pt->c_call ? c_sig(pt, loc).fn_type : fn_type(pt);
+  }
+
+  // The parameter / result attributes clang puts on the C prototype (byval,
+  // sret, alignment, sign/zero extension); used on definitions and call sites.
+  llvm::AttributeList c_attrs(Type* pt) {
+    const AbiSignature& s = c_sig(pt);
+    llvm::AttributeList al;
+    auto ext = [](const AbiArg& a) { return a.sign_ext ? llvm::Attribute::SExt : llvm::Attribute::ZExt; };
+    if (s.ret.kind == AbiArg::Extend) al = al.addRetAttribute(ctx_, ext(s.ret));
+    if (s.sret_index >= 0) {
+      llvm::AttrBuilder b(ctx_);
+      b.addStructRetAttr(lt(pt->returns[0]));
+      b.addAlignmentAttr(llvm::Align(s.ret.align));
+      b.addAttribute(llvm::Attribute::NoAlias);
+      al = al.addParamAttributes(ctx_, s.sret_index, b);
+    }
+    for (size_t i = 0; i < s.params.size(); ++i) {
+      const AbiArg& a = s.params[i];
+      int idx = s.first_ir_arg[i];
+      if (a.kind == AbiArg::Extend) {
+        al = al.addParamAttribute(ctx_, idx, ext(a));
+      } else if (a.kind == AbiArg::Indirect) {
+        llvm::AttrBuilder b(ctx_);
+        if (a.byval) b.addByValAttr(lt(pt->params[i]));
+        b.addAlignmentAttr(llvm::Align(a.align));
+        al = al.addParamAttributes(ctx_, idx, b);
+      }
+    }
+    return al;
+  }
+
+  // Memory holding a value of type t that can also be read or written as `coerced`.
+  llvm::AllocaInst* coerce_slot(Type* t, llvm::Type* coerced, uint64_t min_align = 1) {
+    llvm::Type* vt = lt(t);
+    uint64_t size = std::max<uint64_t>(dl_.getTypeAllocSize(vt), coerced ? dl_.getTypeAllocSize(coerced) : 0);
+    uint64_t align = std::max<uint64_t>(dl_.getPrefTypeAlign(vt).value(), min_align);
+    if (coerced) align = std::max<uint64_t>(align, dl_.getABITypeAlign(coerced).value());
+    auto* a = make_alloca_raw(llvm::ArrayType::get(i8_, std::max<uint64_t>(size, 1)), "c_abi");
+    a->setAlignment(llvm::Align(align));
+    return a;
+  }
+
+  // The IR arguments for one Jai argument value `v` of type t.
+  void lower_c_arg(const AbiArg& a, Type* t, llvm::Value* v, std::vector<llvm::Value*>& out) {
+    switch (a.kind) {
+      case AbiArg::Ignore: return;
+      case AbiArg::Extend: out.push_back(v); return;
+      case AbiArg::Indirect: {  // byval memory, or the copy the callee may modify
+        auto* slot = coerce_slot(t, nullptr, a.align);
+        b_.CreateStore(v, slot);
+        out.push_back(slot);
+        return;
+      }
+      case AbiArg::Direct: {
+        if (a.type == lt(t)) {
+          out.push_back(v);
+          return;
+        }
+        auto* slot = coerce_slot(t, a.type);
+        b_.CreateStore(v, slot);
+        if (a.flatten) {
+          auto* st = llvm::cast<llvm::StructType>(a.type);
+          for (unsigned i = 0; i < st->getNumElements(); ++i)
+            out.push_back(b_.CreateLoad(st->getElementType(i), b_.CreateStructGEP(st, slot, i)));
+        } else {
+          out.push_back(b_.CreateLoad(a.type, slot));
+        }
+        return;
+      }
+    }
+  }
+
+  // Calls a #c_call procedure (direct or through a procedure value).
+  llvm::Value* emit_c_call(Call* c, llvm::Value* callee) {
+    Type* pt = c->proc_type;
+    const AbiSignature& s = c_sig(pt, c->loc);
+    std::vector<llvm::Value*> args;
+    llvm::AllocaInst* sret = nullptr;
+    if (s.sret_index >= 0) {
+      sret = coerce_slot(pt->returns[0], nullptr, s.ret.align);
+      args.push_back(sret);
+    }
+    for (size_t i = 0; i < c->resolved_args.size(); ++i)
+      lower_c_arg(s.params[i], pt->params[i], rvalue(c->resolved_args[i]), args);
+    auto* call = b_.CreateCall(s.fn_type, callee, args);
+    call->setAttributes(c_attrs(pt));
+    if (pt->returns.empty()) return nullptr;
+    Type* rt = pt->returns[0];
+    switch (s.ret.kind) {
+      case AbiArg::Ignore: return llvm::Constant::getNullValue(lt(rt));
+      case AbiArg::Indirect: return b_.CreateLoad(lt(rt), sret);
+      case AbiArg::Extend: return call;
+      case AbiArg::Direct: {
+        if (s.ret.type == lt(rt)) return call;
+        auto* slot = coerce_slot(rt, s.ret.type);
+        b_.CreateStore(call, slot);
+        return b_.CreateLoad(lt(rt), slot);
+      }
+    }
+    return nullptr;
+  }
+
+  // Entry of a #c_call procedure defined in Jai: gives each parameter its storage.
+  void c_prologue(ProcLit* p) {
+    const AbiSignature& s = c_sig(p->type, p->loc);
+    for (size_t i = 0; i < p->params.size(); ++i) {
+      Symbol* sym = p->params[i]->syms[0];
+      const AbiArg& a = s.params[i];
+      int idx = s.first_ir_arg[i];
+      if (a.kind == AbiArg::Indirect) {  // the memory is this call's own (byval, or a copy made by the caller)
+        sym->llvm_value = fn_->getArg(idx);
+        continue;
+      }
+      if (a.kind == AbiArg::Ignore || a.kind == AbiArg::Extend || a.type == lt(sym->type)) {
+        auto* slot = make_alloca(sym->type, sym->name);
+        if (a.kind != AbiArg::Ignore) b_.CreateStore(fn_->getArg(idx), slot);
+        sym->llvm_value = slot;
+        continue;
+      }
+      auto* slot = coerce_slot(sym->type, a.type);
+      if (a.flatten) {
+        auto* st = llvm::cast<llvm::StructType>(a.type);
+        for (unsigned j = 0; j < st->getNumElements(); ++j)
+          b_.CreateStore(fn_->getArg(idx + j), b_.CreateStructGEP(st, slot, j));
+      } else {
+        b_.CreateStore(fn_->getArg(idx), slot);
+      }
+      sym->llvm_value = slot;
+    }
+  }
+
+  // `return v` from a #c_call procedure defined in Jai.
+  void emit_c_ret(llvm::Value* v) {
+    const AbiSignature& s = c_sig(proc_->type);
+    Type* rt = proc_->type->returns.empty() ? nullptr : proc_->type->returns[0];
+    switch (s.ret.kind) {
+      case AbiArg::Ignore: b_.CreateRetVoid(); return;
+      case AbiArg::Indirect:
+        b_.CreateStore(v, fn_->getArg(s.sret_index));
+        b_.CreateRetVoid();
+        return;
+      case AbiArg::Extend: b_.CreateRet(v); return;
+      case AbiArg::Direct: {
+        if (s.ret.type == lt(rt)) {
+          b_.CreateRet(v);
+          return;
+        }
+        auto* slot = coerce_slot(rt, s.ret.type);
+        b_.CreateStore(v, slot);
+        b_.CreateRet(b_.CreateLoad(s.ret.type, slot));
+        return;
+      }
+    }
+  }
 
   // ------------------------------------------------------------------ runtime
 
@@ -457,7 +636,7 @@ class CodeGen {
   // ------------------------------------------------------------------ declarations
 
   void declare_proc(ProcLit* p) {
-    llvm::FunctionType* ft = fn_type(p->type);
+    llvm::FunctionType* ft = proc_fn_type(p->type, p->loc);
     if (p->is_foreign) {
       if (llvm::Function* existing = mod_->getFunction(p->foreign_name)) {
         if (existing->getFunctionType() != ft)
@@ -467,12 +646,21 @@ class CodeGen {
         return;
       }
       p->llvm_fn = llvm::Function::Create(ft, llvm::GlobalValue::ExternalLinkage, p->foreign_name, mod_.get());
+      p->llvm_fn->setAttributes(c_attrs(p->type));
       p->llvm_fn->addFnAttr(llvm::Attribute::NoUnwind);
       return;
     }
     std::string name = p->name.empty() ? "__anonymous_proc" : p->name;
     if (p == prog_.main_proc) name = "__ojay_user_main";
-    p->llvm_fn = llvm::Function::Create(ft, llvm::GlobalValue::InternalLinkage, name, mod_.get());
+    auto linkage = llvm::GlobalValue::InternalLinkage;
+    if (p->program_export) {
+      name = p->export_name.empty() ? p->name : p->export_name;
+      if (mod_->getNamedValue(name))
+        throw CompileError(p->loc, cat("#program_export: the symbol '", name, "' is already defined"));
+      linkage = llvm::GlobalValue::ExternalLinkage;
+    }
+    p->llvm_fn = llvm::Function::Create(ft, linkage, name, mod_.get());
+    if (p->type->c_call) p->llvm_fn->setAttributes(c_attrs(p->type));
     p->llvm_fn->addFnAttr(llvm::Attribute::NoUnwind);
   }
 
@@ -552,7 +740,8 @@ class CodeGen {
     b_.SetInsertPoint(entry_);
     scopes_.clear();
     scopes_.push_back({});
-    for (size_t i = 0; i < p->params.size(); ++i) {
+    if (p->type->c_call) c_prologue(p);
+    else for (size_t i = 0; i < p->params.size(); ++i) {
       Symbol* s = p->params[i]->syms[0];
       auto* a = make_alloca(s->type, s->name);
       b_.CreateStore(fn_->getArg(i), a);
@@ -999,7 +1188,8 @@ class CodeGen {
     }
     emit_defers_down_to(0);
     if (terminated()) return;
-    if (ret) b_.CreateRet(ret);
+    if (proc_->type->c_call) emit_c_ret(ret);
+    else if (ret) b_.CreateRet(ret);
     else b_.CreateRetVoid();
   }
 
@@ -1456,6 +1646,7 @@ class CodeGen {
     Ident* id = c->callee->kind == NK::Ident ? static_cast<Ident*>(c->callee) : nullptr;
     if (id && id->sym->kind == SymKind::Proc) callee = id->sym->proc->llvm_fn;
     else callee = rvalue(c->callee);
+    if (c->proc_type->c_call) return emit_c_call(c, callee);
     std::vector<llvm::Value*> args;
     for (Expr* a : c->resolved_args) args.push_back(rvalue(a));
     auto* call = b_.CreateCall(fn_type(c->proc_type), callee, args);

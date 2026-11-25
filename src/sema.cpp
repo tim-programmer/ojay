@@ -1,5 +1,7 @@
 #include "sema.h"
 
+#include "abi.h"
+
 #include "interp.h"
 #include "parser.h"
 
@@ -1073,17 +1075,18 @@ class Checker : public InterpHost {
       fail(p->returns[1].loc, "#expand macros with more than one return value are not supported yet");
     if (p->is_macro && p->c_call) fail(p->loc, "an #expand macro cannot be #c_call");
     p->type = T.proc(params, rets, p->c_call, p->variadic);
+    if (p->is_foreign && p->variadic) fail(p->loc, "variadic #foreign procedures are not supported yet");
+    if (p->program_export) {
+      if (!p->c_call) fail(p->loc, "#program_export procedures must be #c_call (C calls them with the C calling convention)");
+      if (p->is_foreign) fail(p->loc, "a #foreign procedure cannot be #program_export");
+    }
     if (p->c_call) {
       for (size_t i = 0; i < params.size(); ++i)
-        if (!is_c_scalar(params[i]))
-          fail(p->params[i]->loc, "#c_call/#foreign parameters of type ", type_name(params[i]),
-               " are not supported yet (use a pointer)");
+        check_c_type(params[i], p->params[i]->loc, false);
       if (rets.size() > 1) fail(p->loc, "#c_call/#foreign procedures cannot return multiple values");
-      if (rets.size() == 1 && !is_c_scalar(rets[0]))
-        fail(p->loc, "#c_call/#foreign return type ", type_name(rets[0]), " is not supported yet");
+      if (rets.size() == 1) check_c_type(rets[0], p->returns[0].loc, true);
     }
     if (p->is_foreign) {
-      if (p->variadic) fail(p->loc, "variadic #foreign procedures are not supported yet");
       if (p->foreign_lib) {
         Expr* lib = p->foreign_lib;
         check(lib, nullptr);
@@ -1096,6 +1099,14 @@ class Checker : public InterpHost {
     }
     p->signature_done = true;
     if (for_codegen) want_proc(p);
+  }
+
+  // Parameters and results of #c_call procedures must be C types (abi.h).
+  void check_c_type(Type* t, SourceLoc loc, bool is_return) {
+    std::string why = c_abi_unsupported(t);
+    if (why.empty()) return;
+    if (is_return) fail(loc, "#c_call/#foreign return type ", type_name(t), " is not supported: ", why);
+    fail(loc, "#c_call/#foreign parameters of type ", type_name(t), " are not supported: ", why);
   }
 
   void complete_type(Type* t, SourceLoc loc) {
@@ -2032,6 +2043,12 @@ class Checker : public InterpHost {
         for (Expr*& x : p->returns) {
           Type* r = resolve_type(x);
           if (r->kind != TypeKind::Void) rs.push_back(r);
+        }
+        if (p->c_call) {
+          if (p->variadic) fail(e->loc, "variadic #c_call procedure types are not supported");
+          if (rs.size() > 1) fail(e->loc, "#c_call/#foreign procedures cannot return multiple values");
+          for (size_t i = 0; i < ps.size(); ++i) check_c_type(ps[i], p->params[i]->loc, false);
+          if (rs.size() == 1) check_c_type(rs[0], e->loc, true);
         }
         e->cv = ConstValue::of_type(T.proc(ps, rs, p->c_call, p->variadic));
         return T.type_t;

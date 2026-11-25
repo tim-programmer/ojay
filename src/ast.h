@@ -240,6 +240,8 @@ struct ProcLit : Expr {
   bool poly_returns = false;  // has `$T` in a return type
   bool is_macro = false;  // #expand: inlined at each call (MacroExpansion), never called
   bool no_context = false;  // #no_context: like #c_call procedures, it has no context
+  bool program_export = false;  // #program_export: an external symbol (named export_name, else name) C can call
+  std::string export_name;
   Block* modify = nullptr;  // #modify { ... }: runs when a polymorphic procedure is instantiated
   std::string name;       // bound name, for diagnostics and symbol names
   // sema

@@ -3,6 +3,16 @@
 
 tests/run/*.jai     compiled, linked and executed; stdout must equal the .out
                     file. An optional `// EXIT: n` line gives the exit status.
+                    `// SKIP: text` lines skip the configurations whose label
+                    contains text (e.g. `// SKIP: static` for a test that
+                    needs libc, which the static x86-64 runtime does not have).
+                    A C file next to the test (foo.jai + foo.c) is compiled
+                    with the target's C compiler (cc, arm-none-eabi-gcc,
+                    riscv32-esp-elf-gcc; -O0 for -O0 configurations, else
+                    -O2) and linked in, for testing C interop (#foreign and
+                    #c_call). It must not use libc beyond what the static
+                    runtime provides (memcpy, memset), unless the test skips
+                    that configuration.
                     `// COMPILE_OUTPUT: text` lines give what the compiler
                     itself must print on stdout (compile-time `print` in
                     `#run`), one line each, for every target; without them
@@ -85,11 +95,12 @@ def board_responds(runner):
 
 
 class Config:
-    def __init__(self, label, compile_cmd, link, runner):
+    def __init__(self, label, compile_cmd, link, runner, cc):
         self.label = label
         self.compile_cmd = compile_cmd  # compiler + flags
         self.link = link                # function(obj, exe) -> argv
         self.runner = runner            # argv prefix, or None for a native run; False = do not run
+        self.cc = cc                    # C compiler + flags for a test's .c file (compile only)
 
 
 def make_configs(build_dir, arm_mode, riscv_mode):
@@ -157,14 +168,17 @@ def make_configs(build_dir, arm_mode, riscv_mode):
             rv_where = "ESP32-C6 board (RAM)"
         else:
             rv_run, rv_where = False, "linked only, not executed"
-        configs_rv = [Config("riscv -O0", [rv], link_rv, rv_run), Config("riscv -O2", [rv, "-O2"], link_rv, rv_run)]
+        rv_cc = [rv_gcc] + RISCV_GCC_FLAGS + ["-ffreestanding", "-c"]
+        configs_rv = [Config("riscv -O0", [rv], link_rv, rv_run, rv_cc + ["-O0"]),
+                      Config("riscv -O2", [rv, "-O2"], link_rv, rv_run, rv_cc + ["-O2"])]
 
     return [
-        Config("x86_64 -O0", [x64], link_hosted, None),
-        Config("x86_64 -O2", [x64, "-O2"], link_hosted, None),
-        Config("x86_64 static", [x64, "-O1", "--no-pic"], link_static, None),
-        Config("arm32 -O0", [arm], arm_link, arm_run),
-        Config("arm32 -O2", [arm, "-O2"], arm_link, arm_run),
+        Config("x86_64 -O0", [x64], link_hosted, None, ["cc", "-c", "-O0"]),
+        Config("x86_64 -O2", [x64, "-O2"], link_hosted, None, ["cc", "-c", "-O2"]),
+        Config("x86_64 static", [x64, "-O1", "--no-pic"], link_static, None,
+               ["cc", "-c", "-O2", "-fno-pic", "-ffreestanding", "-fno-stack-protector"]),
+        Config("arm32 -O0", [arm], arm_link, arm_run, ["arm-none-eabi-gcc"] + ARM_GCC_FLAGS + ["-c", "-O0"]),
+        Config("arm32 -O2", [arm, "-O2"], arm_link, arm_run, ["arm-none-eabi-gcc"] + ARM_GCC_FLAGS + ["-c", "-O2"]),
     ] + configs_rv, where, rv_where
 
 
@@ -191,9 +205,11 @@ def main():
     not_run = 0
     tmp = tempfile.mkdtemp(prefix="ojay-tests-")
 
-    def check_program(name, src, want_out, want_code, want_compile_out=""):
+    def check_program(name, src, want_out, want_code, want_compile_out="", c_src=None, skip=()):
         nonlocal passed, not_run
         for cfg in configs:
+            if any(s in cfg.label for s in skip):
+                continue
             base = os.path.join(tmp, name[:-4] + "_" + re.sub(r"\W+", "_", cfg.label))
             obj, exe = base + ".o", base + ".exe"
             r = run(cfg.compile_cmd + [src, "-o", obj])
@@ -204,7 +220,15 @@ def main():
                 failures.append((name, cfg.label, f"compiler output differs\n--- got\n{r.stdout.decode()}"
                                                   f"--- want\n{want_compile_out}"))
                 continue
-            r = run(cfg.link(obj, exe))
+            link = cfg.link(obj, exe)
+            if c_src:
+                c_obj = base + ".c.o"
+                r = run(cfg.cc + ["-Wall", c_src, "-o", c_obj])
+                if r.returncode != 0:
+                    failures.append((name, cfg.label, "C compile failed:\n" + r.stderr.decode()))
+                    continue
+                link.insert(link.index(obj) + 1, c_obj)
+            r = run(link)
             if r.returncode != 0:
                 failures.append((name, cfg.label, "link failed:\n" + r.stderr.decode()))
                 continue
@@ -235,7 +259,10 @@ def main():
         compile_out = "".join(line + "\n" for line in re.findall(r"^// COMPILE_OUTPUT: ?(.*)$", text, re.M))
         with open(src[:-4] + ".out") as f:
             want_out = f.read()
-        check_program(name, src, want_out, int(m.group(1)) if m else 0, compile_out)
+        skip = [s.strip() for s in re.findall(r"^// SKIP:(.*)$", text, re.M)]
+        c_src = src[:-4] + ".c"
+        check_program(name, src, want_out, int(m.group(1)) if m else 0, compile_out,
+                      c_src if os.path.exists(c_src) else None, skip)
 
     # tools/regs2jai.py: X_svd_test.jai #loads the conversion of X.svd (X_h_test.jai: of X.h)
     # as X_svd.jai. An optional `// REGS2JAI: args` line gives extra converter arguments.
