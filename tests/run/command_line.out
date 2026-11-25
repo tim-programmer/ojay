@@ -1,0 +1,7 @@
+count: 5
+program name ends in .exe: true
+[1] 'one' (3 bytes)
+[2] 'two words' (9 bytes)
+[3] '3' (1 bytes)
+[4] '' (0 bytes)
+same array: true

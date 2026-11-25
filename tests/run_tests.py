@@ -6,6 +6,8 @@ tests/run/*.jai     compiled, linked and executed; stdout must equal the .out
                     `// SKIP: text` lines skip the configurations whose label
                     contains text (e.g. `// SKIP: static` for a test that
                     needs libc, which the static x86-64 runtime does not have).
+                    `// ARGS: words` gives command-line arguments (shell
+                    quoting) for native runs; embedded programs get none.
                     A C file next to the test (foo.jai + foo.c) is compiled
                     with the target's C compiler (cc, arm-none-eabi-gcc,
                     riscv32-esp-elf-gcc; -O0 for -O0 configurations, else
@@ -31,7 +33,9 @@ runtime (the same commands as in README.md) and runs the result. ARM32
                loaded with OpenOCD by tools/run_mcxn947.py)
   qemu         qemu-system-arm -M mps2-an505
 otherwise they are only linked and checked. Override with
---arm=board|board-flash|qemu|none (board-flash programs each test into flash).
+--arm=board|board-flash|board-uart|qemu|none (board-flash programs each test
+into flash; board-uart runs RAM images without semihosting and reads their
+output from the board's UART, which also carries what they write to stderr).
 
 RISC-V (ESP32-C6) images are run on an attached ESP32-C6 through its built-in
 USB-JTAG (RAM images, loaded with openocd-esp32 by tools/run_esp32c6.py) when
@@ -136,6 +140,9 @@ def make_configs(build_dir, arm_mode, riscv_mode):
     if arm_mode == "board":
         arm_link, arm_run, where = link_arm("mcxn947-ram.ld"), [sys.executable, run_board, "--timeout", "20"], \
             "MCX N947 board (RAM)"
+    elif arm_mode == "board-uart":
+        arm_link, arm_run, where = link_arm("mcxn947-ram.ld"), \
+            [sys.executable, run_board, "--uart", "--timeout", "20"], "MCX N947 board (RAM, UART console)"
     elif arm_mode == "board-flash":
         arm_link, arm_run, where = link_arm("mcxn947-flash.ld"), \
             [sys.executable, run_board, "--flash", "--timeout", "20"], "MCX N947 board (flash)"
@@ -190,7 +197,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--build-dir", default=os.path.join(REPO, "build"))
     ap.add_argument("--filter", default="")
-    ap.add_argument("--arm", choices=["auto", "board", "board-flash", "qemu", "none"], default="auto",
+    ap.add_argument("--arm", choices=["auto", "board", "board-flash", "board-uart", "qemu", "none"], default="auto",
                     help="where to execute ARM32 tests (default: auto)")
     ap.add_argument("--riscv", choices=["auto", "board", "none", "skip"], default="auto",
                     help="where to execute RISC-V tests (default: auto)")
@@ -205,7 +212,7 @@ def main():
     not_run = 0
     tmp = tempfile.mkdtemp(prefix="ojay-tests-")
 
-    def check_program(name, src, want_out, want_code, want_compile_out="", c_src=None, skip=()):
+    def check_program(name, src, want_out, want_code, want_compile_out="", c_src=None, skip=(), prog_args=()):
         nonlocal passed, not_run
         for cfg in configs:
             if any(s in cfg.label for s in skip):
@@ -236,7 +243,7 @@ def main():
                 not_run += 1
                 passed += 1
                 continue
-            r = run((cfg.runner or []) + [exe])
+            r = run((cfg.runner or []) + [exe] + (list(prog_args) if cfg.runner is None else []))
             out = r.stdout.decode()
             if out != want_out or r.returncode != want_code:
                 msg = f"exit {r.returncode} (want {want_code})\n--- got\n{out}--- want\n{want_out}"
@@ -261,8 +268,9 @@ def main():
             want_out = f.read()
         skip = [s.strip() for s in re.findall(r"^// SKIP:(.*)$", text, re.M)]
         c_src = src[:-4] + ".c"
+        prog_args = shlex.split(" ".join(re.findall(r"^// ARGS:(.*)$", text, re.M)))
         check_program(name, src, want_out, int(m.group(1)) if m else 0, compile_out,
-                      c_src if os.path.exists(c_src) else None, skip)
+                      c_src if os.path.exists(c_src) else None, skip, prog_args)
 
     # tools/regs2jai.py: X_svd_test.jai #loads the conversion of X.svd (X_h_test.jai: of X.h)
     # as X_svd.jai. An optional `// REGS2JAI: args` line gives extra converter arguments.

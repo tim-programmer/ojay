@@ -139,15 +139,30 @@ Serial/JTAG port.
   on stderr giving the request and the heap's state (size, free bytes,
   largest free block). Freeing a pointer that is not an allocated block
   (a double free, a pointer not from the heap) stops it too.
-* `print` and the exit status go through **semihosting**, so output appears
-  in the debugger (OpenOCD, LinkServer, J-Link, pyOCD) or QEMU. With no
-  debugger attached, output is dropped and the program halts in `wfi` on exit.
-* Caveat (Cortex-M): the runtime uses semihosting whenever the core reports
-  that debugging is enabled (DHCSR.C_DEBUGEN). That bit survives a reset, so
-  after a debug session that left it set (LinkServer does), a program that
-  prints halts at its first `print` until a debugger attaches or the board is
-  power-cycled. Programs meant to run standalone, like `blink.jai`, should not
-  print.
+* Cortex-M console: `print` and the exit status go through **semihosting**
+  when a debugger handles it, otherwise to the board's **console**:
+  * The MCX N947 board scripts select LPUART4 (FLEXCOMM4, P1_9 TX / P1_8 RX,
+    115200 8N1), which the FRDM-MCXN947's MCU-Link presents as its virtual
+    COM port (e.g. `/dev/serial/by-id/usb-NXP_Semiconductors_MCU-LINK_...-if02`).
+    `\n` is sent as CR LF. A custom board script selects it with
+    `__ojay_console_mcxn947 = 1;`.
+  * A program can provide its own console by defining
+    `__ojay_console_write(data: *u8, count: s64)`, for example
+    `console :: (data: *u8, count: s64) #c_call #program_export "__ojay_console_write" { ... }`.
+    It replaces the built-in UART.
+  * Stdout and stderr share the console. Without semihosting the program
+    ends in a `wfi` loop with r0 = 0xE417C0DE and r1 = its exit status.
+* Cortex-M semihosting: a semihosting call halts the core whenever halting
+  debug is enabled (DHCSR.C_DEBUGEN), even when the debugger that enabled it
+  has gone, and that bit survives resets until a power cycle (LinkServer
+  leaves it set). So on a board with a console the runtime only uses
+  semihosting when the debugger announces itself by starting the program at
+  `Reset_Handler` with r0 = 0x5E41D0B6 and r1 = its complement
+  (`tools/run_mcxn947.py` does). Other debuggers (LinkServer, J-Link, pyOCD)
+  show the output on the console instead, and a program started by a reset
+  never halts in a semihosting call. On a board script without a console
+  (and on QEMU, `mps2-an505.ld`) semihosting is used whenever C_DEBUGEN is
+  set, as before; with no debugger output is dropped.
 * Faults print the fault type and CFSR/HFSR (ARM) or mcause/mepc/mtval
   (RISC-V), then exit with status 134.
 * ESP32-C6: startup turns off the watchdogs (timer groups, RTC and super
@@ -174,12 +189,17 @@ These are development tools, separate from the compiler:
   (`mcxn947-ram.ld`) are loaded with OpenOCD (`tools/mcxn947.cfg`) without
   touching flash. Flash images need `--flash`: they are programmed with NXP
   LinkServer (`/opt/linkserver/LinkServer`, or set `OJAY_LINKSERVER`), then
-  started from their reset vector under OpenOCD.
+  started from their reset vector under OpenOCD. `--uart` starts the program
+  without announcing semihosting, reads its output from the virtual COM port
+  (`--vcom` to choose the device) and its exit status from r0/r1, i.e. runs
+  it as it runs without a debugger. `tests/run_tests.py --arm=board-uart`
+  runs the tests that way (the ones that write to stderr then differ, as the
+  UART carries both streams).
 * The core's debug port only appears after a session is opened through NXP's
   Debug Mailbox; `tools/mcxn947.cfg` does this (it resets the chip).
 * Flashing and a real cold boot can also be done directly with
-  `LinkServer run MCXN947:FRDM-MCXN947 hello.elf`, which prints the output but
-  does not report the exit status.
+  `LinkServer flash MCXN947:FRDM-MCXN947 load hello.elf`; the program then
+  prints on the virtual COM port.
 
 ### Register definitions from SVD files and CMSIS headers
 
@@ -309,11 +329,15 @@ Implemented:
 * Built-in modules: `Basic` (`print`, `sprint`/`tprint`, `write_string`,
   `alloc`, `free`, `realloc`, `New`, `NewArray`, `array_add`, `array_free`,
   `array_reset`, `assert`, `exit`, `memcpy`, `memset`, `min`, `max`,
-  `to_c_string`, integer limits) and `Math` (`sqrt`, `sin`, `cos`, `tan`,
+  `to_c_string`, `get_command_line_arguments`, integer limits) and `Math` (`sqrt`, `sin`, `cos`, `tan`,
   `atan2`, `pow`, `floor`, `ceil`, `round`, `exp`, `log`, `abs`, `PI`, `TAU`).
   The allocating ones use `context.allocator`; `alloc`, `free`, `realloc`,
   `New` and `NewArray` also take an explicit allocator (`alloc(n, a)`,
   `New(T, allocator = a)`), and `New` / `NewArray` take `initialized = false`.
+  `get_command_line_arguments()` returns the program's arguments as a
+  `[] string`, the program name first; the array and strings belong to the
+  runtime (do not free them). Bare-metal programs, and `#run` code, get an
+  empty array.
 
 Not yet implemented: `#compiler` procedures and the compiler message loop
 (`#run,stallable`), `Code_Node` introspection (`compiler_get_nodes`),

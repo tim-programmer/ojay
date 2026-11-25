@@ -29,10 +29,14 @@
 
 - [x] A real allocator for bare-metal targets: a first-fit free list with boundary tags and
       immediate merging (not yet: size-class bins for faster allocation with many free blocks)
-- [ ] `get_command_line_arguments()` (argc/argv are already saved by the runtime)
+- [x] `get_command_line_arguments()` (not yet: `__command_line_arguments`, arguments for
+      bare-metal programs, e.g. from semihosting `SYS_GET_CMDLINE`)
 - [ ] Write more of `Basic` and `Math` in Jai once polymorphism exists
-- [ ] Cortex-M: console output without a debugger (UART), and avoid halting in
-      semihosting when DHCSR.C_DEBUGEN was left set by a detached debugger
+- [x] Cortex-M: console output without a debugger (UART), and avoid halting in
+      semihosting when DHCSR.C_DEBUGEN was left set by a detached debugger: LPUART4 on the
+      FRDM-MCXN947 or a program-defined `__ojay_console_write`; semihosting only when the
+      debugger announces itself (not yet: console input, a UART for the MPS2 / QEMU board,
+      separate stdout and stderr on the console)
 
 ## Targets and boards
 

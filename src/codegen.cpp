@@ -119,7 +119,7 @@ class CodeGen {
 
   // runtime functions
   llvm::FunctionCallee rt_print_, rt_sprint_, rt_write_, rt_alloc_, rt_free_, rt_realloc_, rt_bounds_,
-      rt_assert_, rt_streq_, rt_exit_, rt_array_reserve_, rt_init_, rt_cstring_;
+      rt_assert_, rt_streq_, rt_exit_, rt_args_, rt_array_reserve_, rt_init_, rt_cstring_;
 
   // The context: a pointer to the current Context (the default context's global
   // initially), replaced by push_context. Only programs that use the context
@@ -400,6 +400,7 @@ class CodeGen {
     rt_assert_ = rt("__ojay_assert_fail", void_, {ptr_, i64_, i32_, ptr_, i64_}, true);
     rt_streq_ = rt("__ojay_string_equal", i32_, {ptr_, i64_, ptr_, i64_});
     rt_exit_ = rt("__ojay_exit", void_, {i32_}, true);
+    rt_args_ = rt("__ojay_command_line_arguments", ptr_, {ptr_});
     rt_array_reserve_ = rt("__ojay_array_reserve", void_, {ptr_, i64_, i64_, ptr_, ptr_});
     rt_init_ = rt("__ojay_runtime_init", void_, {i32_, ptr_});
     rt_cstring_ = rt("__ojay_to_c_string", ptr_, {ptr_, i64_, ptr_, ptr_});
@@ -1882,6 +1883,13 @@ class CodeGen {
         b_.CreateUnreachable();
         b_.SetInsertPoint(ok_bb);
         return nullptr;
+      }
+      case Builtin::CommandLineArguments: {
+        auto* count = make_alloca_raw(i64_, "argc");
+        llvm::Value* data = b_.CreateCall(rt_args_, {count});
+        llvm::Value* v = llvm::UndefValue::get(lt(c->type));
+        v = b_.CreateInsertValue(v, b_.CreateLoad(i64_, count), 0);
+        return b_.CreateInsertValue(v, data, 1);
       }
       case Builtin::Exit:
         b_.CreateCall(rt_exit_, {rvalue(a[0])});

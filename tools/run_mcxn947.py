@@ -8,7 +8,15 @@ Flash images (linked with mcxn947-flash.ld) are only run with --flash: the
 image is programmed with NXP LinkServer, then started from its reset vector
 under OpenOCD so its exit status can be reported.
 
-In both cases the program's semihosting console output goes to stdout.
+In both cases the program's semihosting console output goes to stdout. The
+program is started with r0/r1 set to the runtime's "debugger present" values,
+which enable semihosting (without them the runtime never makes semihosting
+calls on this board, so a leftover DHCSR.C_DEBUGEN cannot halt it).
+
+With --uart the program is started without them, as if no debugger were
+attached: its output is read from the board's UART (LPUART4, the MCU-Link's
+virtual COM port) instead, and the exit status from r0/r1 once the program
+waits in its final wfi loop.
 
 Exit status: the program's exit status, or
   124  the program did not finish within --timeout seconds
@@ -16,7 +24,13 @@ Exit status: the program's exit status, or
   126  the core stopped without the program exiting
 """
 import argparse
+import glob
 import os
+import re
+import select
+import termios
+import threading
+import time
 import shutil
 import struct
 import subprocess
@@ -26,6 +40,51 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 RAM_START, RAM_END = 0x20000000, 0x20080000
 FLASH_START, FLASH_END = 0x00000000, 0x00200000
 DEVICE = "MCXN947:FRDM-MCXN947"
+DEBUGGER_MAGIC = 0x5E41D0B6   # runtime/ojay_runtime.c: OJAY_DEBUGGER_MAGIC
+EXITED_MAGIC = 0xE417C0DE     # OJAY_EXITED_MAGIC
+
+
+def find_vcom():
+    found = sorted(glob.glob("/dev/serial/by-id/*MCU-LINK*FRDM-MCXN947*-if0[0-9]"))
+    return found[0] if found else None
+
+
+class SerialReader:
+    """Reads a tty at 115200 8N1 in the background, forwarding to stdout (CRLF -> LF)."""
+
+    def __init__(self, path):
+        self.fd = os.open(path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        attrs = termios.tcgetattr(self.fd)
+        attrs[0] = 0                                        # iflag: raw
+        attrs[1] = 0                                        # oflag
+        attrs[2] = termios.CS8 | termios.CREAD | termios.CLOCAL
+        attrs[3] = 0                                        # lflag: no echo, non-canonical
+        attrs[4] = attrs[5] = termios.B115200
+        termios.tcsetattr(self.fd, termios.TCSANOW, attrs)
+        termios.tcflush(self.fd, termios.TCIFLUSH)
+        self.stop = False
+        self.data = bytearray()
+        self.thread = threading.Thread(target=self.run, daemon=True)
+        self.thread.start()
+
+    def run(self):
+        while not self.stop:
+            r, _, _ = select.select([self.fd], [], [], 0.05)
+            if r:
+                try:
+                    chunk = os.read(self.fd, 4096)
+                except BlockingIOError:
+                    continue
+                self.data += chunk
+
+    def finish(self):
+        time.sleep(0.2)  # the last bytes in flight
+        self.stop = True
+        self.thread.join()
+        os.close(self.fd)
+        out = bytes(self.data).replace(b"\r\n", b"\n")
+        sys.stdout.buffer.write(out)
+        sys.stdout.flush()
 
 
 def find_linkserver():
@@ -63,6 +122,10 @@ def main():
     ap.add_argument("--openocd", default=shutil.which("openocd") or "openocd")
     ap.add_argument("--cfg", default=os.path.join(HERE, "mcxn947.cfg"))
     ap.add_argument("--flash", action="store_true", help="program a flash image (with LinkServer) and run it")
+    ap.add_argument("--uart", action="store_true",
+                    help="run without semihosting; read the output from the board's UART (virtual COM port)")
+    ap.add_argument("--vcom", default=os.environ.get("OJAY_MCXN947_VCOM"),
+                    help="serial device of the MCU-Link virtual COM port (default: found in /dev/serial/by-id)")
     ap.add_argument("-v", "--verbose", action="store_true", help="show OpenOCD's log")
     args = ap.parse_args()
 
@@ -103,24 +166,58 @@ def main():
         load = ""
 
     ms = int(args.timeout * 1000)
-    script = (
+    start = (
         "init; mcxn947_start_debug_session; mcxn947.cpu0 arp_examine; halt; "
         f"{load}"
         f"mww 0xE000ED08 {base:#x}; reg msp {sp:#x}; reg pc {reset:#x}; reg xPSR 0x01000000; "
-        "arm semihosting enable; resume; "
-        # A semihosting exit makes OpenOCD exit with the program's status, so
-        # reaching the lines below means something went wrong.
-        f"if {{[catch {{wait_halt {ms}}}]}} {{ echo OJAY-RUN-TIMEOUT; halt; shutdown error }}; "
-        "echo OJAY-RUN-HALTED; shutdown error"
     )
-    proc = subprocess.run([args.openocd, "-f", args.cfg, "-c", script], stderr=subprocess.PIPE,
-                          timeout=args.timeout + 30)
+    reader = None
+    if args.uart:
+        vcom = args.vcom or find_vcom()
+        if not vcom:
+            print("run_mcxn947: the MCU-Link virtual COM port was not found (use --vcom)", file=sys.stderr)
+            return 125
+        reader = SerialReader(vcom)
+        # No semihosting: poll (halting briefly) until the program waits in
+        # its exit loop with r0 = EXITED_MAGIC, then report r1.
+        script = start + (
+            "reg r0 0; resume; "
+            f"set deadline [expr {{[clock milliseconds] + {ms}}}]; "
+            "while {1} { "
+            "  sleep 100; halt; "
+            "  regexp {0x([0-9a-fA-F]+)} [reg r0] -> r0; "
+            f"  if {{[expr 0x$r0] == {EXITED_MAGIC}}} {{ "
+            "    regexp {0x([0-9a-fA-F]+)} [reg r1] -> r1; "
+            "    echo \"OJAY-EXIT [expr 0x$r1]\"; shutdown }; "
+            "  if {[clock milliseconds] > $deadline} { echo OJAY-RUN-TIMEOUT; shutdown error }; "
+            "  resume "
+            "}"
+        )
+    else:
+        script = start + (
+            f"reg r0 {DEBUGGER_MAGIC:#x}; reg r1 {DEBUGGER_MAGIC ^ 0xFFFFFFFF:#x}; "
+            "arm semihosting enable; resume; "
+            # A semihosting exit makes OpenOCD exit with the program's status, so
+            # reaching the lines below means something went wrong.
+            f"if {{[catch {{wait_halt {ms}}}]}} {{ echo OJAY-RUN-TIMEOUT; halt; shutdown error }}; "
+            "echo OJAY-RUN-HALTED; shutdown error"
+        )
+    try:
+        proc = subprocess.run([args.openocd, "-f", args.cfg, "-c", script], stderr=subprocess.PIPE,
+                              timeout=args.timeout + 30)
+    finally:
+        if reader:
+            reader.finish()
     log = proc.stderr.decode(errors="replace")
     if args.verbose:
         sys.stderr.write(log)
     if "OJAY-RUN-TIMEOUT" in log:
         print(f"run_mcxn947: timed out after {args.timeout:g}s", file=sys.stderr)
         return 124
+    if args.uart:
+        m = re.search(r"OJAY-EXIT (\d+)", log)
+        if m:
+            return int(m.group(1)) & 0xFF  # as a process exit status
     if "OJAY-RUN-HALTED" in log:
         print("run_mcxn947: the core halted without the program exiting", file=sys.stderr)
         return 126

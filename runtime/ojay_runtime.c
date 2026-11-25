@@ -6,7 +6,8 @@
  *   linux freestanding  - talks to the Linux kernel directly, provides _start
  *   cortex-m            - bare metal: vector table, reset handler, a heap
  *                         (see "Heap" below) in the RAM the linker script
- *                         leaves free, console I/O via semihosting
+ *                         leaves free, console I/O via semihosting or the
+ *                         board's UART (see "Console" below)
  *   esp32-c6            - bare metal RISC-V: watchdogs off, trap handler,
  *                         console via semihosting or the USB Serial/JTAG port
  *
@@ -145,9 +146,99 @@ extern uint8_t __ojay_semihost_always __attribute__((weak));
 
 #define SCB_DHCSR (*(volatile uint32_t *)0xE000EDF0u)
 
+/* Console.
+ *
+ * Output goes to semihosting when a debugger handles it, otherwise to the
+ * board's console: a program-provided `__ojay_console_write` (for example a
+ * Jai `#c_call #program_export "__ojay_console_write"` procedure), else the
+ * built-in UART driver the board script selects (`__ojay_console_mcxn947`:
+ * LPUART4 on the FRDM-MCXN947, the MCU-Link's virtual COM port).
+ *
+ * A semihosting call (bkpt 0xAB) halts the core whenever halting debug is
+ * enabled (DHCSR.C_DEBUGEN), whether or not a debugger is still there to
+ * resume it, and that bit survives resets until a power cycle. So on boards
+ * with a console, semihosting is only used when the debugger announced
+ * itself: it starts the program at Reset_Handler with r0 = OJAY_DEBUGGER_MAGIC
+ * and r1 = ~OJAY_DEBUGGER_MAGIC (tools/run_mcxn947.py does). Boards without a
+ * console keep using semihosting whenever C_DEBUGEN is set, as nothing else
+ * could show the output. */
+#define OJAY_DEBUGGER_MAGIC 0x5E41D0B6u
+extern uint8_t __ojay_console_mcxn947 __attribute__((weak));
+extern void __ojay_console_write(const uint8_t *data, int64_t len) __attribute__((weak));
+
+static int debugger_announced; /* set by Reset_Handler */
+
+static int have_console(void) {
+  return __ojay_console_write != 0 || (uintptr_t)&__ojay_console_mcxn947 != 0;
+}
+
 static int semihost_available(void) {
   if ((uintptr_t)&__ojay_semihost_always != 0) return 1;
-  return (SCB_DHCSR & 1u) != 0; /* C_DEBUGEN: a debugger is connected */
+  if ((SCB_DHCSR & 1u) == 0) return 0; /* C_DEBUGEN clear: bkpt would fault */
+  return debugger_announced || !have_console();
+}
+
+/* ---- FRDM-MCXN947: LP_FLEXCOMM4 as LPUART, TX on P1_9, RX on P1_8 (ALT2),
+ * clocked from FRO 12 MHz, 115200 8N1. Register layout from NXP's
+ * MCXN947 device headers (SYSCON, SCG, PORT, LP_FLEXCOMM, LPUART). */
+#define MMIO(a) (*(volatile uint32_t *)(uintptr_t)(a))
+#define MCX_SYSCON 0x40000000u
+#define MCX_SCG0 0x40044000u
+#define MCX_PORT1 0x40117000u
+#define MCX_FC4 0x400B4000u
+#define LPUART_BAUD 0x10u
+#define LPUART_STAT 0x14u
+#define LPUART_CTRL 0x18u
+#define LPUART_DATA 0x1Cu
+#define LPUART_FIFO 0x28u
+#define LPUART_STAT_TDRE (1u << 23)
+#define LPUART_STAT_TC (1u << 22)
+
+static int mcx_uart_ready;
+
+static void mcx_uart_init(void) {
+  MMIO(MCX_SCG0 + 0x200) |= 1u << 5;          /* SIRCCSR.SIRC_CLK_PERIPH_EN: FRO 12 MHz to peripherals */
+  MMIO(MCX_SYSCON + 0x220) = 1u << 14;        /* AHBCLKCTRLSET0: PORT1 */
+  MMIO(MCX_SYSCON + 0x224) = 1u << 15;        /* AHBCLKCTRLSET1: LP_FLEXCOMM4 */
+  MMIO(MCX_SYSCON + 0x140) = 1u << 14;        /* PRESETCTRLCLR0: PORT1 out of reset */
+  MMIO(MCX_SYSCON + 0x144) = 1u << 15;        /* PRESETCTRLCLR1: LP_FLEXCOMM4 out of reset */
+  MMIO(MCX_SYSCON + 0x2B0 + 4 * 4) = 2;       /* FCCLKSEL4: FRO 12 MHz */
+  MMIO(MCX_SYSCON + 0x850 + 4 * 4) = 1u << 30; /* FLEXCOMM4CLKDIV: halt, then divide by 1 */
+  MMIO(MCX_SYSCON + 0x850 + 4 * 4) = 0;
+  for (int i = 0; i < 100000 && (MMIO(MCX_SYSCON + 0x850 + 4 * 4) & (1u << 31)); i++) {}
+  MMIO(MCX_FC4 + 0xFF8) = (MMIO(MCX_FC4 + 0xFF8) & ~7u) | 1u; /* PSELID: LPUART */
+  MMIO(MCX_FC4 + LPUART_CTRL) = 0;
+  /* 12 MHz / (26 * 4) = 115385 baud (+0.16%): OSR = 26 - 1, SBR = 4. */
+  MMIO(MCX_FC4 + LPUART_BAUD) = (25u << 24) | 4u;
+  MMIO(MCX_FC4 + LPUART_FIFO) |= 1u << 7;     /* TXFE: transmit FIFO */
+  MMIO(MCX_FC4 + LPUART_CTRL) = 1u << 19;     /* TE: the transmitter idles high */
+  /* Route the pins only now, with a pull-up on TX, so the line never goes
+   * low (which the receiver would take for a NUL byte or a break). */
+  MMIO(MCX_PORT1 + 0x80 + 4 * 9) = (2u << 8) | 3u;          /* PCR9: TX, ALT2, pull-up */
+  MMIO(MCX_PORT1 + 0x80 + 4 * 8) = (2u << 8) | (1u << 12) | 3u; /* PCR8: RX, ALT2, input buffer, pull-up */
+  mcx_uart_ready = 1;
+}
+
+static void mcx_uart_write(const uint8_t *p, int64_t n) {
+  if (!mcx_uart_ready) mcx_uart_init();
+  for (int64_t i = 0; i < n; i++) {
+    if (p[i] == '\n') {
+      while (!(MMIO(MCX_FC4 + LPUART_STAT) & LPUART_STAT_TDRE)) {}
+      MMIO(MCX_FC4 + LPUART_DATA) = '\r';
+    }
+    while (!(MMIO(MCX_FC4 + LPUART_STAT) & LPUART_STAT_TDRE)) {}
+    MMIO(MCX_FC4 + LPUART_DATA) = p[i];
+  }
+}
+
+static void console_write(const void *buf, int64_t n) {
+  if (__ojay_console_write) __ojay_console_write((const uint8_t *)buf, n);
+  else if ((uintptr_t)&__ojay_console_mcxn947 != 0) mcx_uart_write((const uint8_t *)buf, n);
+}
+
+static void console_drain(void) {
+  if (!__ojay_console_write && mcx_uart_ready)
+    while (!(MMIO(MCX_FC4 + LPUART_STAT) & LPUART_STAT_TC)) {}
 }
 
 static int semihost(int op, void *arg) {
@@ -173,13 +264,27 @@ static int sh_handle(int fd) {
 }
 
 static void plat_write(int fd, const void *buf, int64_t n) {
-  if (n <= 0 || !semihost_available()) return;
+  if (n <= 0) return;
+  if (!semihost_available()) {
+    console_write(buf, n);
+    return;
+  }
   uintptr_t args[3] = {(uintptr_t)sh_handle(fd), (uintptr_t)buf, (uintptr_t)n};
   semihost(SH_WRITE, args);
 }
 
+/* Without semihosting the program ends in a wfi loop with r0 = OJAY_EXITED_MAGIC
+ * and r1 = the exit status, where a debugger can read them. */
+#define OJAY_EXITED_MAGIC 0xE417C0DEu
+
 __attribute__((noreturn)) static void plat_exit(int code) {
-  if (semihost_available()) {
+  if (!semihost_available()) {
+    console_drain();
+    register uint32_t r0 __asm__("r0") = OJAY_EXITED_MAGIC;
+    register uint32_t r1 __asm__("r1") = (uint32_t)code;
+    for (;;) __asm__ volatile("wfi" : : "r"(r0), "r"(r1));
+  }
+  {
     /* ADP_Stopped_ApplicationExit with an exit code (SYS_EXIT_EXTENDED),
      * falling back to plain SYS_EXIT for hosts that lack it. */
     uintptr_t args[2] = {0x20026, (uintptr_t)code};
@@ -850,9 +955,33 @@ __attribute__((noreturn)) static void heap_bad_pointer(const char *what, void *p
 }
 #endif
 
-/* Saved for a future get_command_line_arguments(). */
+/* Saved for get_command_line_arguments(). */
 int __ojay_argc;
 char **__ojay_argv;
+
+/* get_command_line_arguments(): the arguments as Jai strings ({count, data}),
+   built on the first call; the array and the strings belong to the runtime.
+   Bare-metal programs have none. */
+const OString *__ojay_command_line_arguments(int64_t *count) {
+  static OString *args;
+  static int64_t n;
+  if (!args && __ojay_argc > 0 && __ojay_argv) {
+    OString *a = (OString *)plat_alloc((int64_t)sizeof(OString) * __ojay_argc);
+    if (a) {
+      for (int i = 0; i < __ojay_argc; i++) {
+        const char *s = __ojay_argv[i] ? __ojay_argv[i] : "";
+        int64_t len = 0;
+        while (s[len]) len++;
+        a[i].count = len;
+        a[i].data = (uint8_t *)s;
+      }
+      n = __ojay_argc;
+      args = a;
+    }
+  }
+  *count = n;
+  return args;
+}
 
 void __ojay_runtime_init(int argc, char **argv) {
   __ojay_argc = argc;
@@ -1051,7 +1180,10 @@ extern uint8_t __bss_start[], __bss_end[];
 #define SCB_CFSR (*(volatile uint32_t *)0xE000ED28u)
 #define SCB_HFSR (*(volatile uint32_t *)0xE000ED2Cu)
 
-__attribute__((noreturn, used)) void Reset_Handler(void) {
+/* r0 / r1 hold whatever the core had at reset, or the values a debugger set
+ * to announce that it handles semihosting (see "Console"). */
+__attribute__((noreturn, used)) void Reset_Handler(uint32_t r0, uint32_t r1) {
+  int announced = r0 == OJAY_DEBUGGER_MAGIC && r1 == ~OJAY_DEBUGGER_MAGIC;
   /* Enable the FPU (CP10/CP11 full access) before any floating-point code. */
   SCB_CPACR |= 0xFu << 20;
   __asm__ volatile("dsb\n isb" ::: "memory");
@@ -1059,6 +1191,10 @@ __attribute__((noreturn, used)) void Reset_Handler(void) {
     for (uint8_t *d = __data_start, *s = __data_load; d < __data_end;) *d++ = *s++;
   }
   for (uint8_t *d = __bss_start; d < __bss_end;) *d++ = 0;
+  debugger_announced = announced;
+  /* Drive the console's TX line from the start when it will carry the output. */
+  if (!semihost_available() && !__ojay_console_write && (uintptr_t)&__ojay_console_mcxn947 != 0)
+    mcx_uart_init();
   plat_exit(main(0, 0));
 }
 

@@ -7,6 +7,7 @@
 // Register addresses come from NXP's MCUXpresso SDK headers for the MCX N947;
 // the core runs at 48 MHz out of reset.
 
+#import "Basic";
 #import "Hardware";   // ojay extension: volatile_load / volatile_store
 
 // System configuration: clock gates and peripheral resets.
@@ -66,10 +67,12 @@ delay_ms :: (ms: int) {
 main :: () {
     init_led();
     init_timer();
-    // No print here: console output uses semihosting, which stops the core if
-    // a debugger has left debugging enabled but is not attached any more.
+    // Without a debugger this goes to the UART (the MCU-Link's virtual COM port).
+    count := 0;
     while true {
         write(GPIO0_BASE + GPIO_PTOR, 1 << LED_RED_PIN);
+        count += 1;
+        if count % 2 == 0  print("blink %\n", count / 2);
         delay_ms(500);
     }
 }

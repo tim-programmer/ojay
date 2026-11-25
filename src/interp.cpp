@@ -1876,6 +1876,8 @@ class Machine {
         std::string msg = a.size() == 2 ? read_string(eval(a[1]), a[1]->loc) : "";
         err(loc, "assertion failed", msg.empty() ? "" : ": ", msg);
       }
+      case Builtin::CommandLineArguments:
+        return make_string(0, 0);  // compile time: no program arguments (a view has a string's layout)
       case Builtin::Exit: {
         i64 code = (i64)get_int(eval(a[0]), a[0]->type);
         err(loc, "exit(", code, ") was called during compile-time execution");

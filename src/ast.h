@@ -146,7 +146,7 @@ enum class Builtin {
   SizeOf, TypeOf, TypeInfo,
   // Basic
   Print, Sprint, WriteString, Alloc, Free, Realloc, New, NewArray, ArrayAdd, ArrayFree, ArrayReset,
-  Assert, Exit, Memcpy, Memset, Min, Max, Abs, ToCString,
+  Assert, Exit, Memcpy, Memset, Min, Max, Abs, ToCString, CommandLineArguments,
   // Preload internals: the runtime's own heap, bypassing the context's allocator
   RawAlloc, RawFree, RawRealloc,
   // Math

@@ -619,7 +619,7 @@ class Checker : public InterpHost {
     static const std::unordered_set<std::string> names = {
         "print", "sprint", "tprint", "write_string", "alloc", "free", "realloc", "New", "NewArray",
         "array_add", "array_free", "array_reset", "assert", "exit", "memcpy", "memset", "min", "max",
-        "to_c_string"};
+        "to_c_string", "get_command_line_arguments"};
     return names.count(n) > 0;
   }
   static bool is_math_name(const std::string& n) {
@@ -665,6 +665,7 @@ class Checker : public InterpHost {
       add_builtin(sc, "min", Builtin::Min);
       add_builtin(sc, "max", Builtin::Max);
       add_builtin(sc, "to_c_string", Builtin::ToCString);
+      add_builtin(sc, "get_command_line_arguments", Builtin::CommandLineArguments);
       limits();
     } else if (module == "Hardware") {
       add_builtin(sc, "volatile_load", Builtin::VolatileLoad);
@@ -4459,6 +4460,9 @@ class Checker : public InterpHost {
         if (a.size() == 2) check_value(a[1], T.string_t);
         return T.void_t;
       }
+      case Builtin::CommandLineArguments:
+        positional(c, 0, 0, "get_command_line_arguments");
+        return T.array_of(T.string_t, ArrayKind::View);
       case Builtin::Exit: {
         auto& a = positional(c, 1, 1, "exit");
         check_value(a[0], T.s32);
