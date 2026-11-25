@@ -1,0 +1,26 @@
+max_of: 7 2.5 200 -4
+max_of s16: 300 s16
+first: 4 alpha x
+last: beta
+count_of: 6 2
+swap: 2 1 right left
+apply: 42 4 3
+describe_type: s64 (8 bytes) | bool (1 bytes) | [6]s64 (48 bytes)
+sum_all: 6 0.75 310
+make: 2.5 *float64
+zero_of: 0 "" false
+convert: 65 65535
+repeat: [ab, ab, ab] [3]string [2]s64
+scaled: 40 12
+nth_power: 1024 27 1
+show: int overload | polymorphic (s32) | polymorphic (string) | pair of float32 | polymorphic ([6]s64)
+defaults: s64 float32
+append: [1, 4, 9, 16, 25, 36, 49, 64, 81, 100] (count 10, allocated 16)
+index_of: 6 -1 1
+map: [8, 16, 30, 32, 46, 84] [5, 4] [..]s64
+stack: 50 40 3, second 1
+pair: answer 42 Pair(string, s64)
+quicksort: [1, 2, 3, 5, 7, 8, 9] [-1, 0, 0.5, 2.5]
+negate: -3 -1.5 not ok
+named: [1.5, 1.5] 100
+clamp: 10 -1 7

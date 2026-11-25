@@ -1,0 +1,12 @@
+cast float->int: 3
+cast int->float64: 1.5
+trunc: 44
+widen: 12
+xx: 200
+sqrt: 1.414214
+floor/ceil: 2 3
+min/max/abs: 3 1 17
+PI: 3.141593
+limits: 2147483647 255
+big float: 1e+20
+neg float: -0.125

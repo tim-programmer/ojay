@@ -1,0 +1,14 @@
+{SQUARE, box, 2.5, [1, 2, 3], true, null}
+[{SQUARE, box, 2.5, [1, 2, 3], true, null}, {CIRCLE, dot, 0.125, [0, 0, 0], false, null}]
+nested: {-7, [x, yz]}
+any int: 42, type s64
+any string: text, type string
+any enum: SQUARE, type Kind
+types: Shape [2]Shape *Shape [3]u8 s64
+empty view: [], count 0
+null pointer: null
+chars: 120 120
+1 and % and 2
+counted
+print returned 8
+write_string works

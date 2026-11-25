@@ -1,0 +1,8 @@
+orc 100 true {0, 0, 0}
+after: 70
+dead: -10 false
+v = {11, 2, 33}
+v.y = 4
+p.pos = {5, 0, 0}, size_of(Vec3) = 12
+list total = 6
+elf 100 true

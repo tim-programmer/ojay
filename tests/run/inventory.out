@@ -1,0 +1,11 @@
+5 items, total value 149.96
+restock: hammer
+restock: saw
+restock: glue
+0: hammer x 12.99 = 51.96
+1: saw x 24.50 = 49.00
+2: bolts x 0.05 = 25.00
+3: nuts x 0.03 = 24.00
+4: glue x 4.50 = 0.00
+after removing the first: 4 items: glue saw bolts nuts
+many: count=1000 last=1000000 allocated>=count: true

@@ -1,0 +1,95 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A made-up device covering the SVD features tools/regs2jai.py handles. -->
+<device schemaVersion="1.3">
+  <name>TESTDEV</name>
+  <size>32</size>
+  <peripherals>
+    <peripheral>
+      <name>GPIOA</name>
+      <groupName>GPIO</groupName>
+      <description>General-purpose I/O</description>
+      <baseAddress>0x40010000</baseAddress>
+      <interrupt><name>GPIOA</name><value>7</value></interrupt>
+      <registers>
+        <register>
+          <name>MODE</name>
+          <description>Mode</description>
+          <addressOffset>0x0</addressOffset>
+          <fields>
+            <field>
+              <name>PIN%s</name>
+              <dim>4</dim><dimIncrement>2</dimIncrement>
+              <bitOffset>0</bitOffset><bitWidth>2</bitWidth>
+              <enumeratedValues>
+                <enumeratedValue><name>INPUT</name><value>0</value></enumeratedValue>
+                <enumeratedValue><name>OUTPUT</name><value>#01</value></enumeratedValue>
+                <enumeratedValue><name>ANY</name><value>#1x</value></enumeratedValue>
+              </enumeratedValues>
+            </field>
+          </fields>
+        </register>
+        <register>
+          <name>OUT</name>
+          <addressOffset>0x8</addressOffset>
+          <fields>
+            <field><name>VALUE</name><bitRange>[15:4]</bitRange></field>
+            <field><name>EN</name><lsb>31</lsb><msb>31</msb></field>
+          </fields>
+        </register>
+        <register>
+          <name>CTRL_A</name>
+          <description>Control (mode A)</description>
+          <addressOffset>0xC</addressOffset>
+        </register>
+        <register>
+          <name>CTRL_B</name>
+          <description>Control (mode B)</description>
+          <alternateRegister>CTRL_A</alternateRegister>
+          <addressOffset>0xC</addressOffset>
+        </register>
+        <register>
+          <name>CTRL_HI</name>
+          <description>Upper half of CTRL in mode B</description>
+          <addressOffset>0xE</addressOffset>
+          <size>16</size>
+          <fields><field><name>X</name><bitOffset>8</bitOffset><bitWidth>8</bitWidth></field></fields>
+        </register>
+        <register>
+          <dim>8</dim><dimIncrement>4</dimIncrement>
+          <name>PCR[%s]</name>
+          <addressOffset>0x20</addressOffset>
+          <fields><field><name>MUX</name><bitOffset>8</bitOffset><bitWidth>3</bitWidth></field></fields>
+        </register>
+        <register>
+          <dim>2</dim><dimIncrement>8</dimIncrement><dimIndex>LO,HI</dimIndex>
+          <name>FILT_%s</name>
+          <addressOffset>0x40</addressOffset>
+          <size>16</size>
+        </register>
+        <cluster>
+          <dim>3</dim><dimIncrement>0x10</dimIncrement>
+          <name>CH[%s]</name>
+          <addressOffset>0x100</addressOffset>
+          <register><name>CFG</name><addressOffset>0x0</addressOffset>
+            <fields><field><name>ON</name><bitOffset>0</bitOffset><bitWidth>1</bitWidth></field></fields>
+          </register>
+          <register><name>DATA</name><addressOffset>0x8</addressOffset></register>
+        </cluster>
+      </registers>
+    </peripheral>
+    <peripheral derivedFrom="GPIOA">
+      <name>GPIOB</name>
+      <baseAddress>0x40011000</baseAddress>
+      <interrupt><name>GPIOB</name><value>8</value></interrupt>
+    </peripheral>
+    <peripheral>
+      <name>TIMER</name>
+      <description>A timer whose name is a Jai keyword: if</description>
+      <baseAddress>0x40020000</baseAddress>
+      <registers>
+        <register><name>if</name><addressOffset>0x0</addressOffset></register>
+        <register><name>COUNT</name><addressOffset>0x8</addressOffset><size>64</size></register>
+      </registers>
+    </peripheral>
+  </peripherals>
+</device>

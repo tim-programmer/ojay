@@ -1,0 +1,8 @@
+NORTH EAST SOUTH WEST 
+flags = READ | EXEC, raw = 5
+has write: false
+levels: LOW MID 6
+SIZE=4 HALF=2 count=4 NAME=constant RATIO=1.5
+Index: 7 s32
+x = 240
+WEST EAST

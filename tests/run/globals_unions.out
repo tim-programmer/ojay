@@ -1,0 +1,11 @@
+config = {default, 3, 0.5}
+config = {custom, 5, 0.5}
+ids: 101 102 103
+table sum = 20, buffer size = 48, first byte = 0
+last byte = 255
+1.0 as bits: 1065353216 (0x3f800000 = 1065353216)
+bytes (little endian): [0, 0, 128, 63]
+0xC0490FDB as float32: -3.141593
+size_of(Bits) = 4
+release build, version 3
+version 3 features enabled

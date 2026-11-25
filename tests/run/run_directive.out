@@ -1,0 +1,15 @@
+crc32("123456789") = 3421780262
+sines: 0 1 -1
+N = 8, buffer.count = 8, #if taken
+repeat = 7777
+config = 13 cfg2, global_level = 42
+outer = {{[1, 2, 3], hi, GREEN}, true, 0.25, [4]u16}
+outer.inner.label = hi, kind = [4]u16
+squares = {[0, 1, 4, 9, 16]}, type = Vector(s16, 5)
+picked: pointer-sized = true, matches = true
+busy = 10470
+bumped = 15 15, counter = 5
+layout matches: true, pointer size matches: true
+twice = 42, twice(2.5) = 5, twice(i) = 4, triple = 21
+runtime index: true 9
+odd entries: 128

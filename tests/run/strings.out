@@ -1,0 +1,14 @@
+'hello, world' has 12 bytes, 3 'l's, 2 'o's
+upper: HELLO, WORLD
+reversed: dlrow ,olleh
+'racecar' palindrome: true
+'level' palindrome: true
+'jai' palindrome: false
+'a' palindrome: true
+'' palindrome: true
+TEXT has 43 bytes and 9 words
+first line ends at 19
+Hello, Sailor! You are 42 years old. (36 bytes)
+equal: true false
+substring: 'Sailor'
+tab[	] quote["] backslash[\] hex[A] code=65

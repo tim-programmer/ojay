@@ -1,0 +1,15 @@
+t=0 RED for 30s
+t=30 RED_AMBER for 5s
+t=35 GREEN for 30s
+t=65 AMBER for 5s
+t=70 RED for 30s
+t=100 RED_AMBER for 5s
+t=105 GREEN for 30s
+t=135 AMBER for 5s
+size_of(Light) = 1, last value = 3
+events = BUTTON | EMERGENCY
+emergency!
+no sensor event
+after clearing BUTTON: EMERGENCY
+none = NONE
+7 is at index 5

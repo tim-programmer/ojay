@@ -1,0 +1,14 @@
+negative zero small large
+while 1
+while 3
+for 0
+for 2
+rev 3
+rev 2
+rev 1
+named 5
+named 6
+named 7
+(0,0) (0,1) (1,0) (1,1) 
+ifx: 100 small
+zero one-or-two one-or-two other other 

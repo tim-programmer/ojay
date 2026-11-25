@@ -1,0 +1,12 @@
+even(10)=true odd(7)=true even(7)=false
+add 6 3 = 9
+sub 6 3 = 3
+mul 6 3 = 18
+midpoint = {2, 1}
+empty midpoint = {0, 0}
+mean=3.75 lo=-1 hi=9
+clamp: 0 50 100 500
+bumps: 1 11 12
+twice: 7 81
+f is null: true
+f(7)=49, f==sq: true, f==inc: false

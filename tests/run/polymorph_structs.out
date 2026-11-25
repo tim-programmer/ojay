@@ -1,0 +1,12 @@
+vector: {[1.5, 2.5, 3.5]} Vector(float32, 3)
+scaled: {[2, 4, 6]} {[3, 6, 9]}
+dot: 3 dims: 3 5
+ints: {[13, 24]} 110 Vector(s64, 2)
+sizes: 3 24 12
+equal: true false true
+same type: true true false
+names: Vector(Vector(u8, 2), 1) Buffer(string, 4, "-")
+buffer: [7, 7, 7, 7] 0 Buffer(s64, 4, 7)
+buffer: [true, true, true, true]
+list: 3 c *Node(string)
+module: 2.5 true Pair(s64, bool)

@@ -1,0 +1,9 @@
+a={1, 2} b={10, 2}
+nums=[1, 2, 3, 4] copy=[1, 20, 3, 4]
+bump_copy returned 1003, nums=[1, 2, 3, 4]
+after bump_view: [999, 2, 3, 4]
+move: {6, 2} (original {1, 2})
+poly={3, 4} other={3, 40}
+through pointer: {7, 0}
+swapped: {2, 2} {1, 1}
+same name: true, same x: true

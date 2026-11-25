@@ -1,0 +1,11 @@
+f: in block
+f: inner block
+f: body 1
+f: end of iteration 1
+f: end of iteration 2
+f: end of iteration 3
+f: deferred 2
+f: deferred 1
+f returned 42
+inner x = 2
+outer x = 1

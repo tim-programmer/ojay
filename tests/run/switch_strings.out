@@ -1,0 +1,8 @@
+go -> move
+run -> move
+stop -> stop
+halt -> stop
+ -> empty
+jump -> unknown
+stopped -> unknown
+built string matched

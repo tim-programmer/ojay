@@ -1,0 +1,5 @@
+in order: [20, 20, 20, 30, 30, 40, 50, 60, 65, 70, 80]
+height: 4
+contains 65: true, contains 66: false
+root: key=50 count=1 left=30 right=70
+freed 8 nodes
