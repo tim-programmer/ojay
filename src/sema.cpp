@@ -11,6 +11,9 @@
 #include <unordered_set>
 
 namespace ojay {
+
+extern const char* const kPreloadSource;  // preload.jai (generated preload.cpp)
+
 namespace {
 
 using i128 = __int128;
@@ -77,6 +80,7 @@ struct Context {
   std::vector<Stmt*> loops;
   int defer_depth;
   std::vector<MacroCtx> macros;
+  int push_depth;
 };
 
 // An error that needs no notes on where it happened (it says so itself).
@@ -101,6 +105,7 @@ class Checker : public InterpHost {
   void run() {
     universe_ = new_scope(nullptr, nullptr);
     setup_universe();
+    setup_preload();
     for (auto& m : prog_.modules) {
       m.scope = new_scope(universe_, nullptr);
       m.scope->is_module = true;
@@ -113,6 +118,8 @@ class Checker : public InterpHost {
       if (prog_.modules[i].kind == ModuleUnit::Kind::Builtin) continue;
       scope_ = prog_.modules[i].scope;
       collect(prog_.modules[i].top_level, false);
+      // The Preload is visible in every module, after the module's own imports.
+      scope_->imports.push_back(preload_);
     }
     scope_ = global_;
 
@@ -163,6 +170,15 @@ class Checker : public InterpHost {
 
   std::vector<Symbol*> global_order_;
   std::vector<std::pair<Stmt*, Scope*>> top_directives_;
+  // The Preload (preload.jai): its declarations are resolved only when used.
+  Scope* preload_ = nullptr;
+  Symbol* context_sym_ = nullptr;   // `context`
+  bool lazy_collect_ = false;       // collecting the Preload: declarations are not resolved eagerly
+  bool context_ready_ = false;
+  bool context_resolving_ = false;
+  Type* context_type_ = nullptr;
+  std::vector<std::pair<Decl*, Scope*>> context_additions_;  // #add_context members
+  int push_depth_ = 0;  // push_context blocks around the code being checked (in the current procedure)
   std::vector<ProcLit*> pending_;
   std::unordered_map<Type*, std::pair<StructDef*, Scope*>> struct_defs_;
   std::vector<Type*> all_structs_;
@@ -233,6 +249,8 @@ class Checker : public InterpHost {
     ComptimeMode mode(*this, !p->registered, p, false);
     check_proc_body(p);
   }
+  Symbol* default_context() override { return prog_.default_context; }
+  ProcLit* allocate_proc() override { return prog_.allocate_proc; }
 
  private:
 
@@ -288,13 +306,14 @@ class Checker : public InterpHost {
     return s;
   }
 
-  Context save() { return Context{scope_, proc_, loops_, defer_depth_, macros_}; }
+  Context save() { return Context{scope_, proc_, loops_, defer_depth_, macros_, push_depth_}; }
   void restore(const Context& c) {
     scope_ = c.scope;
     proc_ = c.proc;
     loops_ = c.loops;
     defer_depth_ = c.defer_depth;
     macros_ = c.macros;
+    push_depth_ = c.push_depth;
   }
 
   // Restores the context (and whether a #run expression is being checked)
@@ -491,6 +510,109 @@ class Checker : public InterpHost {
     add_builtin(universe_, "type_of", Builtin::TypeOf);
   }
 
+  // ------------------------------------------------------------------ the context (Preload)
+
+  // Parses the Preload into its own scope. Its declarations are only resolved
+  // when something uses them; its procedures can use Basic's built-ins and the
+  // runtime's raw allocator, which the program does not see.
+  void setup_preload() {
+    Scope* internals = new_scope(universe_, nullptr);
+    internals->is_module = true;
+    add_module_builtins(internals, "Basic");
+    add_builtin(internals, "__ojay_raw_alloc", Builtin::RawAlloc);
+    add_builtin(internals, "__ojay_raw_free", Builtin::RawFree);
+    add_builtin(internals, "__ojay_raw_realloc", Builtin::RawRealloc);
+    preload_ = new_scope(universe_, nullptr);
+    preload_->is_module = true;
+    preload_->imports.push_back(internals);
+    std::vector<Stmt*> stmts = parse_source_stmts(ast_, sm_, sm_.add("<preload>", kPreloadSource), true);
+    Scope* saved = scope_;
+    scope_ = preload_;
+    lazy_collect_ = true;
+    collect(stmts, true);
+    lazy_collect_ = false;
+    scope_ = saved;
+    context_sym_ = declare(preload_, "context", SymKind::Var, SourceLoc{});
+    context_sym_->is_context = true;
+    context_sym_->is_global = true;
+    context_sym_->state = Symbol::State::Resolved;
+  }
+
+  Symbol* preload_sym(const char* name) { return preload_->syms.at(name); }
+
+  // The program uses the context (or something else of the Preload): from now
+  // on allocations go through context.allocator, and code generation needs
+  // the default context and __allocate.
+  void ensure_context_support() {
+    if (context_ready_ || context_resolving_) return;
+    context_resolving_ = true;
+    prog_.uses_context = true;
+    Symbol* ctx = preload_sym("Context");
+    resolve(ctx);
+    context_type_ = ctx->cv.t;
+    context_sym_->type = context_type_;
+    Symbol* al = preload_sym("Allocator");
+    resolve(al);
+    prog_.allocator_type = al->cv.t;
+    complete_type(context_type_, SourceLoc{});
+    Symbol* dc = preload_sym("__default_context");
+    resolve(dc);
+    prog_.default_context = dc;
+    Symbol* ap = preload_sym("__allocate");
+    resolve(ap);
+    prog_.allocate_proc = ap->proc;
+    context_resolving_ = false;
+    context_ready_ = true;
+  }
+
+  Type* allocator_type() {
+    ensure_context_support();
+    return prog_.allocator_type;
+  }
+
+  // Whether the code being checked has a context: everything but #c_call and
+  // #no_context procedures, unless inside a push_context.
+  bool has_context() const { return !proc_ || !(proc_->c_call || proc_->no_context) || push_depth_ > 0; }
+
+  static std::string proc_desc(const ProcLit* p) { return p->name.empty() ? "<anonymous>" : "'" + p->name + "'"; }
+  const char* no_context_why() const { return proc_->c_call ? "#c_call" : "#no_context"; }
+
+  // `what` needs a context.
+  void require_context(SourceLoc loc, const std::string& what) {
+    if (has_context()) return;
+    fail(loc, what, " needs a context, but ", no_context_why(), " procedure ", proc_desc(proc_),
+         " has none (give it one with push_context)");
+  }
+
+  // `context`
+  Type* check_context_ident(Ident* id) {
+    ensure_context_support();
+    if (!proc_ && !in_run_operand_) fail(id->loc, "'context' only exists inside procedures");
+    if (!has_context())
+      fail(id->loc, "cannot use 'context' in ", no_context_why(), " procedure ", proc_desc(proc_),
+           ": it has no context (give it one with push_context)");
+    complete_type(context_type_, id->loc);
+    return context_type_;
+  }
+
+  void check_push_context(PushContext* pc) {
+    ensure_context_support();
+    if (!proc_) fail(pc->loc, "push_context is only allowed inside a procedure");
+    Type* t = check_rv(pc->ctx, context_type_);
+    if (t != context_type_)
+      fail(pc->ctx->loc, "push_context needs a value of type Context, not ", type_name(t));
+    ++push_depth_;
+    check_block(pc->body);
+    --push_depth_;
+  }
+
+  // The allocator argument of an allocating built-in.
+  void set_allocator_arg(Call* c, Expr* a) {
+    if (!a) return;
+    check_value(a, allocator_type());
+    c->allocator = a;
+  }
+
   static bool is_basic_name(const std::string& n) {
     static const std::unordered_set<std::string> names = {
         "print", "sprint", "tprint", "write_string", "alloc", "free", "realloc", "New", "NewArray",
@@ -578,6 +700,12 @@ class Checker : public InterpHost {
         case NK::Decl: {
           auto* d = static_cast<Decl*>(s);
           d->is_global = true;
+          if (d->add_context) {  // a member of Context, added when Context is laid out
+            if (context_type_ && context_type_->layout_state != Type::LayoutState::None)
+              fail(d->loc, "#add_context after Context has been used (by #run code that ran earlier)");
+            context_additions_.push_back({d, scope_});
+            break;
+          }
           for (size_t i = 0; i < d->names.size(); ++i) {
             Symbol* sym = d->is_const ? declare_const(scope_, d, i)
                                       : declare(scope_, d->names[i].name, SymKind::Var, d->names[i].loc);
@@ -585,7 +713,7 @@ class Checker : public InterpHost {
             sym->decl_index = (int)i;
             sym->is_global = true;
             d->syms.push_back(sym);
-            global_order_.push_back(sym);
+            if (!lazy_collect_) global_order_.push_back(sym);
           }
           break;
         }
@@ -692,6 +820,8 @@ class Checker : public InterpHost {
   // ------------------------------------------------------------------ symbol resolution
 
   void resolve(Symbol* s) {
+    // Anything from the Preload brings in the context machinery.
+    if (s->scope == preload_ && !context_ready_) ensure_context_support();
     if (s->state == Symbol::State::Resolved) return;
     if (s->state == Symbol::State::Resolving)
       fail(s->loc, "circular dependency: '", s->name, "' depends on itself");
@@ -841,6 +971,12 @@ class Checker : public InterpHost {
         return true;
       case NK::Ident:
         return static_cast<Ident*>(e)->sym->kind == SymKind::Proc;
+      case NK::Unary: {  // the address of a global variable
+        auto* u = static_cast<Unary*>(e);
+        if (u->op != UnOp::AddrOf || u->operand->kind != NK::Ident) return false;
+        Symbol* g = static_cast<Ident*>(u->operand)->sym;
+        return g->kind == SymKind::Var && g->is_global && !g->is_context;
+      }
       case NK::ImplicitConv: {
         auto* ic = static_cast<ImplicitConv*>(e);
         return ic->type->kind != TypeKind::Any && ic->operand->type->kind != TypeKind::Array &&
@@ -1003,13 +1139,19 @@ class Checker : public InterpHost {
     proc_ = sc->proc;
     macros_.clear();
     std::unordered_set<std::string> names;
-    std::vector<Decl*> todo(sd->members.rbegin(), sd->members.rend());  // a stack: next member last
+    // A stack (next member last) of members and the scopes they are checked in.
+    std::vector<std::pair<Decl*, Scope*>> todo;
+    if (t == context_type_)  // #add_context members come after Context's own
+      for (auto it = context_additions_.rbegin(); it != context_additions_.rend(); ++it) todo.push_back(*it);
+    for (auto it = sd->members.rbegin(); it != sd->members.rend(); ++it) todo.push_back({*it, sc});
     while (!todo.empty()) {
-      Decl* d = todo.back();
+      auto [d, dsc] = todo.back();
       todo.pop_back();
+      scope_ = dsc;
+      proc_ = dsc->proc;
       if (d->insert) {  // `#insert x;`: its members come next
         std::vector<Decl*> more = with_note(insert_note(d->loc), [&] { return inserted_members(d); });
-        todo.insert(todo.end(), more.rbegin(), more.rend());
+        for (auto it = more.rbegin(); it != more.rend(); ++it) todo.push_back({*it, dsc});
         continue;
       }
       Type* ft = d->type_expr ? resolve_type(d->type_expr) : nullptr;
@@ -1073,6 +1215,7 @@ class Checker : public InterpHost {
     scope_ = new_scope(p->scope, p);
     loops_.clear();
     defer_depth_ = 0;
+    push_depth_ = 0;
     macros_.clear();
     for (size_t i = 0; i < p->params.size(); ++i) {
       Decl* d = p->params[i];
@@ -1099,6 +1242,7 @@ class Checker : public InterpHost {
     switch (s->kind) {
       case NK::Break: return static_cast<BreakContinue*>(s)->target == loop;
       case NK::Insert: return contains_break_to(static_cast<Insert*>(s)->result, loop);
+      case NK::PushContext: return contains_break_to(static_cast<PushContext*>(s)->body, loop);
       case NK::ExprStmt: {
         Expr* e = static_cast<ExprStmt*>(s)->expr;
         return e->kind == NK::Expansion && contains_break_to(static_cast<MacroExpansion*>(e)->body, loop);
@@ -1138,6 +1282,7 @@ class Checker : public InterpHost {
         return t == nullptr || t == exp;
       }
       case NK::Insert: return always_returns(static_cast<Insert*>(s)->result, exp);
+      case NK::PushContext: return always_returns(static_cast<PushContext*>(s)->body, exp);
       case NK::Block:
         for (Stmt* x : static_cast<Block*>(s)->stmts)
           if (always_returns(x, exp)) return true;
@@ -1275,6 +1420,7 @@ class Checker : public InterpHost {
         return;
       }
       case NK::Using: check_using(static_cast<UsingStmt*>(s)); return;
+      case NK::PushContext: check_push_context(static_cast<PushContext*>(s)); return;
       case NK::Import:
       case NK::Load:
         fail(s->loc, "#import and #load are only allowed at top level");
@@ -1754,6 +1900,7 @@ class Checker : public InterpHost {
           case MemberKind::ArrayCount:
           case MemberKind::ArrayData:
           case MemberKind::ArrayAllocated:
+          case MemberKind::ArrayAllocator:
           case MemberKind::StringCount:
           case MemberKind::StringData:
             if (m->base->type->is_fixed_array() && !m->through_pointer) return false;
@@ -1956,6 +2103,7 @@ class Checker : public InterpHost {
       s = pick;
     }
     id->sym = s;
+    if (s->is_context) return check_context_ident(id);
     resolve(s);
     switch (s->kind) {
       case SymKind::Var:
@@ -2403,6 +2551,10 @@ class Checker : public InterpHost {
         if (m->name == "allocated" && bt->is_dynamic()) {
           m->mkind = MemberKind::ArrayAllocated;
           return T.s64;
+        }
+        if (m->name == "allocator" && bt->is_dynamic()) {
+          m->mkind = MemberKind::ArrayAllocator;
+          return allocator_type();
         }
         fail(m->loc, "array type ", type_name(bt), " has no member '", m->name, "'");
       case TypeKind::String:
@@ -3493,6 +3645,7 @@ class Checker : public InterpHost {
       case NK::While: for_each_return(static_cast<While*>(s)->body, f); return;
       case NK::For: for_each_return(static_cast<For*>(s)->body, f); return;
       case NK::Defer: for_each_return(static_cast<Defer*>(s)->body, f); return;
+      case NK::PushContext: for_each_return(static_cast<PushContext*>(s)->body, f); return;
       case NK::Switch:
         for (auto& c : static_cast<Switch*>(s)->cases)
           for (Stmt* x : c.body) for_each_return(x, f);
@@ -3678,6 +3831,8 @@ class Checker : public InterpHost {
     if (c->callee->kind == NK::Ident && static_cast<Ident*>(c->callee)->sym->kind == SymKind::Proc)
       lit = static_cast<Ident*>(c->callee)->sym->proc;
     c->proc_type = ct;
+    if (!ct->c_call)
+      require_context(c->loc, lit ? "calling " + proc_desc(lit) : std::string("calling a procedure value"));
     bind_args(c, ct, lit);
     if (ct->returns.empty()) return T.void_t;
     if (ct->returns.size() == 1) return ct->returns[0];
@@ -4029,6 +4184,41 @@ class Checker : public InterpHost {
     return c->resolved_args;
   }
 
+  // Arguments of a built-in with parameters `names`: positional ones first,
+  // then by name. The first `required` must be given; others may be null.
+  std::vector<Expr*> builtin_args(Call* c, std::initializer_list<const char*> names, size_t required,
+                                  const char* what) {
+    std::vector<const char*> ns(names);
+    std::vector<Expr*> out(ns.size(), nullptr);
+    size_t pos = 0;
+    bool named_seen = false;
+    for (auto& a : c->args) {
+      if (a.name.empty()) {
+        if (named_seen) fail(a.value->loc, "positional arguments must come before named ones");
+        if (pos >= ns.size()) fail(a.value->loc, "too many arguments for '", what, "'");
+        out[pos++] = a.value;
+        continue;
+      }
+      named_seen = true;
+      size_t i = 0;
+      while (i < ns.size() && a.name != ns[i]) ++i;
+      if (i == ns.size()) fail(a.name_loc, "'", what, "' has no parameter named '", a.name, "'");
+      if (out[i]) fail(a.name_loc, "parameter '", a.name, "' is given twice");
+      out[i] = a.value;
+    }
+    for (size_t i = 0; i < required; ++i)
+      if (!out[i]) fail(c->loc, "'", what, "' is missing its '", ns[i], "' argument");
+    return out;
+  }
+
+  // `initialized = b` of New / NewArray (a constant).
+  void set_initialized_arg(Call* c, Expr* e) {
+    if (!e) return;
+    check_value(e, T.bool_t);
+    if (!e->is_const()) fail(e->loc, "'initialized' must be a compile-time constant");
+    c->no_init = !e->cv.b;
+  }
+
   int count_format_specs(const std::string& fmt) {
     int n = 0;
     for (size_t i = 0; i < fmt.size(); ++i) {
@@ -4059,6 +4249,10 @@ class Checker : public InterpHost {
     if (!t->is_numeric()) fail(c->loc, "'", name, "' needs numeric arguments, not ", type_name(t));
     for (Expr*& a : args) coerce(a, t);
     return t;
+  }
+
+  static std::string callee_name(Call* c) {
+    return c->callee->kind == NK::Ident ? static_cast<Ident*>(c->callee)->name : std::string("sprint");
   }
 
   Type* check_builtin(Call* c, Type* hint) {
@@ -4112,7 +4306,15 @@ class Checker : public InterpHost {
         if (to_stderr) check_value(to_stderr, T.bool_t);
         c->resolved_args = args;
         c->resolved_args.push_back(to_stderr);  // may be null
-        return c->builtin == Builtin::Print ? T.s64 : T.string_t;
+        if (c->builtin == Builtin::Print) return T.s64;
+        require_context(c->loc, cat("'", callee_name(c), "'"));
+        if (callee_name(c) == "tprint") {  // sprint with temporary_allocator
+          auto* ta = ast_.make<Ident>(c->loc, "temporary_allocator");
+          ta->sym = preload_sym("temporary_allocator");
+          Expr* e = ta;
+          set_allocator_arg(c, e);
+        }
+        return T.string_t;
       }
       case Builtin::WriteString: {
         Expr* to_stderr = nullptr;
@@ -4133,12 +4335,19 @@ class Checker : public InterpHost {
         return T.void_t;
       }
       case Builtin::Alloc: {
-        auto& a = positional(c, 1, 1, "alloc");
-        check_value(a[0], T.s64);
+        auto args = builtin_args(c, {"size", "allocator"}, 1, "alloc");
+        require_context(c->loc, "'alloc'");
+        c->resolved_args = {args[0]};
+        check_value(c->resolved_args[0], T.s64);
+        set_allocator_arg(c, args[1]);
         return T.void_ptr;
       }
       case Builtin::Free: {
-        auto& a = positional(c, 1, 1, "free");
+        auto args = builtin_args(c, {"memory", "allocator"}, 1, "free");
+        require_context(c->loc, "'free'");
+        c->resolved_args = {args[0]};
+        set_allocator_arg(c, args[1]);
+        auto& a = c->resolved_args;
         Type* t = check_value(a[0], nullptr);
         if (t->is_pointer()) coerce(a[0], T.void_ptr);
         else if (t->is_view() || t->kind == TypeKind::String) {
@@ -4149,28 +4358,59 @@ class Checker : public InterpHost {
         return T.void_t;
       }
       case Builtin::Realloc: {
-        auto& a = positional(c, 3, 3, "realloc");
+        auto args = builtin_args(c, {"memory", "size", "old_size", "allocator"}, 3, "realloc");
+        require_context(c->loc, "'realloc'");
+        c->resolved_args = {args[0], args[1], args[2]};
+        auto& a = c->resolved_args;
+        check_value(a[0], T.void_ptr);
+        check_value(a[1], T.s64);
+        check_value(a[2], T.s64);
+        set_allocator_arg(c, args[3]);
+        return T.void_ptr;
+      }
+      case Builtin::New: {
+        auto args = builtin_args(c, {"T", "initialized", "allocator"}, 1, "New");
+        require_context(c->loc, "'New'");
+        c->resolved_args = {args[0]};
+        Type* t = resolve_type(c->resolved_args[0]);
+        complete_type(t, c->loc);
+        c->type_arg = t;
+        set_initialized_arg(c, args[1]);
+        set_allocator_arg(c, args[2]);
+        return T.pointer_to(t);
+      }
+      case Builtin::NewArray: {
+        auto args = builtin_args(c, {"count", "T", "initialized", "allocator"}, 2, "NewArray");
+        require_context(c->loc, "'NewArray'");
+        c->resolved_args = {args[0], args[1]};
+        auto& a = c->resolved_args;
+        check_value(a[0], T.s64);
+        Type* t = resolve_type(a[1]);
+        complete_type(t, c->loc);
+        c->type_arg = t;
+        set_initialized_arg(c, args[2]);
+        set_allocator_arg(c, args[3]);
+        return T.array_of(t, ArrayKind::View);
+      }
+      case Builtin::RawAlloc: {
+        auto& a = positional(c, 1, 1, "__ojay_raw_alloc");
+        check_value(a[0], T.s64);
+        return T.void_ptr;
+      }
+      case Builtin::RawFree: {
+        auto& a = positional(c, 1, 1, "__ojay_raw_free");
+        check_value(a[0], T.void_ptr);
+        return T.void_t;
+      }
+      case Builtin::RawRealloc: {
+        auto& a = positional(c, 3, 3, "__ojay_raw_realloc");
         check_value(a[0], T.void_ptr);
         check_value(a[1], T.s64);
         check_value(a[2], T.s64);
         return T.void_ptr;
       }
-      case Builtin::New: {
-        auto& a = positional(c, 1, 1, "New");
-        Type* t = resolve_type(a[0]);
-        complete_type(t, c->loc);
-        c->type_arg = t;
-        return T.pointer_to(t);
-      }
-      case Builtin::NewArray: {
-        auto& a = positional(c, 2, 2, "NewArray");
-        check_value(a[0], T.s64);
-        Type* t = resolve_type(a[1]);
-        complete_type(t, c->loc);
-        c->type_arg = t;
-        return T.array_of(t, ArrayKind::View);
-      }
       case Builtin::ArrayAdd: {
+        require_context(c->loc, "'array_add'");
         auto& a = positional(c, 1, 2, "array_add");
         Type* t = check_value(a[0], nullptr);
         if (!t->is_pointer() || !t->elem->is_dynamic())
@@ -4182,6 +4422,7 @@ class Checker : public InterpHost {
         return T.void_t;
       }
       case Builtin::ArrayFree: {
+        require_context(c->loc, "'array_free'");
         auto& a = positional(c, 1, 1, "array_free");
         Type* t = check_value(a[0], nullptr);
         if (t->kind != TypeKind::Array || t->is_fixed_array())
@@ -4189,6 +4430,7 @@ class Checker : public InterpHost {
         return T.void_t;
       }
       case Builtin::ArrayReset: {
+        require_context(c->loc, "'array_reset'");
         auto& a = positional(c, 1, 1, "array_reset");
         Type* t = check_value(a[0], nullptr);
         if (!t->is_pointer() || !t->elem->is_dynamic()) fail(a[0]->loc, "'array_reset' needs a pointer to a dynamic array");
@@ -4230,6 +4472,7 @@ class Checker : public InterpHost {
         return check_numeric_args(c, a, false, "abs");
       }
       case Builtin::ToCString: {
+        require_context(c->loc, "'to_c_string'");
         auto& a = positional(c, 1, 1, "to_c_string");
         check_value(a[0], T.string_t);
         return T.pointer_to(T.u8);

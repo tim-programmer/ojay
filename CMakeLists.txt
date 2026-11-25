@@ -16,7 +16,13 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 # ---------------------------------------------------------------- compiler
 
+# The Preload (Context, Allocator, ...) is Jai source compiled into the compiler.
+file(READ ${CMAKE_SOURCE_DIR}/src/preload.jai OJAY_PRELOAD)
+configure_file(src/preload.cpp.in ${CMAKE_BINARY_DIR}/generated/preload.cpp @ONLY)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/preload.jai)
+
 add_library(ojay_core STATIC
+  ${CMAKE_BINARY_DIR}/generated/preload.cpp
   src/lexer.cpp
   src/parser.cpp
   src/ast_clone.cpp

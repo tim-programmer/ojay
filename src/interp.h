@@ -23,6 +23,11 @@ class InterpHost {
   // Called before procedure `p` is executed: checks its body if that has not
   // happened yet. May throw CompileError.
   virtual void prepare_proc(ProcLit* p) = 0;
+  // The context (Preload), once the program uses it: the global holding the
+  // default Context, and __allocate. Null before (allocations then go to the
+  // interpreter's heap directly).
+  virtual Symbol* default_context() = 0;
+  virtual ProcLit* allocate_proc() = 0;
 };
 
 class Interpreter {

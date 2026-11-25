@@ -17,14 +17,16 @@
 - [x] Metaprogramming: `#insert`, `#code`, `#modify`, `#expand` (not yet: `#insert,scope()`,
       `Code_Node` introspection / `compiler_get_nodes`, `#caller_location`, `` `break``/`` `continue``,
       `#modify` on structs, macros with several return values)
-- [ ] The context and custom allocators
+- [x] The context and custom allocators (not yet: Basic's `log`, threads and thread contexts,
+      the `STARTUP` / `CAPS` / ... allocator modes, alignment requests)
 - [x] Named module imports (`Name :: #import "..."`) with a real namespace
 - [ ] `#foreign` procedures that pass or return structs by value (C ABI lowering)
 - [x] `if x == { case ...; }` switches on strings
 
 ## Runtime and modules
 
-- [ ] A real allocator for bare-metal targets (`free` currently does not reclaim memory)
+- [x] A real allocator for bare-metal targets: a first-fit free list with boundary tags and
+      immediate merging (not yet: size-class bins for faster allocation with many free blocks)
 - [ ] `get_command_line_arguments()` (argc/argv are already saved by the runtime)
 - [ ] Write more of `Basic` and `Math` in Jai once polymorphism exists
 - [ ] Cortex-M: console output without a debugger (UART), and avoid halting in

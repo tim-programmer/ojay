@@ -126,6 +126,19 @@ Serial/JTAG port.
 
 * The runtime provides the vector table and reset handler (FPU enable,
   `.data` copy, `.bss` clear, then `main`).
+* The heap is the RAM between `.bss` and the stack (`STACK_SIZE` in the
+  board script); on the MCX N947 RAM image that is about 110 KB. `free` and
+  `realloc` give memory back: the allocator is a first-fit free list with
+  boundary tags. Freed blocks are merged with free neighbours immediately,
+  `realloc` grows into a free successor or shrinks in place, and blocks are
+  8-byte aligned with 8 bytes of overhead each (16 and 16 on 64-bit). There
+  is one free list, so allocation time grows with the number of free
+  blocks. The freestanding x86-64 runtime uses the same allocator over
+  `mmap`ed chunks; hosted Linux uses libc's `malloc`.
+* Running out of memory stops the program with exit status 1 and a message
+  on stderr giving the request and the heap's state (size, free bytes,
+  largest free block). Freeing a pointer that is not an allocated block
+  (a double free, a pointer not from the heap) stops it too.
 * `print` and the exit status go through **semihosting**, so output appears
   in the debugger (OpenOCD, LinkServer, J-Link, pyOCD) or QEMU. With no
   debugger attached, output is dropped and the program halts in `wfi` on exit.
@@ -287,18 +300,27 @@ Implemented:
   A pointer to a fixed address is a compile-time constant
   (`GPIO0 :: cast(*GPIO_Type) 0x4009_6000;`), so register blocks can be
   described as structs, as in CMSIS headers (see *Register definitions* below).
+* The context and custom allocators (see *The context and allocators* below):
+  `context`, `push_context`, `Context`, `Allocator`, `Allocator_Proc`,
+  `Allocator_Mode`, `#add_context`, `#no_context`, temporary storage
+  (`temporary_allocator`, `tprint`, `talloc`, `reset_temporary_storage`),
+  `push_allocator`, and an allocator for each dynamic array
 * Built-in modules: `Basic` (`print`, `sprint`/`tprint`, `write_string`,
   `alloc`, `free`, `realloc`, `New`, `NewArray`, `array_add`, `array_free`,
   `array_reset`, `assert`, `exit`, `memcpy`, `memset`, `min`, `max`,
   `to_c_string`, integer limits) and `Math` (`sqrt`, `sin`, `cos`, `tan`,
-  `atan2`, `pow`, `floor`, `ceil`, `round`, `exp`, `log`, `abs`, `PI`, `TAU`)
+  `atan2`, `pow`, `floor`, `ceil`, `round`, `exp`, `log`, `abs`, `PI`, `TAU`).
+  The allocating ones use `context.allocator`; `alloc`, `free`, `realloc`,
+  `New` and `NewArray` also take an explicit allocator (`alloc(n, a)`,
+  `New(T, allocator = a)`), and `New` / `NewArray` take `initialized = false`.
 
 Not yet implemented: `#compiler` procedures and the compiler message loop
 (`#run,stallable`), `Code_Node` introspection (`compiler_get_nodes`),
 `#insert,scope(...)`, `#caller_location` / `#location`,
-`#procedure_of_call`, the context and custom allocators, `#foreign`
+`#procedure_of_call`, `#foreign`
 procedures that pass or return structs by value, `using` on pointer members
-and at top level, `#as`. Polymorphism does not yet cover `$$` auto-baking,
+and at top level, `#as`, Basic's `log` (the context has a logger; call
+`context.logger` directly), threads and thread contexts. Polymorphism does not yet cover `$$` auto-baking,
 `#bake_arguments`, `$T/Interface` constraints, `$R` introduced in a return
 type, `#modify` on structs, or polymorphic procedure values (using a template
 without calling it).
@@ -346,11 +368,96 @@ buffer: [#run compute_size()]u8;        // anywhere a constant is needed
 * Limits: 50 million steps (statements, loop iterations and calls; an
   infinite loop is reported after a few seconds), 20000 nested calls, 256 MB
   of heap and 16 MB of locals.
-* Differences from Jai: there is no compiler message loop, `#run,stallable`,
-  context or allocator support; results cannot contain pointers (Jai can
-  bake some of them into the program); `sin`, `pow` and other transcendental
+* The context works as at run time: `#run` code starts with the default
+  context, can `push_context`, and can use allocators written in Jai, also
+  ones that hand out memory from a buffer of the `#run` code (every access
+  is still checked).
+* Differences from Jai: there is no compiler message loop or
+  `#run,stallable`; results cannot contain pointers or procedure values
+  (so not a `Context` or `Allocator` either; Jai can bake some of them into
+  the program); `sin`, `pow` and other transcendental
   functions use the host's math library, whose last-bit rounding can differ
   from the target's libm.
+
+### The context and allocators
+
+```jai
+Counter :: struct { allocs: int; }
+counting :: (mode: Allocator_Mode, size: s64, old_size: s64, old_memory: *void, data: *void) -> *void {
+    if mode == .ALLOCATE  (cast(*Counter) data).allocs += 1;
+    return default_allocator_proc(mode, size, old_size, old_memory, null);
+}
+
+c: Counter;
+ctx := context;
+ctx.allocator = .{counting, *c};
+push_context ctx {
+    node := New(Node);          // alloc, New, NewArray, array_add, sprint,
+    s := sprint("%", 1);        // to_c_string and free use context.allocator
+}
+p := alloc(64, Allocator.{counting, *c});   // or an explicit allocator
+t := tprint("x = %", 5);                    // temporary storage
+reset_temporary_storage();
+```
+
+* `Context` has `allocator`, `logger` / `logger_data` (the default logger
+  writes the message to stdout, or stderr for `Log_Flags.ERROR`, adding a
+  newline), `log_source_identifier`, `temporary_storage`, `thread_index`
+  (always 0), `user_index` and `user_data`, plus the members added with
+  `#add_context name: T = default;` (at top level, in any module).
+* `context` is the running procedure's context. Assigning to it or its
+  members (`context.allocator = a;`) changes that context, which is the
+  caller's, as in Jai. `push_context c { ... }` runs the block with a copy
+  of `c` and restores the previous context however the block is left: at
+  its end, by `break` / `continue`, by `return` (after the block's defers,
+  which still see the pushed context), or by a macro's `` `return``.
+  `push_allocator(a)` makes `a` the allocator until the end of the calling
+  scope.
+* `Allocator :: struct { proc: Allocator_Proc; data: *void; }` and
+  `Allocator_Proc :: #type (mode: Allocator_Mode, size: s64, old_size: s64,
+  old_memory: *void, allocator_data: *void) -> *void`, with modes
+  `ALLOCATE`, `RESIZE` (move to a block of `size` bytes, keeping `old_size`
+  bytes; `old_memory` may be null), `FREE` and `FREE_ALL`.
+  `default_allocator_proc` is the runtime's heap. An allocator whose `proc`
+  is null means `context.allocator`.
+* A dynamic array (`[..]T`) has an `allocator` member, as in Jai: it takes
+  `context.allocator` when it first grows and keeps it, so `array_add`,
+  `array_free` and `array_reset` use the allocator its memory came from.
+* Temporary storage: `temporary_allocator` hands out memory from 4 KB pages
+  (bigger requests get a page of their own) taken from the heap when first
+  needed; `FREE` does nothing, and `reset_temporary_storage()` frees it all,
+  keeping the first page. `tprint` is `sprint` into temporary storage, and
+  `talloc(n)` allocates there. `context.temporary_storage` has the usage and
+  its high-water mark.
+* `#c_call` and `#foreign` procedures, and procedures marked `#no_context`,
+  have no context: using `context`, calling a procedure that needs one, or
+  using an allocating built-in in them is an error, except inside a
+  `push_context` block. A `#c_call` callback that needs a context saves
+  one in a global beforehand and pushes it:
+  `push_context saved_context { ... }`.
+* Lowering: the context is one global pointer, `__ojay_context`, which
+  points to a static default `Context` (the default allocator is
+  `default_allocator_proc`). It needs no initialization at startup, so the C
+  `main` that the object defines is unchanged. `push_context` stores the
+  address of its copy there and the old pointer back when the block is left
+  (on the same paths as `defer`). Procedures get no hidden parameter. Calls
+  cost the same, and Jai procedures, `#c_call` procedures and C functions
+  keep the same calling convention. The price is that the context is shared
+  by everything that runs, which is fine without threads. An interrupt
+  handler runs with the context of the code it interrupted; if it pushes one,
+  it restores the pointer before returning.
+* The Preload (`src/preload.jai`, compiled into the compiler) declares all
+  of this in Jai. A program gets only the parts it uses. A program that uses
+  none of it (no `context`, `push_context`, `Allocator`, `tprint`, ...)
+  calls the runtime's heap directly, exactly as before. Otherwise the
+  allocating built-ins go through `__allocate`, which calls the runtime
+  directly when the allocator is the default one and makes an indirect call
+  otherwise.
+* Differences from Jai: `push_context` always pushes a copy; there is no
+  `log` procedure and no threads; `Allocator_Mode` has only the four modes
+  above (no `STARTUP`, `CAPS`, ...), and allocators are not asked for
+  alignment; `print` (which does not allocate) is allowed without a
+  context.
 
 ### Metaprogramming
 

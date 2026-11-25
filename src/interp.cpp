@@ -221,6 +221,7 @@ class Machine {
   std::unordered_map<std::string, u64> strings_;
   std::unordered_map<Type*, Val> defaults_;
   std::unordered_map<Type*, bool> needs_default_;
+  u64 context_ = 0;  // address of the current Context (0: the default one, not yet made)
   // Macro expansions being evaluated, innermost last.
   struct ActiveExpansion {
     MacroExpansion* x;
@@ -291,6 +292,7 @@ class Machine {
   // Element size for pointer arithmetic (*void steps by bytes).
   int64_t elem_size(Type* ptr) { return ptr->elem->kind == TypeKind::Void ? 1 : sz(ptr->elem); }
   int64_t dyn_allocated_off() const { return align_up(8 + ps_, 8); }
+  int64_t dyn_allocator_off() const { return dyn_allocated_off() + 8; }
 
   int64_t tuple_off(Type* tt, size_t index) {
     int64_t off = 0;
@@ -638,7 +640,18 @@ class Machine {
     return a;
   }
 
+  // The current Context: the default context's global until a push_context.
+  u64 context_addr(SourceLoc loc) {
+    if (!context_) {
+      Symbol* dc = in_.host.default_context();
+      if (!dc) err(loc, "internal error: the context is used but was not set up");
+      context_ = global_addr(dc, loc);
+    }
+    return context_;
+  }
+
   u64 var_addr(Symbol* s, SourceLoc loc) {
+    if (s->is_context) return context_addr(loc);
     if (s->is_global) return global_addr(s, loc);
     auto& vars = frames_.back()->vars;
     if (s->interp_slot < 0 || (size_t)s->interp_slot >= vars.size() || !vars[(size_t)s->interp_slot])
@@ -797,6 +810,19 @@ class Machine {
           if (fl != Flow::Normal) return fl;
         }
         return Flow::Normal;
+      }
+      case NK::PushContext: {
+        auto* pc = static_cast<PushContext*>(s);
+        Val v = eval(pc->ctx);  // the block runs with a copy of the context it was given
+        u64 ctx = alloc_stack(pc->ctx->type, pc->loc);
+        store(ctx, v, pc->loc);
+        struct Restore {
+          u64& cur;
+          u64 old;
+          ~Restore() { cur = old; }
+        } restore{context_, context_addr(pc->loc)};
+        context_ = ctx;
+        return exec_body(pc->body);  // runs the block's defers before the context is restored
       }
       default:
         err(s->loc, "internal error: unexpected statement during compile-time execution");
@@ -1016,7 +1042,8 @@ class Machine {
         auto* m = static_cast<Member*>(e);
         return m->mkind == MemberKind::Field || m->mkind == MemberKind::ArrayCount ||
                m->mkind == MemberKind::ArrayData || m->mkind == MemberKind::ArrayAllocated ||
-               m->mkind == MemberKind::StringCount || m->mkind == MemberKind::StringData;
+               m->mkind == MemberKind::ArrayAllocator || m->mkind == MemberKind::StringCount ||
+               m->mkind == MemberKind::StringData;
       }
       default: return false;
     }
@@ -1060,6 +1087,8 @@ class Machine {
         return base + 8;
       case MemberKind::ArrayAllocated:
         return base + (u64)dyn_allocated_off();
+      case MemberKind::ArrayAllocator:
+        return base + (u64)dyn_allocator_off();
       default:
         err(m->loc, "internal error: member is not addressable");
     }
@@ -1209,6 +1238,8 @@ class Machine {
         std::memcpy(v.data(), b.data() + off, (size_t)v.size());
         return v;
       }
+      case MemberKind::ArrayAllocator:
+        return load(member_addr(m), m->type, m->loc);
       case MemberKind::AnyType:
       case MemberKind::AnyValue: {
         Val b = eval(m->base);
@@ -1661,13 +1692,52 @@ class Machine {
     std::fflush(f);
   }
 
+  // ---- allocation (as in codegen: through __allocate once the program uses
+  // the context, otherwise the heap directly)
+
+  enum Mode { ALLOCATE = 0, RESIZE = 1, FREE = 2 };
+
+  // An allocation with the Allocator at `allocator` (0: context.allocator).
+  u64 allocate(Mode mode, i64 size, i64 old_size, u64 old, u64 allocator, SourceLoc loc) {
+    ProcLit* p = in_.host.allocate_proc();
+    if (!p) {
+      switch (mode) {
+        case ALLOCATE: return heap_alloc(size, loc);
+        case RESIZE: return heap_realloc(old, size, loc);
+        case FREE: heap_free(old, loc); return 0;
+      }
+    }
+    const auto& ps = p->type->params;
+    size_t base = args_.size();
+    args_.push_back(make_int(ps[0], (u64)mode));
+    args_.push_back(make_int(T.s64, (u64)size));
+    args_.push_back(make_int(T.s64, (u64)old_size));
+    args_.push_back(make_ptr(old));
+    args_.push_back(make_ptr(allocator));
+    Val r = invoke(p, base, loc);
+    args_.resize(base);
+    return get_ptr(r);
+  }
+  u64 allocator_arg(Call* c) { return c->allocator ? addr_of(c->allocator) : 0; }
+
   void reserve(u64 arr, int64_t esz, i64 needed, SourceLoc loc) {
     i64 allocated = load_i64(arr + (u64)dyn_allocated_off(), loc);
     if (allocated >= needed) return;
     i64 cap = allocated * 2;
     if (cap < 8) cap = 8;
     if (cap < needed) cap = needed;
-    u64 data = heap_realloc(load_ptr(arr + 8, loc), cap * esz, loc);
+    u64 allocator = arr + (u64)dyn_allocator_off();
+    u64 data;
+    if (in_.host.allocate_proc()) {
+      // The array keeps the allocator it first grew with: context.allocator then.
+      if (load_ptr(allocator, loc) == 0) {
+        u64 ctx = context_addr(loc);  // context.allocator is the Context's first member
+        std::memmove(at(allocator, 2 * ps_, loc), at(ctx, 2 * ps_, loc), (size_t)(2 * ps_));
+      }
+      data = allocate(RESIZE, cap * esz, allocated * esz, load_ptr(arr + 8, loc), allocator, loc);
+    } else {
+      data = heap_realloc(load_ptr(arr + 8, loc), cap * esz, loc);
+    }
     store_ptr(arr + 8, data, loc);
     store_i64(arr + (u64)dyn_allocated_off(), cap, loc);
   }
@@ -1718,7 +1788,7 @@ class Machine {
       }
       case Builtin::Sprint: {
         std::string s = format(c);
-        u64 data = heap_alloc((int64_t)s.size() + 1, loc);
+        u64 data = allocate(ALLOCATE, (int64_t)s.size() + 1, 0, 0, allocator_arg(c), loc);
         if (!s.empty()) std::memcpy(at(data, (int64_t)s.size(), loc), s.data(), s.size());
         return make_string((i64)s.size(), data);
       }
@@ -1728,29 +1798,45 @@ class Machine {
         write_out(s, to_stderr);
         return Val();
       }
-      case Builtin::Alloc: return make_ptr(heap_alloc((i64)get_int(eval(a[0]), a[0]->type), loc));
+      case Builtin::Alloc: {
+        i64 n = (i64)get_int(eval(a[0]), a[0]->type);
+        return make_ptr(allocate(ALLOCATE, n, 0, 0, allocator_arg(c), loc));
+      }
       case Builtin::Free: {
         Val v = eval(a[0]);
-        heap_free(a[0]->type->is_pointer() ? get_ptr(v) : view_parts(v).second, loc);
+        allocate(FREE, 0, 0, a[0]->type->is_pointer() ? get_ptr(v) : view_parts(v).second, allocator_arg(c), loc);
         return Val();
       }
       case Builtin::Realloc: {
+        u64 p = get_ptr(eval(a[0]));
+        i64 n = (i64)get_int(eval(a[1]), a[1]->type);
+        i64 old = (i64)get_int(eval(a[2]), a[2]->type);
+        return make_ptr(allocate(RESIZE, n, old, p, allocator_arg(c), loc));
+      }
+      case Builtin::RawAlloc: return make_ptr(heap_alloc((i64)get_int(eval(a[0]), a[0]->type), loc));
+      case Builtin::RawFree: heap_free(get_ptr(eval(a[0])), loc); return Val();
+      case Builtin::RawRealloc: {
         u64 p = get_ptr(eval(a[0]));
         i64 n = (i64)get_int(eval(a[1]), a[1]->type);
         eval(a[2]);  // the old size: known from the allocation
         return make_ptr(heap_realloc(p, n, loc));
       }
       case Builtin::New: {
-        u64 p = heap_alloc(sz(c->type_arg), loc);
-        if (needs_default(c->type_arg)) store(p, default_val(c->type_arg, loc), loc);
+        u64 p = allocate(ALLOCATE, sz(c->type_arg), 0, 0, allocator_arg(c), loc);
+        if (!c->no_init && needs_default(c->type_arg)) store(p, default_val(c->type_arg, loc), loc);
+        else if (!c->no_init && sz(c->type_arg)) std::memset(at(p, sz(c->type_arg), loc), 0, (size_t)sz(c->type_arg));
         return make_ptr(p);
       }
       case Builtin::NewArray: {
         Type* et = c->type_arg;
         i64 n = (i64)get_int(eval(a[0]), a[0]->type);
         if (n < 0) err(loc, "NewArray with a negative count (", n, ")");
-        u64 p = heap_alloc(n * sz(et), loc);
-        if (needs_default(et)) {
+        u64 p = allocate(ALLOCATE, n * sz(et), 0, 0, allocator_arg(c), loc);
+        if (c->no_init) {
+          // left as it is
+        } else if (!needs_default(et)) {
+          if (n * sz(et) > 0) std::memset(at(p, n * sz(et), loc), 0, (size_t)(n * sz(et)));
+        } else {
           Val d = default_val(et, loc);
           for (i64 i = 0; i < n; ++i) store(p + (u64)(i * sz(et)), d, loc);
         }
@@ -1771,13 +1857,18 @@ class Machine {
         return has_value ? Val() : make_ptr(slot);
       }
       case Builtin::ArrayFree: {
-        heap_free(view_parts(eval(a[0])).second, loc);
+        if (!conc(a[0]->type)->is_dynamic()) {  // a view: freed with context.allocator
+          allocate(FREE, 0, 0, view_parts(eval(a[0])).second, 0, loc);
+          return Val();
+        }
+        u64 arr = addr_of(a[0]);  // freed with its own allocator
+        allocate(FREE, 0, 0, load_ptr(arr + 8, loc), arr + (u64)dyn_allocator_off(), loc);
         return Val();
       }
       case Builtin::ArrayReset: {
         u64 arr = get_ptr(eval(a[0]));
-        heap_free(load_ptr(arr + 8, loc), loc);
-        store(arr, Val(sz(a[0]->type->elem)), loc);
+        allocate(FREE, 0, 0, load_ptr(arr + 8, loc), arr + (u64)dyn_allocator_off(), loc);
+        std::memset(at(arr, dyn_allocator_off(), loc), 0, (size_t)dyn_allocator_off());  // it keeps its allocator
         return Val();
       }
       case Builtin::Assert: {
@@ -1822,8 +1913,9 @@ class Machine {
       }
       case Builtin::ToCString: {
         std::string s = read_string(eval(a[0]), loc);
-        u64 p = heap_alloc((int64_t)s.size() + 1, loc);
+        u64 p = allocate(ALLOCATE, (int64_t)s.size() + 1, 0, 0, 0, loc);
         if (!s.empty()) std::memcpy(at(p, (int64_t)s.size(), loc), s.data(), s.size());
+        at(p + s.size(), 1, loc)[0] = 0;
         return make_ptr(p);
       }
       case Builtin::Sqrt: case Builtin::Floor: case Builtin::Ceil: case Builtin::Round: case Builtin::Sin:

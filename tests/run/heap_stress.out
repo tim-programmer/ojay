@@ -1,0 +1,5 @@
+random: 2386 allocations, 1250 reallocations, 2386 frees, 1678313 bytes, more than 1 MB: true
+cycle 1: 640 blocks of 80 bytes, then one of 56000 bytes
+cycle 2: 640 blocks of 88 bytes, then one of 56000 bytes
+cycle 3: 640 blocks of 96 bytes, then one of 56000 bytes
+done

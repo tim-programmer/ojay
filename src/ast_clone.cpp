@@ -217,6 +217,10 @@ class Cloner {
         return n;
       }
       case NK::Using: return ast_.make<UsingStmt>(s->loc, expr(as<UsingStmt>(s)->target));
+      case NK::PushContext: {
+        auto* pc = as<PushContext>(s);
+        return ast_.make<PushContext>(s->loc, expr(pc->ctx), block(pc->body));
+      }
       default:
         fail(s->loc, "internal error: cannot clone statement node");
     }
@@ -261,6 +265,7 @@ class Cloner {
     n->is_baked = d->is_baked;
     n->is_global = d->is_global;
     n->backtick = d->backtick;
+    n->add_context = d->add_context;
     n->insert = expr(d->insert);
     return n;
   }
@@ -279,6 +284,7 @@ class Cloner {
     n->is_poly = p->is_poly;
     n->poly_returns = p->poly_returns;
     n->is_macro = p->is_macro;
+    n->no_context = p->no_context;
     n->modify = block(p->modify);
     n->name = p->name;
     return n;

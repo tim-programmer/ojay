@@ -41,6 +41,7 @@ struct Symbol {
   // backend
   llvm::Value* llvm_value = nullptr;
   int interp_slot = -1;  // #run interpreter: index of a local variable in its procedure's frame
+  bool is_context = false;  // `context`: the Context the running procedure was given
 };
 
 // A `using` in a scope: the members of a struct variable (or of the struct a
@@ -77,6 +78,13 @@ struct Program {
   std::vector<Symbol*> global_vars;
   std::vector<std::string> system_libraries;
   ProcLit* main_proc = nullptr;
+  // The context (Preload): set once the program uses it, or anything else of
+  // the Preload (Allocator, temporary_allocator, ...). Programs that never do
+  // keep calling the runtime's allocator directly.
+  bool uses_context = false;
+  Symbol* default_context = nullptr;  // the global Context `context` starts as
+  ProcLit* allocate_proc = nullptr;   // __allocate: an allocation through an Allocator (or the context's)
+  Type* allocator_type = nullptr;     // Allocator
   // Storage for symbols and scopes (they are referenced from the AST).
   std::vector<std::unique_ptr<Scope>> scopes;
   std::vector<std::unique_ptr<Symbol>> symbols;

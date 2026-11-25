@@ -33,7 +33,11 @@ struct CgScope {
   llvm::BasicBlock* continue_bb = nullptr;
   MacroExpansion* expansion = nullptr;  // set on the top-level scope of an inlined #expand macro
   llvm::AllocaInst* result = nullptr;   // the expansion's value
+  llvm::Value* restore_context = nullptr;  // push_context: the context pointer to restore when leaving
 };
+
+// Allocator_Mode values (preload.jai).
+enum AllocatorMode : uint64_t { MODE_ALLOCATE = 0, MODE_RESIZE = 1, MODE_FREE = 2 };
 
 class CodeGen {
  public:
@@ -62,7 +66,10 @@ class CodeGen {
       if (p->is_foreign) declare_proc(p);
     for (ProcLit* p : prog_.procs)
       if (!p->is_foreign) declare_proc(p);
-    for (Symbol* g : prog_.global_vars) emit_global(g);
+    // Globals are created first: an initializer can take the address of another.
+    for (Symbol* g : prog_.global_vars) declare_global(g);
+    for (Symbol* g : prog_.global_vars) init_global(g);
+    if (prog_.uses_context) emit_context_pointer();
     for (ProcLit* p : prog_.procs)
       if (p->body) emit_proc_body(p);
     if (prog_.main_proc) emit_c_main();
@@ -109,6 +116,11 @@ class CodeGen {
   llvm::FunctionCallee rt_print_, rt_sprint_, rt_write_, rt_alloc_, rt_free_, rt_realloc_, rt_bounds_,
       rt_assert_, rt_streq_, rt_exit_, rt_array_reserve_, rt_init_, rt_cstring_;
 
+  // The context: a pointer to the current Context (the default context's global
+  // initially), replaced by push_context. Only programs that use the context
+  // (Program::uses_context) have it.
+  llvm::GlobalVariable* context_ptr_ = nullptr;
+
   // ------------------------------------------------------------------ types
 
   llvm::Type* lt(Type* t) {
@@ -132,7 +144,8 @@ class CodeGen {
         switch (t->array_kind) {
           case ArrayKind::Fixed: r = llvm::ArrayType::get(lt(t->elem), t->count); break;
           case ArrayKind::View: r = llvm::StructType::get(ctx_, {i64_, ptr_}); break;
-          case ArrayKind::Dynamic: r = llvm::StructType::get(ctx_, {i64_, ptr_, i64_}); break;
+          // count, data, allocated, allocator (proc, data)
+          case ArrayKind::Dynamic: r = llvm::StructType::get(ctx_, {i64_, ptr_, i64_, ptr_, ptr_}); break;
         }
         break;
       case TypeKind::Struct: {
@@ -199,7 +212,7 @@ class CodeGen {
 
   void declare_runtime() {
     rt_print_ = rt("__ojay_print", i64_, {ptr_, i64_, ptr_, i64_, i32_});
-    rt_sprint_ = rt("__ojay_sprint", void_, {ptr_, ptr_, i64_, ptr_, i64_});
+    rt_sprint_ = rt("__ojay_sprint", void_, {ptr_, ptr_, i64_, ptr_, i64_, ptr_, ptr_});
     rt_write_ = rt("__ojay_write_string", void_, {ptr_, i64_, i32_});
     rt_alloc_ = rt("__ojay_alloc", ptr_, {i64_});
     rt_free_ = rt("__ojay_free", void_, {ptr_});
@@ -208,9 +221,9 @@ class CodeGen {
     rt_assert_ = rt("__ojay_assert_fail", void_, {ptr_, i64_, i32_, ptr_, i64_}, true);
     rt_streq_ = rt("__ojay_string_equal", i32_, {ptr_, i64_, ptr_, i64_});
     rt_exit_ = rt("__ojay_exit", void_, {i32_}, true);
-    rt_array_reserve_ = rt("__ojay_array_reserve", void_, {ptr_, i64_, i64_});
+    rt_array_reserve_ = rt("__ojay_array_reserve", void_, {ptr_, i64_, i64_, ptr_, ptr_});
     rt_init_ = rt("__ojay_runtime_init", void_, {i32_, ptr_});
-    rt_cstring_ = rt("__ojay_to_c_string", ptr_, {ptr_, i64_});
+    rt_cstring_ = rt("__ojay_to_c_string", ptr_, {ptr_, i64_, ptr_, ptr_});
   }
 
   // ------------------------------------------------------------------ constants
@@ -345,6 +358,8 @@ class CodeGen {
         return static_cast<ProcLit*>(e)->llvm_fn;
       case NK::Ident:
         return static_cast<Ident*>(e)->sym->proc->llvm_fn;
+      case NK::Unary:  // the address of a global variable
+        return llvm::cast<llvm::Constant>(static_cast<Ident*>(static_cast<Unary*>(e)->operand)->sym->llvm_value);
       case NK::ImplicitConv: {
         auto* ic = static_cast<ImplicitConv*>(e);
         Expr* op = ic->operand;
@@ -461,12 +476,25 @@ class CodeGen {
     p->llvm_fn->addFnAttr(llvm::Attribute::NoUnwind);
   }
 
-  void emit_global(Symbol* g) {
+  void declare_global(Symbol* g) {
+    g->llvm_value = new llvm::GlobalVariable(*mod_, lt(g->type), false, llvm::GlobalValue::InternalLinkage, nullptr,
+                                             g->name);
+  }
+
+  void init_global(Symbol* g) {
     llvm::Constant* init = g->init ? const_init(g->init, g->type) : default_value(g->type);
     if (g->decl && g->decl->uninit) init = llvm::Constant::getNullValue(lt(g->type));
-    auto* gv = new llvm::GlobalVariable(*mod_, lt(g->type), false, llvm::GlobalValue::InternalLinkage, init, g->name);
-    g->llvm_value = gv;
+    llvm::cast<llvm::GlobalVariable>(g->llvm_value)->setInitializer(init);
   }
+
+  void emit_context_pointer() {
+    context_ptr_ = new llvm::GlobalVariable(*mod_, ptr_, false, llvm::GlobalValue::InternalLinkage,
+                                            llvm::cast<llvm::Constant>(prog_.default_context->llvm_value),
+                                            "__ojay_context");
+  }
+
+  // The address of the current Context (its allocator is its first member).
+  llvm::Value* context_addr() { return b_.CreateLoad(ptr_, context_ptr_, "context"); }
 
   // Records `#system_library` dependencies in the object file
   // (.deplibs section); ld.lld links them automatically, other linkers need
@@ -557,6 +585,7 @@ class CodeGen {
   }
 
   // Runs (emits) the defers of scopes_[from..end) in reverse order, without popping.
+  // A push_context scope also restores the previous context when left.
   void emit_defers_down_to(size_t from) {
     for (size_t i = scopes_.size(); i-- > from;) {
       std::vector<Stmt*> ds = scopes_[i].defers;
@@ -564,7 +593,24 @@ class CodeGen {
         if (terminated()) start_dead_block();
         emit_body(ds[j]);
       }
+      if (llvm::Value* old = scopes_[i].restore_context) {
+        if (terminated()) start_dead_block();
+        b_.CreateStore(old, context_ptr_);
+      }
     }
+  }
+
+  void emit_push_context(PushContext* pc) {
+    // The block runs with a copy of the context it was given.
+    llvm::Value* ctx = make_alloca(pc->ctx->type, "pushed.context");
+    b_.CreateStore(rvalue(pc->ctx), ctx);
+    CgScope sc;
+    sc.restore_context = b_.CreateLoad(ptr_, context_ptr_, "context.saved");
+    b_.CreateStore(ctx, context_ptr_);
+    scopes_.push_back(sc);
+    emit_scoped(pc->body->stmts);
+    if (!terminated()) emit_defers_down_to(scopes_.size() - 1);
+    scopes_.pop_back();
   }
 
   void emit_scoped(const std::vector<Stmt*>& stmts) {
@@ -630,6 +676,7 @@ class CodeGen {
         emit_stmts(si->taken == 1 ? si->then_s : si->else_s);
         return;
       }
+      case NK::PushContext: emit_push_context(static_cast<PushContext*>(s)); return;
       default:
         throw CompileError(s->loc, "internal error: unexpected statement in codegen");
     }
@@ -988,7 +1035,8 @@ class CodeGen {
         auto* m = static_cast<Member*>(e);
         return m->mkind == MemberKind::Field || m->mkind == MemberKind::ArrayCount ||
                m->mkind == MemberKind::ArrayData || m->mkind == MemberKind::ArrayAllocated ||
-               m->mkind == MemberKind::StringCount || m->mkind == MemberKind::StringData;
+               m->mkind == MemberKind::ArrayAllocator || m->mkind == MemberKind::StringCount ||
+               m->mkind == MemberKind::StringData;
       }
       default: return false;
     }
@@ -1010,6 +1058,7 @@ class CodeGen {
     switch (e->kind) {
       case NK::Ident: {
         Symbol* s = static_cast<Ident*>(e)->sym;
+        if (s->is_context) return context_addr();
         if (!s->llvm_value) throw CompileError(e->loc, cat("internal error: no storage for '", s->name, "'"));
         return s->llvm_value;
       }
@@ -1034,6 +1083,8 @@ class CodeGen {
             return b_.CreateStructGEP(lt(bt), base, 1);
           case MemberKind::ArrayAllocated:
             return b_.CreateStructGEP(lt(bt), base, 2);
+          case MemberKind::ArrayAllocator:
+            return b_.CreateStructGEP(lt(bt), base, 3);
           default:
             break;
         }
@@ -1201,6 +1252,8 @@ class CodeGen {
           return m->through_pointer ? rvalue(m->base) : addr_of(m->base);
         }
         [[fallthrough]];
+      case MemberKind::ArrayAllocator:
+        return b_.CreateLoad(lt(m->type), lvalue(m));
       case MemberKind::ArrayCount:
       case MemberKind::ArrayAllocated:
       case MemberKind::StringCount:
@@ -1438,6 +1491,47 @@ class CodeGen {
     return b_.CreateCall(callee, args);
   }
 
+  // ---- allocation
+  //
+  // Programs that use the context allocate through __allocate (preload.jai),
+  // which calls the allocator given (or context.allocator); others call the
+  // runtime's heap directly, as before.
+
+  llvm::Value* null_ptr() { return llvm::ConstantPointerNull::get(llvm::PointerType::get(ctx_, 0)); }
+
+  // The explicit allocator of an allocating built-in (a pointer to an
+  // Allocator), or null for context.allocator.
+  llvm::Value* allocator_arg(Call* c) { return c->allocator ? addr_of(c->allocator, /*read_only=*/true) : null_ptr(); }
+
+  llvm::Value* allocate(AllocatorMode mode, llvm::Value* size, llvm::Value* old_size, llvm::Value* old_memory,
+                        llvm::Value* allocator) {
+    llvm::Function* f = prog_.allocate_proc->llvm_fn;
+    return b_.CreateCall(f, {llvm::ConstantInt::get(f->getArg(0)->getType(), mode), size, old_size, old_memory,
+                             allocator});
+  }
+
+  llvm::Value* alloc_bytes(Call* c, llvm::Value* size) {
+    if (!prog_.uses_context) return b_.CreateCall(rt_alloc_, {size});
+    return allocate(MODE_ALLOCATE, size, llvm::ConstantInt::get(i64_, 0), null_ptr(), allocator_arg(c));
+  }
+
+  // Frees `p` with the allocator at `allocator` (null: the context's).
+  void free_bytes(llvm::Value* p, llvm::Value* allocator) {
+    if (!prog_.uses_context) {
+      b_.CreateCall(rt_free_, {p});
+      return;
+    }
+    llvm::Value* zero = llvm::ConstantInt::get(i64_, 0);
+    allocate(MODE_FREE, zero, zero, p, allocator);
+  }
+
+  // The (allocate, allocator) arguments of the runtime functions that allocate:
+  // __allocate and the Allocator to use, or nulls for the runtime's heap.
+  std::pair<llvm::Value*, llvm::Value*> runtime_allocator(llvm::Value* allocator) {
+    if (!prog_.uses_context) return {null_ptr(), null_ptr()};
+    return {prog_.allocate_proc->llvm_fn, allocator};
+  }
+
   void store_default(llvm::Value* ptr, Type* t) {
     llvm::Constant* d = default_value(t);
     if (d->isNullValue()) {
@@ -1469,7 +1563,8 @@ class CodeGen {
         size_t n_args = a.size() - 1;
         llvm::Value* anys = any_array(a, 1, n_args);
         auto* out = make_alloca(T.string_t, "sprint.out");
-        b_.CreateCall(rt_sprint_, {out, data, len, anys, llvm::ConstantInt::get(i64_, n_args - 1)});
+        auto [alloc_fn, allocator] = runtime_allocator(allocator_arg(c));
+        b_.CreateCall(rt_sprint_, {out, data, len, anys, llvm::ConstantInt::get(i64_, n_args - 1), alloc_fn, allocator});
         return b_.CreateLoad(lt(T.string_t), out);
       }
       case Builtin::WriteString: {
@@ -1481,28 +1576,42 @@ class CodeGen {
         return nullptr;
       }
       case Builtin::Alloc:
-        return b_.CreateCall(rt_alloc_, {rvalue(a[0])});
+        return alloc_bytes(c, rvalue(a[0]));
       case Builtin::Free: {
         Type* t = a[0]->type;
         llvm::Value* v = rvalue(a[0]);
         if (!t->is_pointer()) v = b_.CreateExtractValue(v, 1);
-        b_.CreateCall(rt_free_, {v});
+        free_bytes(v, prog_.uses_context ? allocator_arg(c) : nullptr);
         return nullptr;
       }
-      case Builtin::Realloc:
+      case Builtin::Realloc: {
+        llvm::Value* p = rvalue(a[0]);
+        llvm::Value* n = rvalue(a[1]);
+        llvm::Value* old = rvalue(a[2]);
+        if (!prog_.uses_context) return b_.CreateCall(rt_realloc_, {p, n, old});
+        return allocate(MODE_RESIZE, n, old, p, allocator_arg(c));
+      }
+      case Builtin::RawAlloc:
+        return b_.CreateCall(rt_alloc_, {rvalue(a[0])});
+      case Builtin::RawFree:
+        b_.CreateCall(rt_free_, {rvalue(a[0])});
+        return nullptr;
+      case Builtin::RawRealloc:
         return b_.CreateCall(rt_realloc_, {rvalue(a[0]), rvalue(a[1]), rvalue(a[2])});
       case Builtin::New: {
-        llvm::Value* p = b_.CreateCall(rt_alloc_, {llvm::ConstantInt::get(i64_, size_of(c->type_arg))});
-        store_default(p, c->type_arg);
+        llvm::Value* p = alloc_bytes(c, llvm::ConstantInt::get(i64_, size_of(c->type_arg)));
+        if (!c->no_init) store_default(p, c->type_arg);
         return p;
       }
       case Builtin::NewArray: {
         Type* et = c->type_arg;
         llvm::Value* n = rvalue(a[0]);
         llvm::Value* bytes = b_.CreateMul(n, llvm::ConstantInt::get(i64_, size_of(et)));
-        llvm::Value* p = b_.CreateCall(rt_alloc_, {bytes});
+        llvm::Value* p = alloc_bytes(c, bytes);
         llvm::Constant* d = default_value(et);
-        if (d->isNullValue()) {
+        if (c->no_init) {
+          // left uninitialized
+        } else if (d->isNullValue()) {
           b_.CreateMemSet(p, llvm::ConstantInt::get(i8_, 0), bytes, llvm::MaybeAlign(1));
         } else {
           // Initialize each element with the type's default value.
@@ -1533,7 +1642,10 @@ class CodeGen {
         llvm::Value* count_p = b_.CreateStructGEP(dyn_t, arr, 0);
         llvm::Value* count = b_.CreateLoad(i64_, count_p);
         llvm::Value* new_count = b_.CreateAdd(count, llvm::ConstantInt::get(i64_, 1));
-        b_.CreateCall(rt_array_reserve_, {arr, llvm::ConstantInt::get(i64_, size_of(et)), new_count});
+        // A dynamic array keeps the allocator it first grew with (context.allocator then).
+        auto [alloc_fn, ctx_allocator] = runtime_allocator(prog_.uses_context ? context_addr() : nullptr);
+        b_.CreateCall(rt_array_reserve_,
+                      {arr, llvm::ConstantInt::get(i64_, size_of(et)), new_count, alloc_fn, ctx_allocator});
         llvm::Value* data = b_.CreateLoad(ptr_, b_.CreateStructGEP(dyn_t, arr, 1));
         llvm::Value* slot = b_.CreateInBoundsGEP(lt(et), data, {count});
         if (value) b_.CreateStore(value, slot);
@@ -1542,16 +1654,26 @@ class CodeGen {
         return value ? nullptr : slot;
       }
       case Builtin::ArrayFree: {
-        llvm::Value* v = rvalue(a[0]);
-        b_.CreateCall(rt_free_, {b_.CreateExtractValue(v, 1)});
+        Type* t = a[0]->type;
+        if (!t->is_dynamic() || !prog_.uses_context) {  // a view: freed with context.allocator
+          llvm::Value* v = rvalue(a[0]);
+          free_bytes(b_.CreateExtractValue(v, 1), null_ptr());
+          return nullptr;
+        }
+        llvm::Value* arr = addr_of(a[0], /*read_only=*/true);  // freed with its own allocator
+        llvm::Value* data = b_.CreateLoad(ptr_, b_.CreateStructGEP(lt(t), arr, 1));
+        free_bytes(data, b_.CreateStructGEP(lt(t), arr, 3));
         return nullptr;
       }
       case Builtin::ArrayReset: {
         llvm::Type* dyn_t = lt(a[0]->type->elem);
         llvm::Value* arr = rvalue(a[0]);
         llvm::Value* data = b_.CreateLoad(ptr_, b_.CreateStructGEP(dyn_t, arr, 1));
-        b_.CreateCall(rt_free_, {data});
-        b_.CreateStore(llvm::Constant::getNullValue(dyn_t), arr);
+        free_bytes(data, b_.CreateStructGEP(dyn_t, arr, 3));
+        // count, data and allocated; the array keeps its allocator
+        b_.CreateStore(llvm::ConstantInt::get(i64_, 0), b_.CreateStructGEP(dyn_t, arr, 0));
+        b_.CreateStore(null_ptr(), b_.CreateStructGEP(dyn_t, arr, 1));
+        b_.CreateStore(llvm::ConstantInt::get(i64_, 0), b_.CreateStructGEP(dyn_t, arr, 2));
         return nullptr;
       }
       case Builtin::Assert: {
@@ -1597,7 +1719,8 @@ class CodeGen {
       case Builtin::ToCString: {
         llvm::Value* len;
         llvm::Value* data = string_parts(a[0], &len);
-        return b_.CreateCall(rt_cstring_, {data, len});
+        auto [alloc_fn, allocator] = runtime_allocator(null_ptr());
+        return b_.CreateCall(rt_cstring_, {data, len, alloc_fn, allocator});
       }
       case Builtin::Sqrt: return emit_math1(llvm::Intrinsic::sqrt, rvalue(a[0]));
       case Builtin::Floor: return emit_math1(llvm::Intrinsic::floor, rvalue(a[0]));

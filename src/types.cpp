@@ -85,8 +85,8 @@ Type* TypeTable::array_of(Type* elem, ArrayKind kind, int64_t count) {
     case ArrayKind::View:  // { count: s64; data: *T; }
       t = make(TypeKind::Array, "", align_up(8 + ps, 8), 8);
       break;
-    case ArrayKind::Dynamic:  // { count: s64; data: *T; allocated: s64; }
-      t = make(TypeKind::Array, "", align_up(align_up(8 + ps, 8) + 8, 8), 8);
+    case ArrayKind::Dynamic:  // { count: s64; data: *T; allocated: s64; allocator: Allocator; }
+      t = make(TypeKind::Array, "", align_up(align_up(8 + ps, 8) + 8 + 2 * ps, 8), 8);
       break;
   }
   t->elem = elem;

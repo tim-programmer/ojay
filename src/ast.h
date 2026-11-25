@@ -29,7 +29,7 @@ enum class NK {
   Ifx, ImplicitConv, TupleGet, Library, Directive, CodeLit, Expansion,
   // statements
   Block, ExprStmt, Decl, Assign, If, Switch, While, For, Return, Break, Continue, Defer, Import,
-  Load, StaticIf, Through, Using, Insert,
+  Load, StaticIf, Through, Using, Insert, PushContext,
 };
 
 struct Node {
@@ -147,6 +147,8 @@ enum class Builtin {
   // Basic
   Print, Sprint, WriteString, Alloc, Free, Realloc, New, NewArray, ArrayAdd, ArrayFree, ArrayReset,
   Assert, Exit, Memcpy, Memset, Min, Max, Abs, ToCString,
+  // Preload internals: the runtime's own heap, bypassing the context's allocator
+  RawAlloc, RawFree, RawRealloc,
   // Math
   Sqrt, Sin, Cos, Tan, Atan2, Pow, Floor, Ceil, Round, Exp, Log,
   // Hardware (ojay extension for memory-mapped I/O)
@@ -162,6 +164,10 @@ struct Call : Expr {
   Type* proc_type = nullptr;
   Type* type_arg = nullptr;          // for New(T), NewArray(n, T), size_of(T)
   Expr* expansion = nullptr;         // sema: the MacroExpansion this call of an #expand macro stands for
+  // Allocating built-ins: an explicit allocator (an Allocator value, e.g. `alloc(n, a)`,
+  // `New(T, allocator = a)`, or temporary_allocator for tprint); null means context.allocator.
+  Expr* allocator = nullptr;
+  bool no_init = false;              // New / NewArray with `initialized = false`
   Call(SourceLoc l, Expr* c) : Expr(NK::Call, l), callee(c) {}
 };
 
@@ -174,7 +180,7 @@ struct Index : Expr {
 
 enum class MemberKind {
   Unresolved, Field, ArrayCount, ArrayData, ArrayAllocated, StringCount, StringData,
-  EnumValue, AnyType, AnyValue,
+  EnumValue, AnyType, AnyValue, ArrayAllocator,
 };
 struct Member : Expr {
   Expr* base;  // null for `.NAME` (enum value with inferred type)
@@ -233,6 +239,7 @@ struct ProcLit : Expr {
   bool is_poly = false;   // has `$T` in a parameter type or a compile-time parameter (`$N: int`)
   bool poly_returns = false;  // has `$T` in a return type
   bool is_macro = false;  // #expand: inlined at each call (MacroExpansion), never called
+  bool no_context = false;  // #no_context: like #c_call procedures, it has no context
   Block* modify = nullptr;  // #modify { ... }: runs when a polymorphic procedure is instantiated
   std::string name;       // bound name, for diagnostics and symbol names
   // sema
@@ -374,6 +381,7 @@ struct Decl : Stmt {
   bool is_baked = false;    // compile-time parameter `$N: int` / `$T: Type`
   bool is_global = false;
   bool backtick = false;    // `` `x := v; `` in an #expand macro: declared in the caller's scope
+  bool add_context = false; // `#add_context name: T = v;`: a member added to Context
   Expr* insert = nullptr;   // a struct member `#insert expr;` (no names): members made by sema
   // sema
   std::vector<Symbol*> syms;
@@ -487,6 +495,14 @@ struct Insert : Stmt {
   Expr* operand;
   Block* result = nullptr;
   Insert(SourceLoc l, Expr* e) : Stmt(NK::Insert, l), operand(e) {}
+};
+
+// `push_context ctx { ... }`: runs the block with `ctx` (a Context) as the
+// context; the previous context is restored however the block is left.
+struct PushContext : Stmt {
+  Expr* ctx;
+  Block* body;
+  PushContext(SourceLoc l, Expr* c, Block* b) : Stmt(NK::PushContext, l), ctx(c), body(b) {}
 };
 
 // ---------------------------------------------------------------------------

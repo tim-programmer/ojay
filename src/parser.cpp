@@ -207,6 +207,24 @@ class Parser {
       }
       case Tok::Directive:
         return parse_directive_stmt(top_level);
+      case Tok::Ident:
+        // `push_context ctx { ... }`. push_context is not a reserved word: it
+        // starts the statement when an expression follows it.
+        if (cur().text == "push_context") {
+          Tok n = peek().kind;
+          if (n == Tok::Ident || n == Tok::Backtick || n == Tok::DotLBrace || n == Tok::Directive ||
+              n == Tok::LBrace || n == Tok::Star || n == Tok::Shl || n == Tok::LParen || n == Tok::KwCast ||
+              n == Tok::KwXx || n == Tok::KwNull || n == Tok::Int || n == Tok::String || n == Tok::KwIfx) {
+            if (top_level) fail(loc, "push_context is only allowed inside a procedure");
+            advance();
+            if (at(Tok::LBrace)) fail(cur().loc, "push_context needs a context: push_context ctx { ... }");
+            Expr* ctx = parse_expr();
+            if (!at(Tok::LBrace)) fail(cur().loc, "expected '{' after push_context ", "expression, found ", describe(cur()));
+            Block* body = parse_block();
+            return ast_.make<PushContext>(loc, ctx, body);
+          }
+        }
+        break;
       case Tok::Backtick:
         if (top_level) fail(loc, "backtick names (`name) are only allowed in the body of an #expand macro");
         if (peek().kind == Tok::KwReturn || peek().kind == Tok::KwDefer) {
@@ -278,6 +296,19 @@ class Parser {
       Expr* e = parse_expr();
       expect(Tok::Semi, "after #insert statement");
       return ast_.make<Insert>(loc, e);
+    }
+    if (d == "add_context") {
+      // `#add_context name: T = value;`: a member added to the Context struct.
+      if (!top_level) fail(loc, "#add_context is only allowed at top level");
+      advance();
+      if (!at(Tok::Ident) || (peek().kind != Tok::Colon && peek().kind != Tok::ColonEq))
+        fail(cur().loc, "#add_context needs a member declaration: #add_context name: Type = value;");
+      Stmt* st = parse_simple_stmt(true);
+      auto* decl = static_cast<Decl*>(st);
+      if (decl->is_const) fail(loc, "#add_context needs a variable member, not a constant");
+      decl->add_context = true;
+      decl->loc = loc;
+      return decl;
     }
     if (d == "through") fail(loc, "#through is only allowed at the end of an 'if ==' case");
     return parse_simple_stmt(top_level);
@@ -1015,6 +1046,8 @@ class Parser {
         if (at(Tok::String)) p->foreign_name = advance().text;
       } else if (d == "c_call") {
         p->c_call = true;
+      } else if (d == "no_context") {
+        p->no_context = true;
       } else if (d == "symmetric") {
         p->symmetric = true;
       } else if (d == "deprecated") {

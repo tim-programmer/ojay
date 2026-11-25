@@ -4,8 +4,9 @@
  * Compiled once per platform (see the platform layer below):
  *   linux hosted        - uses the C library (write, malloc, exit)
  *   linux freestanding  - talks to the Linux kernel directly, provides _start
- *   cortex-m            - bare metal: vector table, reset handler, heap from
- *                         the linker script, console I/O via semihosting
+ *   cortex-m            - bare metal: vector table, reset handler, a heap
+ *                         (see "Heap" below) in the RAM the linker script
+ *                         leaves free, console I/O via semihosting
  *   esp32-c6            - bare metal RISC-V: watchdogs off, trap handler,
  *                         console via semihosting or the USB Serial/JTAG port
  *
@@ -23,10 +24,27 @@ typedef struct {
   uint8_t *data;
 } OString;
 
+/* Allocator_Proc and Allocator (src/preload.jai). Jai procedures use the C
+ * calling convention for these argument types, so C can call them. */
+typedef void *(*OAllocatorProc)(int64_t mode, int64_t size, int64_t old_size, void *old_memory, void *data);
+typedef struct {
+  OAllocatorProc proc;
+  void *data;
+} OAllocator;
+enum { MODE_ALLOCATE = 0, MODE_RESIZE = 1, MODE_FREE = 2 };
+
+/* __allocate (preload.jai): an allocation through `allocator`, or through
+ * context.allocator when it (or its proc) is null. The compiler passes it to
+ * the runtime functions that allocate when the program uses the context;
+ * otherwise they get null and use the runtime's heap. */
+typedef void *(*OAllocateFn)(int64_t mode, int64_t size, int64_t old_size, void *old_memory,
+                             const OAllocator *allocator);
+
 typedef struct {
   int64_t count;
   uint8_t *data;
   int64_t allocated;
+  OAllocator allocator; /* set when the array first grows (to context.allocator) */
 } ODynArray;
 
 enum {
@@ -107,12 +125,15 @@ __attribute__((noreturn)) static void plat_exit(int code) {
   for (;;) sys3(SYS_EXIT_GROUP, code, 0, 0);
 }
 
-/* Returns `size` bytes of fresh zeroed memory, or null. */
-static void *plat_morecore(size_t size) {
+/* More memory for the heap: at least `min` bytes at [*start, *end). */
+static int plat_more_heap(size_t min, uint8_t **start, uint8_t **end) {
+  size_t size = min > (1u << 20) ? (min + 4095) & ~(size_t)4095 : (1u << 20);
   long r = sys6(SYS_MMAP, 0, (long)size, 3 /*RW*/, 0x22 /*PRIVATE|ANON*/, -1, 0);
-  return (r < 0 && r > -4096) ? 0 : (void *)r;
+  if (r < 0 && r > -4096) return 0;
+  *start = (uint8_t *)r;
+  *end = (uint8_t *)r + size;
+  return 1;
 }
-#define MORECORE_CHUNK (1u << 20)
 
 #elif defined(OJAY_PLATFORM_CORTEXM)
 
@@ -168,16 +189,16 @@ __attribute__((noreturn)) static void plat_exit(int code) {
   for (;;) __asm__ volatile("wfi");
 }
 
-static uint8_t *heap_cur = __heap_start;
-
-static void *plat_morecore(size_t size) {
-  if ((size_t)(__heap_end - heap_cur) < size) return 0;
-  uint8_t *p = heap_cur;
-  heap_cur += size;
-  for (size_t i = 0; i < size; ++i) p[i] = 0;
-  return p;
+/* The heap is the RAM between .bss and the stack, given out once. */
+static int plat_more_heap(size_t min, uint8_t **start, uint8_t **end) {
+  static int given;
+  (void)min;
+  if (given) return 0;
+  given = 1;
+  *start = __heap_start;
+  *end = __heap_end;
+  return 1;
 }
-#define MORECORE_CHUNK (4u * 1024u)
 
 #elif defined(OJAY_PLATFORM_ESP32C6)
 
@@ -257,16 +278,16 @@ __attribute__((noreturn)) static void plat_exit(int code) {
   for (;;) __asm__ volatile("wfi");
 }
 
-static uint8_t *heap_cur = __heap_start;
-
-static void *plat_morecore(size_t size) {
-  if ((size_t)(__heap_end - heap_cur) < size) return 0;
-  uint8_t *p = heap_cur;
-  heap_cur += size;
-  for (size_t i = 0; i < size; ++i) p[i] = 0;
-  return p;
+/* The heap is the RAM between .bss and the stack, given out once. */
+static int plat_more_heap(size_t min, uint8_t **start, uint8_t **end) {
+  static int given;
+  (void)min;
+  if (given) return 0;
+  given = 1;
+  *start = __heap_start;
+  *end = __heap_end;
+  return 1;
 }
-#define MORECORE_CHUNK (4u * 1024u)
 
 #elif defined(OJAY_PLATFORM_LINUX_HOSTED)
 
@@ -286,54 +307,220 @@ static void plat_write(int fd, const void *buf, int64_t n) {
   }
 }
 __attribute__((noreturn)) static void plat_exit(int code) { exit(code); }
-static void *plat_alloc(int64_t size) { return malloc(size > 0 ? (size_t)size : 1); }
+__attribute__((noreturn)) static void heap_out_of_memory(int64_t n);
+static void *plat_alloc(int64_t size) {
+  void *p = size < 0 ? 0 : malloc(size > 0 ? (size_t)size : 1);
+  if (!p) heap_out_of_memory(size);
+  return p;
+}
 static void plat_free(void *p) { free(p); }
-static void *plat_realloc(void *p, int64_t size) { return realloc(p, size > 0 ? (size_t)size : 1); }
+static void *plat_realloc(void *p, int64_t size) {
+  void *q = size < 0 ? 0 : realloc(p, size > 0 ? (size_t)size : 1);
+  if (!q) heap_out_of_memory(size);
+  return q;
+}
 
 #else
 #error "define one of the OJAY_PLATFORM_* macros"
 #endif
 
 #if !defined(OJAY_PLATFORM_LINUX_HOSTED)
-/* Simple allocator over plat_morecore(): bump allocation from chunks, with a
- * header in front of each block recording its size. Freed blocks are not
- * reused (a real allocator is future work). */
-typedef struct {
-  uint64_t size;
-  uint64_t pad;
-} BlockHeader;
+/* ------------------------------------------------------------------------ */
+/* Heap (platforms without libc)                                             */
+/*                                                                           */
+/* A first-fit allocator with boundary tags over the memory that             */
+/* plat_more_heap() gives (bare metal: all RAM between .bss and the stack;   */
+/* freestanding Linux: mmap'ed chunks, each an arena of its own).            */
+/*                                                                           */
+/* Every block starts with a two-word header: the size of the previous block */
+/* (valid only while that one is free) and this block's size with two flag   */
+/* bits, INUSE and PREV_INUSE. Sizes include the header and are multiples of */
+/* HEAP_ALIGN (8 bytes on 32-bit targets, 16 on 64-bit), so payloads are     */
+/* HEAP_ALIGN-aligned. Free blocks are on one doubly linked list (links in   */
+/* the payload) and are merged with free neighbours as soon as they are      */
+/* freed, so no two free blocks are ever adjacent. Each arena ends with a    */
+/* zero-size INUSE fence header, so merging never runs off its end.          */
+/* Allocation takes the first free block that fits and splits off the rest  */
+/* when that is big enough to be a block. realloc grows in place into a     */
+/* free successor when it can, and shrinks in place.                        */
+/*                                                                           */
+/* free() and realloc() check the block they are given (in a heap arena,     */
+/* aligned, in use, consistent with its neighbour) and stop the program on a */
+/* bad or double free. Running out of memory stops the program too, with a  */
+/* message giving the request and the heap's state.                          */
 
-static uint8_t *chunk_cur, *chunk_end;
+typedef struct HeapBlock {
+  size_t prev_size;
+  size_t head; /* size | HEAP_INUSE | HEAP_PREV_INUSE */
+  struct HeapBlock *next, *prev; /* free blocks only */
+} HeapBlock;
 
-static void *plat_alloc(int64_t size) {
-  if (size < 0) return 0;
-  size_t total = ((size_t)size + sizeof(BlockHeader) + 7) & ~(size_t)7;
-  if (!chunk_cur || (size_t)(chunk_end - chunk_cur) < total) {
-    size_t want = total > MORECORE_CHUNK ? total : MORECORE_CHUNK;
-    uint8_t *c = (uint8_t *)plat_morecore(want);
-    if (!c && want > total) c = (uint8_t *)plat_morecore(want = total);
-    if (!c) return 0;
-    chunk_cur = c;
-    chunk_end = c + want;
-  }
-  BlockHeader *h = (BlockHeader *)chunk_cur;
-  chunk_cur += total;
-  h->size = (uint64_t)size;
-  return h + 1;
+#define HEAP_ALIGN (2 * sizeof(size_t))
+#define HEAP_HDR (2 * sizeof(size_t))
+#define HEAP_MIN_BLOCK ((sizeof(HeapBlock) + HEAP_ALIGN - 1) & ~(HEAP_ALIGN - 1))
+#define HEAP_INUSE ((size_t)1)
+#define HEAP_PREV_INUSE ((size_t)2)
+#define HEAP_FLAGS (HEAP_INUSE | HEAP_PREV_INUSE)
+#define HEAP_MAX_ARENAS 64
+
+static HeapBlock *heap_free_list;
+static struct {
+  uint8_t *start, *end; /* end: the fence header */
+} heap_arenas[HEAP_MAX_ARENAS];
+static int heap_narenas;
+static size_t heap_total, heap_free_bytes;
+
+static size_t blk_size(const HeapBlock *b) { return b->head & ~HEAP_FLAGS; }
+static HeapBlock *blk_next(HeapBlock *b) { return (HeapBlock *)((uint8_t *)b + blk_size(b)); }
+static void *blk_payload(HeapBlock *b) { return (uint8_t *)b + HEAP_HDR; }
+
+static void heap_link(HeapBlock *b) {
+  b->prev = 0;
+  b->next = heap_free_list;
+  if (heap_free_list) heap_free_list->prev = b;
+  heap_free_list = b;
+  heap_free_bytes += blk_size(b);
 }
 
-static void plat_free(void *p) { (void)p; }
+static void heap_unlink(HeapBlock *b) {
+  if (b->prev) b->prev->next = b->next;
+  else heap_free_list = b->next;
+  if (b->next) b->next->prev = b->prev;
+  heap_free_bytes -= blk_size(b);
+}
+
+/* Makes `b` (not on the free list, flags of its own as given) free and puts
+ * it on the list; its neighbours must not be free. */
+static void heap_make_free(HeapBlock *b, size_t size) {
+  b->head = size | HEAP_PREV_INUSE;
+  HeapBlock *n = blk_next(b);
+  n->prev_size = size;
+  n->head &= ~HEAP_PREV_INUSE;
+  heap_link(b);
+}
+
+/* Frees the block at `b` of `size` bytes (its own flags are ignored; its
+ * predecessor is in use), merging it with a free successor. */
+static void heap_release_tail(HeapBlock *b, size_t size) {
+  HeapBlock *n = (HeapBlock *)((uint8_t *)b + size);
+  if (!(n->head & HEAP_INUSE)) {
+    heap_unlink(n);
+    size += blk_size(n);
+  }
+  heap_make_free(b, size);
+}
+
+/* Shrinks in-use block `b` to `need` bytes if the rest can be a block. */
+static void heap_trim(HeapBlock *b, size_t need) {
+  size_t size = blk_size(b);
+  if (size - need < HEAP_MIN_BLOCK) return;
+  b->head = need | (b->head & HEAP_FLAGS);
+  heap_release_tail((HeapBlock *)((uint8_t *)b + need), size - need);
+}
+
+static int heap_add_arena(size_t min) {
+  uint8_t *start, *end;
+  if (heap_narenas == HEAP_MAX_ARENAS || !plat_more_heap(min + 2 * HEAP_HDR + HEAP_ALIGN, &start, &end)) return 0;
+  start = (uint8_t *)(((uintptr_t)start + HEAP_ALIGN - 1) & ~(uintptr_t)(HEAP_ALIGN - 1));
+  end = (uint8_t *)((uintptr_t)end & ~(uintptr_t)(HEAP_ALIGN - 1)) - HEAP_HDR;
+  if (end <= start || (size_t)(end - start) < HEAP_MIN_BLOCK) return 0;
+  HeapBlock *fence = (HeapBlock *)end;
+  fence->head = HEAP_INUSE;
+  heap_arenas[heap_narenas].start = start;
+  heap_arenas[heap_narenas].end = end;
+  ++heap_narenas;
+  HeapBlock *b = (HeapBlock *)start;
+  heap_total += (size_t)(end - start);
+  heap_make_free(b, (size_t)(end - start));
+  return 1;
+}
+
+static size_t heap_largest_free(void) {
+  size_t m = 0;
+  for (HeapBlock *b = heap_free_list; b; b = b->next)
+    if (blk_size(b) > m) m = blk_size(b);
+  return m > HEAP_HDR ? m - HEAP_HDR : 0;
+}
+
+/* The block size for a request of `n` bytes, or 0 if it is too big. */
+static size_t heap_need(int64_t n) {
+  if (n < 0 || (uint64_t)n > (uint64_t)(SIZE_MAX / 2)) return 0;
+  size_t need = ((size_t)n + HEAP_HDR + HEAP_ALIGN - 1) & ~(HEAP_ALIGN - 1);
+  return need < HEAP_MIN_BLOCK ? HEAP_MIN_BLOCK : need;
+}
+
+__attribute__((noreturn)) static void heap_out_of_memory(int64_t n);
+__attribute__((noreturn)) static void heap_bad_pointer(const char *what, void *p);
+
+static void *plat_alloc(int64_t n) {
+  size_t need = heap_need(n);
+  if (!need) heap_out_of_memory(n);
+  for (;;) {
+    for (HeapBlock *b = heap_free_list; b; b = b->next) {
+      if (blk_size(b) < need) continue;
+      heap_unlink(b);
+      b->head |= HEAP_INUSE;
+      blk_next(b)->head |= HEAP_PREV_INUSE;
+      heap_trim(b, need);
+      return blk_payload(b);
+    }
+    if (!heap_add_arena(need)) heap_out_of_memory(n);
+  }
+}
+
+/* The block of payload `p`, checked to be an in-use heap block. */
+static HeapBlock *heap_block_of(void *p, const char *what) {
+  uint8_t *q = (uint8_t *)p;
+  int i = 0;
+  while (i < heap_narenas && !(q >= heap_arenas[i].start + HEAP_HDR && q < heap_arenas[i].end)) ++i;
+  if (i == heap_narenas || ((uintptr_t)q & (HEAP_ALIGN - 1))) heap_bad_pointer(what, p);
+  HeapBlock *b = (HeapBlock *)(q - HEAP_HDR);
+  size_t size = blk_size(b);
+  if (!(b->head & HEAP_INUSE)) heap_bad_pointer(what, p);
+  if (size < HEAP_MIN_BLOCK || size > (size_t)(heap_arenas[i].end - (uint8_t *)b) ||
+      !(blk_next(b)->head & HEAP_PREV_INUSE))
+    heap_bad_pointer(what, p);
+  return b;
+}
+
+static void plat_free(void *p) {
+  if (!p) return;
+  HeapBlock *b = heap_block_of(p, "free");
+  size_t size = blk_size(b);
+  if (!(b->head & HEAP_PREV_INUSE)) { /* merge with the free predecessor */
+    HeapBlock *prev = (HeapBlock *)((uint8_t *)b - b->prev_size);
+    heap_unlink(prev);
+    size += blk_size(prev);
+    b = prev;
+  }
+  heap_release_tail(b, size);
+}
 
 void *memcpy(void *dst, const void *src, size_t n);
 
-static void *plat_realloc(void *p, int64_t new_size) {
-  if (!p) return plat_alloc(new_size);
-  int64_t old = (int64_t)((BlockHeader *)p - 1)->size;
-  if (new_size <= old) return p;
-  void *n = plat_alloc(new_size);
-  if (!n) return 0;
-  memcpy(n, p, (size_t)old);
-  return n;
+static void *plat_realloc(void *p, int64_t n) {
+  if (!p) return plat_alloc(n);
+  HeapBlock *b = heap_block_of(p, "realloc");
+  size_t need = heap_need(n);
+  if (!need) heap_out_of_memory(n);
+  size_t size = blk_size(b);
+  if (need > size) { /* grow into a free successor */
+    HeapBlock *next = blk_next(b);
+    if (!(next->head & HEAP_INUSE) && size + blk_size(next) >= need) {
+      heap_unlink(next);
+      size += blk_size(next);
+      b->head = size | (b->head & HEAP_FLAGS);
+      blk_next(b)->head |= HEAP_PREV_INUSE;
+    }
+  }
+  if (need <= size) {
+    heap_trim(b, need);
+    return p;
+  }
+  void *q = plat_alloc(n);
+  memcpy(q, p, size - HEAP_HDR);
+  plat_free(p);
+  return q;
 }
 #endif
 
@@ -627,6 +814,42 @@ static void format(Out *o, const uint8_t *fmt, int64_t len, const OAny *args, in
 /* ------------------------------------------------------------------------ */
 /* Entry points called by generated code                                     */
 
+/* ------------------------------------------------------------------------ */
+/* Heap errors                                                               */
+
+__attribute__((noreturn)) static void heap_out_of_memory(int64_t n) {
+  Out o;
+  out_init_fd(&o, 2);
+  out_cstr(&o, "Out of memory: cannot allocate ");
+  out_s64(&o, n);
+  out_cstr(&o, " bytes");
+#if !defined(OJAY_PLATFORM_LINUX_HOSTED)
+  out_cstr(&o, " (heap: ");
+  out_u64(&o, heap_total);
+  out_cstr(&o, " bytes, ");
+  out_u64(&o, heap_free_bytes);
+  out_cstr(&o, " free, largest free block ");
+  out_u64(&o, heap_largest_free());
+  out_cstr(&o, ")");
+#endif
+  out_cstr(&o, ".\n");
+  out_flush(&o);
+  plat_exit(1);
+}
+
+#if !defined(OJAY_PLATFORM_LINUX_HOSTED)
+__attribute__((noreturn)) static void heap_bad_pointer(const char *what, void *p) {
+  Out o;
+  out_init_fd(&o, 2);
+  out_cstr(&o, what);
+  out_cstr(&o, "(): ");
+  out_hex(&o, (uint64_t)(uintptr_t)p);
+  out_cstr(&o, " is not an allocated block (already freed, or not from the heap).\n");
+  out_flush(&o);
+  plat_exit(1);
+}
+#endif
+
 /* Saved for a future get_command_line_arguments(). */
 int __ojay_argc;
 char **__ojay_argv;
@@ -644,11 +867,17 @@ int64_t __ojay_print(const uint8_t *fmt, int64_t len, const OAny *args, int64_t 
   return o.total;
 }
 
-void __ojay_sprint(OString *result, const uint8_t *fmt, int64_t len, const OAny *args, int64_t n) {
+/* Allocates `size` bytes with `allocate` and `allocator`, or from the heap. */
+static void *alloc_with(OAllocateFn allocate, const OAllocator *allocator, int64_t size) {
+  return allocate ? allocate(MODE_ALLOCATE, size, 0, 0, allocator) : plat_alloc(size);
+}
+
+void __ojay_sprint(OString *result, const uint8_t *fmt, int64_t len, const OAny *args, int64_t n,
+                   OAllocateFn allocate, const OAllocator *allocator) {
   Out o;
   out_init_heap(&o);
   format(&o, fmt, len, args, n);
-  uint8_t *data = (uint8_t *)plat_alloc(o.len + 1);
+  uint8_t *data = (uint8_t *)alloc_with(allocate, allocator, o.len + 1);
   for (int64_t i = 0; i < o.len; ++i) data[i] = o.buf[i];
   data[o.len] = 0;
   if (o.buf != o.local) plat_free(o.buf);
@@ -674,12 +903,21 @@ int __ojay_string_equal(const uint8_t *a, int64_t alen, const uint8_t *b, int64_
   return 1;
 }
 
-void __ojay_array_reserve(ODynArray *a, int64_t elem_size, int64_t needed) {
+/* `context_allocator` is the context's Allocator (with `allocate`), which the
+ * array adopts when it first grows. */
+void __ojay_array_reserve(ODynArray *a, int64_t elem_size, int64_t needed, OAllocateFn allocate,
+                          const OAllocator *context_allocator) {
   if (a->allocated >= needed) return;
   int64_t cap = a->allocated * 2;
   if (cap < 8) cap = 8;
   if (cap < needed) cap = needed;
-  uint8_t *data = (uint8_t *)plat_realloc(a->data, cap * elem_size);
+  uint8_t *data;
+  if (allocate) {
+    if (!a->allocator.proc) a->allocator = *context_allocator;
+    data = (uint8_t *)allocate(MODE_RESIZE, cap * elem_size, a->allocated * elem_size, a->data, &a->allocator);
+  } else {
+    data = (uint8_t *)plat_realloc(a->data, cap * elem_size);
+  }
   if (!data) {
     static const char msg[] = "array_add: out of memory\n";
     plat_write(2, msg, sizeof(msg) - 1);
@@ -689,8 +927,8 @@ void __ojay_array_reserve(ODynArray *a, int64_t elem_size, int64_t needed) {
   a->allocated = cap;
 }
 
-uint8_t *__ojay_to_c_string(const uint8_t *data, int64_t len) {
-  uint8_t *r = (uint8_t *)plat_alloc(len + 1);
+uint8_t *__ojay_to_c_string(const uint8_t *data, int64_t len, OAllocateFn allocate, const OAllocator *allocator) {
+  uint8_t *r = (uint8_t *)alloc_with(allocate, allocator, len + 1);
   for (int64_t i = 0; i < len; ++i) r[i] = data[i];
   r[len] = 0;
   return r;

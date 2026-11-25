@@ -1,0 +1,33 @@
+default: default, context.allocator is the default: true
+compile time: bump used 216, restored true
+node 7 at depth 2 (20 values, last 400)
+counting: allocs=2 resizes=3 frees=3 bytes=34
+bump: total 15 names [a1, b2, c3] used 152 bytes
+after push_context: default
+explicit: allocs=3 resizes=1 frees=3 bytes=124
+propagation: call counting nested counting poly counting counting, procedure value counting
+  defer in push_context sees counting
+return_inside: counting
+after return: default
+  iteration 0 uses counting
+  after the loop: default
+  in the macro: counting
+after the macro's `return: default
+after set_directly: counting
+outside: default
+push_allocator: counting
+after its scope: default
+array: count 40 resizes 4 allocator is counting: true
+array_reset: frees 1 allocator kept: true
+temporary 1 of 3
+temporary 2 of 3
+temporary 3 of 3
+temporary: occupied 10072 high water mark >= 10000: true
+after reset: occupied 0
+in temporary storage: 99
+frame_count 3
+in child: frame_count 11 user_index 5
+frame_count 3 (child's is 10)
+logger: 2 lines, last world
+default logger
+callback: 42
