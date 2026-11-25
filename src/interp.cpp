@@ -89,6 +89,13 @@ struct Region {
 
 enum class Flow { Normal, Break, Continue, Return };
 
+// Thrown when a break, continue or return leaves a macro expansion that is
+// part of an expression: it is caught by the statement being executed, which
+// then passes the flow on as usual (running defers on the way).
+struct FlowEscape {
+  Flow flow;
+};
+
 struct Frame {
   ProcLit* proc = nullptr;  // null for the #run expression itself
   SourceLoc call_loc;
@@ -184,11 +191,15 @@ class Machine {
     Frame root;
     frames_.push_back(&root);
     ConstValue out;
-    if (!want_result) {
-      eval_any(e);
-    } else {
-      Val v = eval(e);
-      out = read_const(v.data(), conc(e->type), "", e->loc);
+    try {
+      if (!want_result) {
+        eval_any(e);
+      } else {
+        Val v = eval(e);
+        out = read_const(v.data(), conc(e->type), "", e->loc);
+      }
+    } catch (const FlowEscape&) {
+      err(e->loc, "internal error: break, continue or return out of a #run expression");
     }
     frames_.pop_back();
     return out;
@@ -210,6 +221,13 @@ class Machine {
   std::unordered_map<std::string, u64> strings_;
   std::unordered_map<Type*, Val> defaults_;
   std::unordered_map<Type*, bool> needs_default_;
+  // Macro expansions being evaluated, innermost last.
+  struct ActiveExpansion {
+    MacroExpansion* x;
+    size_t* defer_mark;  // where the defers of the expansion's top level start
+    Val* result;
+  };
+  std::vector<ActiveExpansion> expansions_;
 
   // ------------------------------------------------------------------ errors
 
@@ -468,6 +486,7 @@ class Machine {
       case ConstValue::Null: store_u(p, ps_, 0); return;
       case ConstValue::Address: store_u(p, intlike(t) ? sz(t) : ps_, (u64)cv.i); return;
       case ConstValue::TypeV: store_u(p, ps_, in_.type_id(cv.t)); return;
+      case ConstValue::Code: store_u(p, 8, (u64)cv.i); return;
       case ConstValue::Aggregate: {
         const auto& es = *cv.elems;
         if (es.empty()) return;  // zero value
@@ -521,6 +540,7 @@ class Machine {
         if (!ty) err(loc, where(), " is not a valid Type value (", hex(v), ")");
         return ConstValue::of_type(ty);
       }
+      case TypeKind::Code: return ConstValue::code((__int128)load_u(p, 8));
       case TypeKind::Pointer:
       case TypeKind::Proc: {
         u64 v = load_u(p, ps_);
@@ -675,6 +695,48 @@ class Machine {
 
   Flow exec(Stmt* s) {
     step(s->loc);
+    size_t args_mark = args_.size();
+    try {
+      return exec_inner(s);
+    } catch (const FlowEscape& fe) {  // out of a macro expansion inside this statement's expressions
+      args_.resize(args_mark);
+      return fe.flow;
+    }
+  }
+
+  ActiveExpansion& active_expansion(MacroExpansion* x, SourceLoc loc) {
+    for (size_t i = expansions_.size(); i-- > 0;)
+      if (expansions_[i].x == x) return expansions_[i];
+    err(loc, "internal error: macro expansion is not active");
+  }
+
+  // An inlined #expand macro: runs its statements; its value is set by a
+  // `return` in it (Return::expand_target).
+  Val eval_expansion(MacroExpansion* x) {
+    Frame& f = *frames_.back();
+    size_t mark = f.defers.size();
+    Val result(sz(x->type));
+    expansions_.push_back({x, &mark, &result});
+    Flow fl = Flow::Normal;
+    for (Stmt* st : x->body->stmts) {
+      fl = exec(st);
+      if (fl != Flow::Normal) break;
+    }
+    if (fl == Flow::Break && flow_target_ == x->body) fl = Flow::Normal;  // the macro returned
+    if (f.defers.size() > mark) {
+      Stmt* target = flow_target_;
+      for (size_t j = f.defers.size(); j-- > mark;) exec_body(f.defers[j]);
+      f.defers.resize(mark);
+      flow_target_ = target;
+    }
+    expansions_.pop_back();
+    // Locals of the expansion stay on the stack until the caller's scope ends:
+    // `x := ... declares variables of that scope.
+    if (fl != Flow::Normal) throw FlowEscape{fl};
+    return result;
+  }
+
+  Flow exec_inner(Stmt* s) {
     switch (s->kind) {
       case NK::Block: return exec_scoped(static_cast<Block*>(s)->stmts);
       case NK::ExprStmt: {
@@ -710,8 +772,23 @@ class Machine {
       case NK::Continue:
         flow_target_ = static_cast<BreakContinue*>(s)->target;
         return s->kind == NK::Break ? Flow::Break : Flow::Continue;
-      case NK::Defer:
-        frames_.back()->defers.push_back(static_cast<Defer*>(s)->body);
+      case NK::Defer: {
+        auto* d = static_cast<Defer*>(s);
+        if (d->backtick) {  // `defer: runs when the macro caller's scope ends
+          ActiveExpansion& a = active_expansion(d->target, d->loc);
+          auto& defers = frames_.back()->defers;
+          defers.insert(defers.begin() + (std::ptrdiff_t)*a.defer_mark, d->body);
+          ++*a.defer_mark;
+          return Flow::Normal;
+        }
+        frames_.back()->defers.push_back(d->body);
+        return Flow::Normal;
+      }
+      case NK::Insert:  // inserted code runs in place
+        for (Stmt* x : static_cast<Insert*>(s)->result->stmts) {
+          Flow fl = exec(x);
+          if (fl != Flow::Normal) return fl;
+        }
         return Flow::Normal;
       case NK::StaticIf: {
         auto* si = static_cast<StaticIf*>(s);
@@ -901,6 +978,12 @@ class Machine {
   }
 
   Flow exec_return(Return* r) {
+    if (r->expand_target) {  // leaves the macro expansion with its value
+      ActiveExpansion& a = active_expansion(r->expand_target, r->loc);
+      if (!r->values.empty()) *a.result = eval(r->values[0]);
+      flow_target_ = r->expand_target->body;
+      return Flow::Break;
+    }
     Frame& f = *frames_.back();
     const auto& rets = f.proc->type->returns;
     if (rets.size() == 1) {
@@ -1081,6 +1164,7 @@ class Machine {
         return v;
       }
       case NK::ProcLit: return make_ptr(in_.proc_id(static_cast<ProcLit*>(e)));
+      case NK::Expansion: return eval_expansion(static_cast<MacroExpansion*>(e));
       case NK::Ifx: {
         auto* x = static_cast<Ifx*>(e);
         return truth(eval(x->cond), x->cond->type) ? eval(x->then_e) : eval(x->else_e);

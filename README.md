@@ -276,6 +276,8 @@ Implemented:
   precedence. `M :: #import "Name";` makes them available only as `M.name`
   (procedures, types, constants), for built-in modules too.
 * Compile-time execution: `#run` (see *Compile-time execution* below)
+* Metaprogramming: `#code`, `#insert`, `#expand` macros and `#modify` (see
+  *Metaprogramming* below)
 * Runtime checks: array bounds checks; `assert`
 * ojay extension for embedded targets: `#import "Hardware"` provides
   `volatile_load(p)` and `volatile_store(p, value)` for memory-mapped
@@ -291,12 +293,15 @@ Implemented:
   `to_c_string`, integer limits) and `Math` (`sqrt`, `sin`, `cos`, `tan`,
   `atan2`, `pow`, `floor`, `ceil`, `round`, `exp`, `log`, `abs`, `PI`, `TAU`)
 
-Not yet implemented: `#insert`/`#code` metaprogramming, `#compiler`
-procedures and the compiler message loop (`#run,stallable`), the context and
-custom allocators, `#foreign` procedures that pass or return structs by value,
-`using` on pointer members and at top level, `#as`. Polymorphism does not yet cover `#modify`, `$$` auto-baking,
+Not yet implemented: `#compiler` procedures and the compiler message loop
+(`#run,stallable`), `Code_Node` introspection (`compiler_get_nodes`),
+`#insert,scope(...)`, `#caller_location` / `#location`,
+`#procedure_of_call`, the context and custom allocators, `#foreign`
+procedures that pass or return structs by value, `using` on pointer members
+and at top level, `#as`. Polymorphism does not yet cover `$$` auto-baking,
 `#bake_arguments`, `$T/Interface` constraints, `$R` introduced in a return
-type, or polymorphic procedure values (using a template without calling it).
+type, `#modify` on structs, or polymorphic procedure values (using a template
+without calling it).
 
 ### Compile-time execution
 
@@ -346,6 +351,70 @@ buffer: [#run compute_size()]u8;        // anywhere a constant is needed
   bake some of them into the program); `sin`, `pow` and other transcendental
   functions use the host's math library, whose last-bit rounding can differ
   from the target's libm.
+
+### Metaprogramming
+
+```jai
+// #insert: code made by #run (a string) or written with #code
+unrolled :: (n: int) -> string { ... }   // "total += v[0]; total += v[1]; ..."
+sum4 :: (v: [4]int) -> int { total := 0; #insert #run unrolled(4); return total; }
+Vec :: struct { #insert #run "x, y, z: float;"; }
+
+// #expand: inlined at each call; backticks reach the caller's scope
+each_even :: (arr: []int, body: Code) #expand {
+    `elem := 0;
+    for arr  if it % 2 == 0 { `elem = it; #insert body; }
+}
+each_even(values, #code { total += elem; });
+
+// #modify: runs when a polymorphic procedure is instantiated
+add :: (a: $T, b: T) -> T #modify { if T == s16  T = s64; return true; } { return a + b; }
+```
+
+* `#code expr` and `#code { statements }` are constants of type `Code`: the
+  syntax stays unchecked until it is inserted. A `Code` value can be a
+  constant, an argument (of a macro, or a `$`-baked parameter, which gives
+  each piece of code its own instance) or passed through `#run`; it cannot be
+  printed or converted to `Any`.
+* `#insert x;` takes a `Code` or string constant (typically `#insert #run
+  f();`). Each use checks a fresh copy. As a statement, the code is checked
+  in the current scope, so its declarations are visible after the `#insert`;
+  as an expression (`x := #insert "a * 2";`) it replaces the expression. It
+  also works at top level (declarations, evaluated once the unit's own
+  declarations are known) and in struct bodies (members, also in polymorphic
+  structs). Strings are parsed as source text; errors in them point into a
+  file named `<inserted at file.jai:LINE>`, followed by the `#insert` site.
+* `name :: (params) -> T #expand { ... }` is a macro: every call inlines a
+  copy of the body. Parameters become locals of the caller, evaluated once,
+  in order; `Code` parameters stay constants, so `#insert body;` works on
+  them. Names in the body mean what they mean where the macro is declared;
+  `` `x`` reads, assigns or calls a name of the caller's scope, and
+  `` `x := v;`` declares one there (only at the top level of the body). A
+  plain `return v;` ends the expansion with value `v`; `` `return`` returns
+  from the caller, which for a macro expanded by another macro is that
+  macro's expansion. `` `defer`` (at the top level of the body) defers to
+  the end of the caller's scope. `break` and `continue` work on the caller's
+  loops, and in inserted code on the innermost loop (the macro's own, as in a
+  `for_expansion`). Macros can call macros; a compile-time parameter with
+  `#if` ends recursion, and an expansion more than 100 levels deep is an
+  error. Macros work in `#run` code too. Like polymorphic procedures, a
+  macro's body is only checked where it is expanded.
+* `Code` given to a macro is checked where it was written: it sees the
+  caller's variables (and the backtick declarations the macro made there),
+  and its `return` and backtick names are the caller's.
+* `#modify { ... }` on a polymorphic procedure runs (in the interpreter)
+  each time a call infers new bindings, with the type variables as `Type`
+  variables. It returns a `bool`, optionally with a message
+  (`return false, "why";`): `false` rejects the candidate, so overload
+  resolution tries the others, and the message appears in the error.
+  Assigning a type variable (`T = s64;`) changes the instance. Compile-time
+  values (`$N`) are constants in it.
+* Differences from Jai: `#insert,scope()`, `#insert -> string { ... }`,
+  `Code_Node` introspection, `#caller_location`, `` `break`` / `` `continue``
+  and `#modify` on structs are not supported. `#code` takes an expression or
+  a `{ }` block, not a bare statement. Macros return at most one value. A
+  string inserted inside a macro resolves names in the macro's scope (the
+  insertion point), while inserted `Code` follows the rules above.
 
 ## Layout
 

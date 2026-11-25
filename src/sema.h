@@ -87,6 +87,7 @@ struct SemaOptions {
 };
 
 // Runs semantic analysis over `prog`. Throws CompileError on the first error.
-void analyze(AstContext& ast, const SourceManager& sm, TypeTable& types, Program& prog, const SemaOptions& opts);
+// Text inserted with `#insert` is registered with `sm` as a new source file.
+void analyze(AstContext& ast, SourceManager& sm, TypeTable& types, Program& prog, const SemaOptions& opts);
 
 }  // namespace ojay

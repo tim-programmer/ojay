@@ -24,7 +24,7 @@ enum class Tok {
   LParen, RParen, LBrace, RBrace, LBracket, RBracket,
   Comma, Semi, Colon, ColonColon, ColonEq,
   Dot, DotDot, DotLBrace, DotLBracket, DotStar,
-  Arrow, Dollar, TripleDash,
+  Arrow, Dollar, Backtick, TripleDash,
   Eq, EqEq, NotEq, Lt, LtEq, Gt, GtEq,
   Plus, Minus, Star, Slash, Percent, Amp, Pipe, Caret, Tilde, Bang,
   AndAnd, OrOr, Shl, Shr,

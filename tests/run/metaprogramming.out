@@ -1,0 +1,21 @@
+unrolled: 30
+generated: 0 10 20 30
+top level: 3 42
+answer: 42
+limit: 5 10
+apply: 12 107
+square: 81
+counter: 22
+helpers: 701
+checked_double: -1 42
+classify: 0 120 500
+collect_evens: 12
+enter block
+inside
+leave block
+3 2 1 liftoff
+2 4 6 
+macro_results: 352
+at compile time: 352
+describe: integer float integer
+add: 60000 (s64), 3 (s64)

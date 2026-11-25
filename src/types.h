@@ -37,6 +37,7 @@ enum class TypeKind {
   UntypedFloat,  // float constants that have not yet been given a type
   Null,          // the type of `null` before it is converted to a pointer
   Tuple,         // multiple return values
+  Code,          // `Code`: a piece of unchecked syntax (#code), a compile-time value
 };
 
 enum class ArrayKind { Fixed, View, Dynamic };
@@ -136,6 +137,7 @@ class TypeTable {
   Type* string_t;
   Type* any_t;
   Type* type_t;
+  Type* code_t;
   Type* untyped_int;
   Type* untyped_float;
   Type* null_t;

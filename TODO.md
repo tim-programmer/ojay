@@ -9,12 +9,14 @@
 
 - [x] `#run` (compile-time execution) (not yet: `#run,stallable` and the compiler message loop,
       unions, pointers and procedure values in results)
-- [x] Polymorphic procedures and structs (`$T`) (not yet: `#modify`, `$$`, `#bake_arguments`,
+- [x] Polymorphic procedures and structs (`$T`) (not yet: `$$`, `#bake_arguments`,
       `/interface`, `$R` in return types, polymorphic procedure values)
 - [x] `using` (not yet: pointer members, top level, `#as`)
 - [x] Procedure overloading
 - [x] Operator overloading
-- [ ] Metaprogramming: `#insert`, `#code`, `#modify`, `#expand`
+- [x] Metaprogramming: `#insert`, `#code`, `#modify`, `#expand` (not yet: `#insert,scope()`,
+      `Code_Node` introspection / `compiler_get_nodes`, `#caller_location`, `` `break``/`` `continue``,
+      `#modify` on structs, macros with several return values)
 - [ ] The context and custom allocators
 - [x] Named module imports (`Name :: #import "..."`) with a real namespace
 - [ ] `#foreign` procedures that pass or return structs by value (C ABI lowering)

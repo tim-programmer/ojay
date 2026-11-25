@@ -207,6 +207,29 @@ class Parser {
       }
       case Tok::Directive:
         return parse_directive_stmt(top_level);
+      case Tok::Backtick:
+        if (top_level) fail(loc, "backtick names (`name) are only allowed in the body of an #expand macro");
+        if (peek().kind == Tok::KwReturn || peek().kind == Tok::KwDefer) {
+          advance();
+          Stmt* st = parse_stmt(false);
+          if (st->kind == NK::Return) static_cast<Return*>(st)->backtick = true;
+          else static_cast<Defer*>(st)->backtick = true;
+          st->loc = loc;
+          return st;
+        }
+        if (peek().kind == Tok::KwBreak || peek().kind == Tok::KwContinue)
+          fail(loc, "`", peek().kind == Tok::KwBreak ? "break" : "continue", " is not supported yet");
+        if (peek().kind == Tok::Ident &&
+            (peek(2).kind == Tok::Colon || peek(2).kind == Tok::ColonColon || peek(2).kind == Tok::ColonEq)) {
+          advance();  // `x := ...; declares x in the macro caller's scope
+          auto* d = ast_.make<Decl>(loc);
+          d->names.push_back({cur().text, cur().loc});
+          advance();
+          d->backtick = true;
+          parse_decl_rest(d);
+          return d;
+        }
+        break;
       default:
         break;
     }
@@ -248,6 +271,14 @@ class Parser {
       expect(Tok::Semi, "after #run statement");
       return ast_.make<ExprStmt>(loc, ast_.make<DirectiveExpr>(loc, "run", e));
     }
+    if (d == "insert") {
+      // `#insert expr;`: expr is a Code or string constant.
+      advance();
+      reject_insert_modifiers();
+      Expr* e = parse_expr();
+      expect(Tok::Semi, "after #insert statement");
+      return ast_.make<Insert>(loc, e);
+    }
     if (d == "through") fail(loc, "#through is only allowed at the end of an 'if ==' case");
     return parse_simple_stmt(top_level);
   }
@@ -256,6 +287,13 @@ class Parser {
   void reject_run_modifiers() {
     if (at(Tok::Comma))
       fail(cur().loc, "#run,", peek().kind == Tok::Ident ? peek().text : "...", " is not supported yet");
+  }
+
+  // `#insert,scope(...)` / `#insert -> string { ... }`
+  void reject_insert_modifiers() {
+    if (at(Tok::Comma))
+      fail(cur().loc, "#insert,", peek().kind == Tok::Ident ? peek().text : "...", " is not supported yet");
+    if (at(Tok::Arrow)) fail(cur().loc, "#insert -> string { ... } is not supported yet; use #insert #run");
   }
 
   void skip_directive_modifiers() {
@@ -482,6 +520,7 @@ class Parser {
     if (e->kind == NK::ProcLit) return static_cast<ProcLit*>(e)->body != nullptr;
     // A here-string ends with its terminator line; a ';' after it is optional.
     if (e->kind == NK::StringLit) return static_cast<StringLit*>(e)->here_string;
+    if (e->kind == NK::CodeLit) return static_cast<CodeLit*>(e)->code_block != nullptr;
     return e->kind == NK::StructDef || e->kind == NK::EnumDef;
   }
 
@@ -771,6 +810,12 @@ class Parser {
       }
       case Tok::Dollar:
         return parse_poly_ident();
+      case Tok::Backtick: {
+        advance();
+        auto* id = ast_.make<Ident>(loc, expect_ident("name after '`'"));
+        id->backtick = true;
+        return id;
+      }
       case Tok::Directive:
         return parse_directive_expr();
       default:
@@ -809,10 +854,23 @@ class Parser {
       reject_run_modifiers();
       return ast_.make<DirectiveExpr>(loc, "run", parse_unary());
     }
-    if (d == "procedure_of_call" || d == "code" || d == "insert" || d == "bake_arguments" ||
-        d == "modify" || d == "expand" || d == "caller_location" || d == "location") {
+    if (d == "code") {
+      auto* c = ast_.make<CodeLit>(loc);
+      if (at(Tok::Comma)) fail(cur().loc, "#code,", peek().kind == Tok::Ident ? peek().text : "...",
+                               " is not supported yet");
+      if (at(Tok::LBrace)) c->code_block = parse_block();
+      else c->code_expr = parse_expr();
+      return c;
+    }
+    if (d == "insert") {
+      reject_insert_modifiers();
+      return ast_.make<DirectiveExpr>(loc, "insert", parse_unary());
+    }
+    if (d == "procedure_of_call" || d == "bake_arguments" || d == "caller_location" || d == "location" ||
+        d == "compiler") {
       fail(loc, "#", d, " is not supported yet");
     }
+    if (d == "modify" || d == "expand") fail(loc, "#", d, " must follow a procedure's parameter list");
     fail(loc, "unknown directive '#", d, "' in expression");
   }
 
@@ -961,12 +1019,19 @@ class Parser {
         p->symmetric = true;
       } else if (d == "deprecated") {
         if (at(Tok::String)) advance();
-      } else if (d == "compiler" || d == "expand" || d == "elsewhere" || d == "modify") {
+      } else if (d == "expand") {
+        p->is_macro = true;
+      } else if (d == "modify") {
+        if (p->modify) fail(loc, "a procedure can only have one #modify block");
+        if (!at(Tok::LBrace)) fail(cur().loc, "expected '{' after #modify, found ", describe(cur()));
+        p->modify = parse_block();
+      } else if (d == "compiler" || d == "elsewhere") {
         fail(loc, "#", d, " procedures are not supported yet");
       } else if (!is_ignored_proc_directive(d)) {
         fail(loc, "unknown procedure directive '#", d, "'");
       }
     }
+    if (p->is_macro && p->is_foreign) fail(p->loc, "an #expand macro cannot be #foreign");
     if (!p->is_foreign) {
       if (!at(Tok::LBrace)) fail(cur().loc, "expected procedure body, found ", describe(cur()));
       p->body = parse_block();
@@ -1022,36 +1087,80 @@ class Parser {
       if (s->params.empty()) fail(s->loc, "a parameterized struct needs at least one parameter");
     }
     while (at(Tok::Directive)) {
+      if (cur().text == "modify") fail(cur().loc, "#modify on structs is not supported yet");
       // #type_info_none etc. are accepted and ignored
       advance();
     }
     expect(Tok::LBrace, "to begin struct body");
     while (!at(Tok::RBrace)) {
+      if (at(Tok::Eof)) fail(s->loc, "unterminated struct body (missing '}')");
       if (accept(Tok::Semi)) continue;
-      if (at(Tok::Directive) && (cur().text == "as" || cur().text == "place" || cur().text == "align")) {
-        fail(cur().loc, "#", cur().text, " in structs is not supported yet");
-      }
-      SourceLoc loc = cur().loc;
-      auto* d = ast_.make<Decl>(loc);
-      if (accept(Tok::KwUsing)) d->is_using = true;
-      if (at(Tok::KwStruct) || at(Tok::KwUnion)) {  // anonymous member: `union { a: u32; b: f32; }`
-        if (d->is_using) fail(loc, "expected a member name after 'using'");
-        d->names.push_back({"", loc});
-        d->type_expr = parse_struct();
-        s->members.push_back(d);
-        continue;
-      }
-      for (;;) {
-        d->names.push_back({expect_ident("member name"), cur().loc});
-        if (!accept(Tok::Comma)) break;
-      }
-      parse_decl_rest(d);
-      if (d->is_const) fail(loc, "constants inside structs are not supported yet");
-      s->members.push_back(d);
+      s->members.push_back(parse_struct_member());
     }
     advance();
     return s;
   }
+
+ public:
+  // One member declaration of a struct body (or `#insert expr;`).
+  Decl* parse_struct_member() {
+    if (at(Tok::Directive) && (cur().text == "as" || cur().text == "place" || cur().text == "align")) {
+      fail(cur().loc, "#", cur().text, " in structs is not supported yet");
+    }
+    SourceLoc loc = cur().loc;
+    auto* d = ast_.make<Decl>(loc);
+    if (at_directive("insert")) {  // members made at compile time
+      advance();
+      reject_insert_modifiers();
+      d->insert = parse_expr();
+      expect(Tok::Semi, "after #insert");
+      return d;
+    }
+    if (accept(Tok::KwUsing)) d->is_using = true;
+    if (at(Tok::KwStruct) || at(Tok::KwUnion)) {  // anonymous member: `union { a: u32; b: f32; }`
+      if (d->is_using) fail(loc, "expected a member name after 'using'");
+      d->names.push_back({"", loc});
+      d->type_expr = parse_struct();
+      return d;
+    }
+    for (;;) {
+      d->names.push_back({expect_ident("member name"), cur().loc});
+      if (!accept(Tok::Comma)) break;
+    }
+    parse_decl_rest(d);
+    if (d->is_const) fail(loc, "constants inside structs are not supported yet");
+    return d;
+  }
+
+  // The whole file as statements (an inserted string).
+  std::vector<Stmt*> parse_statements(bool top_level) {
+    std::vector<Stmt*> out;
+    while (!at(Tok::Eof)) {
+      if (accept(Tok::Semi)) continue;
+      out.push_back(parse_stmt(top_level));
+    }
+    return out;
+  }
+
+  // The whole file as one expression (an inserted string).
+  Expr* parse_whole_expr() {
+    Expr* e = parse_expr();
+    accept(Tok::Semi);
+    if (!at(Tok::Eof)) fail(cur().loc, "expected the end of the inserted expression, found ", describe(cur()));
+    return e;
+  }
+
+  // The whole file as struct members (an inserted string).
+  std::vector<Decl*> parse_struct_members() {
+    std::vector<Decl*> out;
+    while (!at(Tok::Eof)) {
+      if (accept(Tok::Semi)) continue;
+      out.push_back(parse_struct_member());
+    }
+    return out;
+  }
+
+ private:
 
   EnumDef* parse_enum() {
     auto* e = ast_.make<EnumDef>(cur().loc);
@@ -1079,6 +1188,21 @@ class Parser {
 std::vector<Stmt*> parse_file(AstContext& ast, const SourceManager& sm, uint32_t file_id) {
   Parser p(ast, sm, file_id);
   return p.parse_top_level();
+}
+
+std::vector<Stmt*> parse_source_stmts(AstContext& ast, const SourceManager& sm, uint32_t file_id, bool top_level) {
+  Parser p(ast, sm, file_id);
+  return top_level ? p.parse_top_level() : p.parse_statements(false);
+}
+
+Expr* parse_source_expr(AstContext& ast, const SourceManager& sm, uint32_t file_id) {
+  Parser p(ast, sm, file_id);
+  return p.parse_whole_expr();
+}
+
+std::vector<Decl*> parse_source_members(AstContext& ast, const SourceManager& sm, uint32_t file_id) {
+  Parser p(ast, sm, file_id);
+  return p.parse_struct_members();
 }
 
 }  // namespace ojay

@@ -1,6 +1,7 @@
 #include "sema.h"
 
 #include "interp.h"
+#include "parser.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -60,16 +61,41 @@ bool is_c_scalar(const Type* t) {
   }
 }
 
+// An #expand macro being expanded.
+struct MacroCtx {
+  int id = 0;
+  MacroExpansion* exp = nullptr;
+  Scope* caller_scope = nullptr;       // where backtick names are looked up and declared
+  bool caller_in_run_operand = false;  // the caller is the expression of a #run
+  int caller_defer_depth = 0;
+  Scope* body_scope = nullptr;         // the scope of the expansion's top level
+};
+
 struct Context {
   Scope* scope;
   ProcLit* proc;
   std::vector<Stmt*> loops;
   int defer_depth;
+  std::vector<MacroCtx> macros;
+};
+
+// An error that needs no notes on where it happened (it says so itself).
+struct FinalError : CompileError {
+  using CompileError::CompileError;
+};
+
+// A `#code` value: unchecked syntax, and where it was written.
+struct CodeEntry {
+  Expr* expr = nullptr;
+  Block* block = nullptr;
+  SourceLoc loc;
+  Scope* scope = nullptr;
+  int macro_id = 0;  // the expansion it was written in (0: none)
 };
 
 class Checker : public InterpHost {
  public:
-  Checker(AstContext& ast, const SourceManager& sm, TypeTable& types, Program& prog, const SemaOptions& opts)
+  Checker(AstContext& ast, SourceManager& sm, TypeTable& types, Program& prog, const SemaOptions& opts)
       : ast_(ast), sm_(sm), T(types), prog_(prog), opts_(opts), interp_(types, sm, *this) {}
 
   void run() {
@@ -117,7 +143,7 @@ class Checker : public InterpHost {
 
  private:
   AstContext& ast_;
-  const SourceManager& sm_;
+  SourceManager& sm_;
   TypeTable& T;
   Program& prog_;
   SemaOptions opts_;
@@ -128,6 +154,12 @@ class Checker : public InterpHost {
   ProcLit* proc_ = nullptr;
   std::vector<Stmt*> loops_;
   int defer_depth_ = 0;
+  // Metaprogramming: the #expand macros being expanded (innermost last) and
+  // the #code values (ids are index + 1).
+  std::vector<MacroCtx> macros_;
+  int next_macro_id_ = 0;
+  std::vector<CodeEntry> codes_;
+  static constexpr size_t kMaxMacroDepth = 100;
 
   std::vector<Symbol*> global_order_;
   std::vector<std::pair<Stmt*, Scope*>> top_directives_;
@@ -173,7 +205,7 @@ class Checker : public InterpHost {
   // Registers `p` for body checking and code generation, with the procedures
   // its body needed while it was checked for compile-time execution only.
   void register_proc(ProcLit* p) {
-    if (p->registered) return;
+    if (p->registered || p->is_macro) return;  // macros are expanded, never called
     p->registered = true;
     prog_.procs.push_back(p);
     if (p->body) pending_.push_back(p);
@@ -186,7 +218,7 @@ class Checker : public InterpHost {
 
   // `p` is used by the code being checked.
   void want_proc(ProcLit* p) {
-    if (p->registered) return;
+    if (p->registered || p->is_macro) return;
     if (!comptime_) return register_proc(p);
     if (comptime_owner_ && comptime_owner_ != p) {
       auto& deps = deferred_regs_[comptime_owner_];
@@ -256,13 +288,42 @@ class Checker : public InterpHost {
     return s;
   }
 
-  Context save() { return Context{scope_, proc_, loops_, defer_depth_}; }
+  Context save() { return Context{scope_, proc_, loops_, defer_depth_, macros_}; }
   void restore(const Context& c) {
     scope_ = c.scope;
     proc_ = c.proc;
     loops_ = c.loops;
     defer_depth_ = c.defer_depth;
+    macros_ = c.macros;
   }
+
+  // Restores the context (and whether a #run expression is being checked)
+  // when it goes out of scope.
+  struct ContextGuard {
+    Checker& c;
+    Context ctx;
+    bool in_run_operand;
+    explicit ContextGuard(Checker& ch) : c(ch), ctx(ch.save()), in_run_operand(ch.in_run_operand_) {}
+    ~ContextGuard() {
+      c.restore(ctx);
+      c.in_run_operand_ = in_run_operand;
+    }
+  };
+
+  // Runs f; an error from it gets `note` (a line saying where the code came from).
+  template <typename F>
+  auto with_note(const std::string& note, F f) {
+    try {
+      return f();
+    } catch (const FinalError&) {
+      throw;
+    } catch (const CompileError& e) {
+      throw CompileError(e.loc, cat(e.what(), "\n    ", note));
+    }
+  }
+
+  std::string insert_note(SourceLoc at) { return "in code inserted at " + sm_.describe(at); }
+
 
   // What a name refers to: a symbol, a member of a `using` variable, or a
   // member of a `using` enum.
@@ -371,6 +432,9 @@ class Checker : public InterpHost {
     }
     if (name == "context")
       fail(loc, "the context (context.allocator, context.logger, ...) is not supported yet");
+    if (name == "compiler_get_nodes" || name == "Code_Node" || name.rfind("Code_", 0) == 0 ||
+        name == "code_of" || name == "compiler_get_code")
+      fail(loc, "'", name, "': Code_Node introspection (compiler_get_nodes) is not supported yet");
     if (name == "volatile_load" || name == "volatile_store") {
       fail(loc, "undeclared identifier '", name, "' (did you forget #import \"Hardware\"?)");
     }
@@ -422,6 +486,7 @@ class Checker : public InterpHost {
     add_type(universe_, "string", T.string_t);
     add_type(universe_, "Any", T.any_t);
     add_type(universe_, "Type", T.type_t);
+    add_type(universe_, "Code", T.code_t);
     add_builtin(universe_, "size_of", Builtin::SizeOf);
     add_builtin(universe_, "type_of", Builtin::TypeOf);
   }
@@ -507,6 +572,7 @@ class Checker : public InterpHost {
 
   void collect(const std::vector<Stmt*>& stmts, bool) {
     std::vector<StaticIf*> static_ifs;
+    std::vector<Insert*> inserts;
     for (Stmt* s : stmts) {
       switch (s->kind) {
         case NK::Decl: {
@@ -534,6 +600,9 @@ class Checker : public InterpHost {
         case NK::StaticIf:
           static_ifs.push_back(static_cast<StaticIf*>(s));
           break;
+        case NK::Insert:
+          inserts.push_back(static_cast<Insert*>(s));
+          break;
         case NK::ExprStmt:
           if (static_cast<ExprStmt*>(s)->expr->kind == NK::Directive) {
             top_directives_.push_back({s, scope_});
@@ -548,6 +617,26 @@ class Checker : public InterpHost {
       bool taken = eval_static_cond(si->cond);
       si->taken = taken ? 1 : 0;
       collect(taken ? si->then_s : si->else_s, true);
+    }
+    // Top-level #insert: declarations made at compile time. They are
+    // evaluated once the unit's own declarations are known.
+    for (Insert* ins : inserts) {
+      ConstValue v = insert_operand(ins->operand);
+      auto* blk = ast_.make<Block>(ins->loc);
+      ins->result = blk;
+      with_note(insert_note(ins->loc), [&] {
+        if (v.kind == ConstValue::String) {
+          blk->stmts = parse_source_stmts(ast_, sm_, insert_source(v.s, ins->loc), true);
+        } else {
+          const CodeEntry& c = code_entry(v);
+          if (!c.block) fail(c.loc, "only a #code block of declarations can be inserted at top level");
+          blk->stmts = static_cast<Block*>(clone_stmt(ast_, c.block))->stmts;
+        }
+        for (Stmt* x : blk->stmts)
+          if (x->kind == NK::Decl) static_cast<Decl*>(x)->is_global = true;
+        collect(blk->stmts, true);
+        return 0;
+      });
     }
   }
 
@@ -616,6 +705,7 @@ class Checker : public InterpHost {
     proc_ = s->scope->proc;
     loops_.clear();
     defer_depth_ = 0;
+    if (s->is_global) macros_.clear();
     try {
       if (s->decl->is_const) resolve_const(s);
       else resolve_global_var(s);
@@ -810,6 +900,8 @@ class Checker : public InterpHost {
   // which are registered once a call actually uses them (use_instance).
   void define_proc(ProcLit* p, bool for_codegen = true) {
     if (p->signature_done) return;
+    if (p->modify && !poly_instances_.count(p))
+      fail(p->modify->loc, "#modify is only allowed on polymorphic procedures");
     p->scope = scope_;
     p->enclosing = proc_;
     std::vector<Type*> params;
@@ -841,6 +933,9 @@ class Checker : public InterpHost {
       rets.push_back(t);
     }
     if (rets.empty()) p->returns.clear();
+    if (p->is_macro && rets.size() > 1)
+      fail(p->returns[1].loc, "#expand macros with more than one return value are not supported yet");
+    if (p->is_macro && p->c_call) fail(p->loc, "an #expand macro cannot be #c_call");
     p->type = T.proc(params, rets, p->c_call, p->variadic);
     if (p->c_call) {
       for (size_t i = 0; i < params.size(); ++i)
@@ -906,8 +1001,17 @@ class Checker : public InterpHost {
     Context c = save();
     scope_ = sc;
     proc_ = sc->proc;
+    macros_.clear();
     std::unordered_set<std::string> names;
-    for (Decl* d : sd->members) {
+    std::vector<Decl*> todo(sd->members.rbegin(), sd->members.rend());  // a stack: next member last
+    while (!todo.empty()) {
+      Decl* d = todo.back();
+      todo.pop_back();
+      if (d->insert) {  // `#insert x;`: its members come next
+        std::vector<Decl*> more = with_note(insert_note(d->loc), [&] { return inserted_members(d); });
+        todo.insert(todo.end(), more.rbegin(), more.rend());
+        continue;
+      }
       Type* ft = d->type_expr ? resolve_type(d->type_expr) : nullptr;
       if (!d->values.empty() && d->values.size() != 1 && d->values.size() != d->names.size())
         fail(d->loc, "member declaration needs one value per name");
@@ -969,6 +1073,7 @@ class Checker : public InterpHost {
     scope_ = new_scope(p->scope, p);
     loops_.clear();
     defer_depth_ = 0;
+    macros_.clear();
     for (size_t i = 0; i < p->params.size(); ++i) {
       Decl* d = p->params[i];
       Symbol* s = declare(scope_, d->names[0].name, SymKind::Var, d->names[0].loc);
@@ -993,6 +1098,11 @@ class Checker : public InterpHost {
     if (!s) return false;
     switch (s->kind) {
       case NK::Break: return static_cast<BreakContinue*>(s)->target == loop;
+      case NK::Insert: return contains_break_to(static_cast<Insert*>(s)->result, loop);
+      case NK::ExprStmt: {
+        Expr* e = static_cast<ExprStmt*>(s)->expr;
+        return e->kind == NK::Expansion && contains_break_to(static_cast<MacroExpansion*>(e)->body, loop);
+      }
       case NK::Block:
         for (Stmt* x : static_cast<Block*>(s)->stmts)
           if (contains_break_to(x, loop)) return true;
@@ -1018,17 +1128,23 @@ class Checker : public InterpHost {
     }
   }
 
-  bool always_returns(Stmt* s) {
+  // Whether `s` always returns from the procedure (or, with `exp`, leaves
+  // that macro expansion with a value).
+  bool always_returns(Stmt* s, MacroExpansion* exp = nullptr) {
     if (!s) return false;
     switch (s->kind) {
-      case NK::Return: return true;
+      case NK::Return: {
+        MacroExpansion* t = static_cast<Return*>(s)->expand_target;
+        return t == nullptr || t == exp;
+      }
+      case NK::Insert: return always_returns(static_cast<Insert*>(s)->result, exp);
       case NK::Block:
         for (Stmt* x : static_cast<Block*>(s)->stmts)
-          if (always_returns(x)) return true;
+          if (always_returns(x, exp)) return true;
         return false;
       case NK::If: {
         auto* i = static_cast<If*>(s);
-        return i->else_s && always_returns(i->then_s) && always_returns(i->else_s);
+        return i->else_s && always_returns(i->then_s, exp) && always_returns(i->else_s, exp);
       }
       case NK::Switch: {
         auto* sw = static_cast<Switch*>(s);
@@ -1038,7 +1154,7 @@ class Checker : public InterpHost {
           if (c.fallthrough) continue;
           bool r = false;
           for (Stmt* x : c.body)
-            if (always_returns(x)) r = true;
+            if (always_returns(x, exp)) r = true;
           if (!r) return false;
         }
         return has_default;
@@ -1051,12 +1167,14 @@ class Checker : public InterpHost {
       case NK::StaticIf: {
         auto* si = static_cast<StaticIf*>(s);
         for (Stmt* x : si->taken == 1 ? si->then_s : si->else_s)
-          if (always_returns(x)) return true;
+          if (always_returns(x, exp)) return true;
         return false;
       }
       case NK::ExprStmt: {
         // A call to exit() never returns.
         Expr* e = static_cast<ExprStmt*>(s)->expr;
+        // A macro expansion whose every path does `return.
+        if (e->kind == NK::Expansion) return always_returns(static_cast<MacroExpansion*>(e)->body, exp);
         return e->kind == NK::Call && static_cast<Call*>(e)->builtin == Builtin::Exit;
       }
       default: return false;
@@ -1138,11 +1256,17 @@ class Checker : public InterpHost {
       }
       case NK::Defer: {
         auto* d = static_cast<Defer*>(s);
+        if (d->backtick) {
+          const MacroCtx& m = top_level_macro(s->loc, "`defer");
+          if (m.caller_in_run_operand) fail(s->loc, "`defer is not allowed in a macro expanded in a #run expression");
+          d->target = m.exp;
+        }
         ++defer_depth_;
         check_body(d->body);
         --defer_depth_;
         return;
       }
+      case NK::Insert: check_insert(static_cast<Insert*>(s)); return;
       case NK::StaticIf: {
         auto* si = static_cast<StaticIf*>(s);
         bool taken = eval_static_cond(si->cond);
@@ -1160,10 +1284,16 @@ class Checker : public InterpHost {
   }
 
   void check_local_decl(Decl* d) {
+    Scope* into = scope_;  // `x := ...; in a macro: the caller's scope
+    if (d->backtick) {
+      into = top_level_macro(d->loc, "a backtick declaration").caller_scope;
+      if (into->is_module || !into->proc)
+        fail(d->loc, "a backtick declaration needs a caller inside a procedure");
+    }
     if (d->is_const) {
       if (d->values.size() != d->names.size()) fail(d->loc, "constant declaration needs one value per name");
       for (size_t i = 0; i < d->names.size(); ++i) {
-        Symbol* s = declare_const(scope_, d, i);
+        Symbol* s = declare_const(into, d, i);
         s->decl = d;
         s->decl_index = (int)i;
         d->syms.push_back(s);
@@ -1205,7 +1335,7 @@ class Checker : public InterpHost {
         // `T := int;` is legal (a runtime Type value) - keep it as a variable.
       }
       complete_type(types[i], d->loc);
-      Symbol* s = declare(scope_, d->names[i].name, SymKind::Var, d->names[i].loc);
+      Symbol* s = declare(into, d->names[i].name, SymKind::Var, d->names[i].loc);
       s->type = types[i];
       s->owner = proc_;
       s->decl = d;
@@ -1433,8 +1563,22 @@ class Checker : public InterpHost {
 
   void check_return(Return* r) {
     if (defer_depth_ > 0) fail(r->loc, "'return' is not allowed inside defer");
-    if (!proc_) fail(r->loc, "'return' outside of a procedure");
-    const auto& rets = proc_->type->returns;
+    // A plain return in a macro body leaves the expansion; `return leaves
+    // the macro's caller (a procedure, or the expansion of an outer macro).
+    size_t level = macros_.size();
+    if (r->backtick) {
+      if (level == 0) fail(r->loc, "`return is only allowed in the body of an #expand macro");
+      const MacroCtx& m = macros_[--level];
+      if (m.caller_defer_depth > 0) fail(r->loc, "`return is not allowed in a macro expanded inside defer");
+    }
+    bool run_operand = level < macros_.size() ? macros_[level].caller_in_run_operand : in_run_operand_;
+    if (level > 0) {
+      r->expand_target = macros_[level - 1].exp;
+    } else {
+      if (run_operand) fail(r->loc, "'return' is not allowed in a #run expression");
+      if (!proc_) fail(r->loc, "'return' outside of a procedure");
+    }
+    const auto& rets = r->expand_target ? r->expand_target->macro->type->returns : proc_->type->returns;
     if (r->values.size() == 1 && rets.size() > 1) {
       Type* t = check(r->values[0], nullptr);
       if (t->kind == TypeKind::Tuple && t->elems == rets) return;
@@ -1469,6 +1613,8 @@ class Checker : public InterpHost {
     Type* from = e->type;
     if (from == to) return;
     if (to->kind == TypeKind::Any) {
+      if (from->kind == TypeKind::Code)
+        fail(e->loc, "a Code value cannot be converted to Any (Code only exists at compile time)");
       if (from->is_untyped()) default_untyped(e);
       if (e->type->kind == TypeKind::Any) return;
       if (e->type->kind == TypeKind::Void) fail(e->loc, "cannot pass a void expression as Any");
@@ -1641,22 +1787,8 @@ class Checker : public InterpHost {
         return T.null_t;
       case NK::Ident: {
         auto* id = static_cast<Ident*>(e);
-        if (!id->sym) {
-          Found f = find(id->name, id->loc);
-          if (f.via) {  // a member of a `using` variable: rewrite to var.member
-            auto* base = ast_.make<Ident>(id->loc, f.via->name);
-            base->sym = f.via;
-            auto* m = ast_.make<Member>(id->loc, base, id->name);
-            e = m;
-            return check_member(m, hint);
-          }
-          if (f.enum_type) {
-            auto* m = ast_.make<Member>(id->loc, nullptr, id->name);
-            e = m;
-            return enum_member(m, f.enum_type);
-          }
-        }
-        return check_ident(id, hint);
+        if (id->backtick && !id->sym) return check_backtick_name(e, hint);
+        return check_name(e, hint);
       }
       case NK::Unary: {
         auto* u = static_cast<Unary*>(e);
@@ -1676,7 +1808,12 @@ class Checker : public InterpHost {
         }
         return t;
       }
-      case NK::Call: return check_call(static_cast<Call*>(e), hint);
+      case NK::Call: {
+        auto* c = static_cast<Call*>(e);
+        Type* t = check_call(c, hint);
+        if (c->expansion) e = c->expansion;  // a call of an #expand macro
+        return t;
+      }
       case NK::Index: {
         auto* ix = static_cast<Index*>(e);
         Type* t = check_index(ix);
@@ -1758,15 +1895,51 @@ class Checker : public InterpHost {
         return e->type;
       case NK::Library:
         fail(e->loc, "a library can only be bound to a constant");
+      case NK::CodeLit: {
+        auto* cl = static_cast<CodeLit*>(e);
+        CodeEntry ce;
+        ce.expr = cl->code_expr;
+        ce.block = cl->code_block;
+        ce.loc = cl->loc;
+        ce.scope = scope_;
+        ce.macro_id = macros_.empty() ? 0 : macros_.back().id;
+        codes_.push_back(ce);
+        e->cv = ConstValue::code((i128)codes_.size());
+        return T.code_t;
+      }
+      case NK::Expansion:
+        return e->type;
       case NK::Directive: {
         auto* d = static_cast<DirectiveExpr*>(e);
         if (d->name == "run") return check_run(d, hint, /*statement=*/false);
+        if (d->name == "insert") return check_insert_expr(e, hint);
         if (d->name.rfind("import:", 0) == 0) fail(e->loc, "named #import is only supported as `Name :: #import \"...\";`");
         fail(e->loc, "#", d->name, " is not supported here");
       }
       default:
         fail(e->loc, "unexpected node in expression");
     }
+  }
+
+  // A name: a symbol, or a member brought in by `using` (rewritten).
+  Type* check_name(Expr*& e, Type* hint) {
+    auto* id = static_cast<Ident*>(e);
+    if (!id->sym) {
+      Found f = find(id->name, id->loc);
+      if (f.via) {  // a member of a `using` variable: rewrite to var.member
+        auto* base = ast_.make<Ident>(id->loc, f.via->name);
+        base->sym = f.via;
+        auto* m = ast_.make<Member>(id->loc, base, id->name);
+        e = m;
+        return check_member(m, hint);
+      }
+      if (f.enum_type) {
+        auto* m = ast_.make<Member>(id->loc, nullptr, id->name);
+        e = m;
+        return enum_member(m, f.enum_type);
+      }
+    }
+    return check_ident(id, hint);
   }
 
   Type* check_ident(Ident* id, Type* hint) {
@@ -1796,7 +1969,10 @@ class Checker : public InterpHost {
       case SymKind::Type:
         id->cv = s->cv;
         return T.type_t;
-      case SymKind::Proc: return s->type;
+      case SymKind::Proc:
+        if (s->proc && s->proc->is_macro)
+          fail(id->loc, "'", id->name, "' is an #expand macro; it can only be called, not used as a value");
+        return s->type;
       case SymKind::Builtin: fail(id->loc, "'", id->name, "' is a built-in procedure and can only be called");
       case SymKind::Library: return T.void_t;  // only meaningful in #foreign
       case SymKind::Module: fail(id->loc, "module '", id->name, "' cannot be used as a value");
@@ -2601,6 +2777,7 @@ class Checker : public InterpHost {
       case ConstValue::String: return std::to_string(v.s.size()) + ":" + v.s;
       case ConstValue::TypeV: return "type " + std::to_string((uintptr_t)v.t);
       case ConstValue::Null: return "null";
+      case ConstValue::Code: return "code " + i128_str(v.i);
       case ConstValue::Aggregate: {
         std::string k = "{";
         for (const ConstValue& e : *v.elems) k += const_key(e) + ",";
@@ -2627,6 +2804,7 @@ class Checker : public InterpHost {
       case ConstValue::Bool: return v.b ? "true" : "false";
       case ConstValue::String: return "\"" + v.s + "\"";
       case ConstValue::Aggregate: return "{...}";
+      case ConstValue::Code: return "(Code)";
       default: return const_key(v);
     }
   }
@@ -2659,6 +2837,7 @@ class Checker : public InterpHost {
     proc_ = tscope->proc;
     loops_.clear();
     defer_depth_ = 0;
+    macros_.clear();
     auto r = f();
     restore(c);
     return r;
@@ -2941,6 +3120,7 @@ class Checker : public InterpHost {
       if (!x.bound)
         fail(loc, "cannot infer '$", x.name, "' of '", p->name, "' from the arguments (", p->name, " :: ",
              proc_pattern_str(p), ")");
+    run_modify(tmpl, b, loc);
     return b;
   }
 
@@ -3074,6 +3254,356 @@ class Checker : public InterpHost {
     return t;
   }
 
+  // ------------------------------------------------------------------ metaprogramming
+  //
+  // `#code` makes a Code constant: an id into codes_, which keeps the syntax
+  // unchecked. `#insert` checks a fresh copy of it (or parses a string) where
+  // it is used, rewriting the tree in place, so code generation and the #run
+  // interpreter only ever see ordinary checked nodes.
+  //
+  // A call of an #expand macro becomes a MacroExpansion: the parameters as
+  // locals of the caller, then a copy of the macro body, checked in a scope
+  // whose parent is the macro's own scope (names in the body mean what they
+  // mean where the macro is declared). Backtick names reach the caller's
+  // scope (MacroCtx::caller_scope).
+
+  // Registers inserted text as a source file, so errors in it point into it.
+  uint32_t insert_source(const std::string& text, SourceLoc at) {
+    return sm_.add(cat("<inserted at ", sm_.get(at.file).path, ":", at.line, ">"), text);
+  }
+
+  // The constant an #insert operand evaluates to: Code or a string.
+  ConstValue insert_operand(Expr*& op) {
+    Type* t = check_value(op, nullptr);
+    if (t->kind != TypeKind::Code && t->kind != TypeKind::String)
+      fail(op->loc, "#insert needs a Code or string constant, not a value of type ", type_name(t));
+    if (!op->is_const())
+      fail(op->loc, "#insert needs a compile-time constant (a #code value, or a string made with #run)");
+    return op->cv;
+  }
+
+  const CodeEntry& code_entry(const ConstValue& v) {
+    if (v.kind != ConstValue::Code || v.i < 1 || (size_t)v.i > codes_.size())
+      fail(SourceLoc{}, "internal error: invalid Code value");
+    return codes_[(size_t)v.i - 1];
+  }
+
+  // Runs f in the context where Code `c` is checked. That is the insertion
+  // point, except for code inserted by a macro that its caller wrote (a Code
+  // argument): that code means what it means at the call, so it is checked
+  // in a new scope inside the one it was written in, with the caller's macro
+  // context (its `return` and backtick names are the caller's).
+  template <typename F>
+  void in_code_context(const CodeEntry& c, F f) {
+    bool on_chain = false;
+    for (Scope* s = scope_; s && !on_chain; s = s->parent) on_chain = s == c.scope;
+    int current = macros_.empty() ? 0 : macros_.back().id;
+    if (!(on_chain && c.macro_id == current) && c.scope && !c.scope->is_module && c.scope != universe_ &&
+        c.scope->proc == proc_) {
+      size_t keep = 0;
+      bool found = c.macro_id == 0;
+      for (size_t k = 0; k < macros_.size() && !found; ++k)
+        if (macros_[k].id == c.macro_id) {
+          keep = k + 1;
+          found = true;
+        }
+      if (found && keep < macros_.size()) {
+        ContextGuard guard(*this);
+        in_run_operand_ = macros_[keep].caller_in_run_operand;
+        macros_.resize(keep);
+        scope_ = new_scope(c.scope, proc_);
+        f();
+        return;
+      }
+    }
+    f();
+  }
+
+  // `#insert x;` as a statement: the inserted statements are checked in the
+  // current scope (an inserted declaration is visible after the #insert).
+  void check_insert(Insert* ins) {
+    ConstValue v = insert_operand(ins->operand);
+    auto* blk = ast_.make<Block>(ins->loc);
+    blk->scope = scope_;
+    ins->result = blk;
+    with_note(insert_note(ins->loc), [&] {
+      if (v.kind == ConstValue::String) {
+        blk->stmts = parse_source_stmts(ast_, sm_, insert_source(v.s, ins->loc), false);
+        for (Stmt* x : blk->stmts) check_stmt(x);
+        return 0;
+      }
+      const CodeEntry& c = code_entry(v);
+      if (c.block) blk->stmts = static_cast<Block*>(clone_stmt(ast_, c.block))->stmts;
+      else blk->stmts.push_back(ast_.make<ExprStmt>(c.expr->loc, clone_expr(ast_, c.expr)));
+      in_code_context(c, [&] {
+        for (Stmt* x : blk->stmts) check_stmt(x);
+      });
+      return 0;
+    });
+  }
+
+  // `#insert x` as an expression: the expression is replaced by the inserted one.
+  Type* check_insert_expr(Expr*& e, Type* hint) {
+    auto* d = static_cast<DirectiveExpr*>(e);
+    ConstValue v = insert_operand(d->operand);
+    SourceLoc at = d->loc;
+    return with_note(insert_note(at), [&] {
+      Expr* x;
+      if (v.kind == ConstValue::String) {
+        x = parse_source_expr(ast_, sm_, insert_source(v.s, at));
+        e = x;
+        return check(e, hint);
+      }
+      const CodeEntry& c = code_entry(v);
+      if (!c.expr) fail(at, "a #code block cannot be inserted as an expression (insert it as a statement)");
+      x = clone_expr(ast_, c.expr);
+      e = x;
+      Type* t = nullptr;
+      in_code_context(c, [&] { t = check(e, hint); });
+      return t;
+    });
+  }
+
+  // The members a struct body's `#insert x;` makes.
+  std::vector<Decl*> inserted_members(Decl* d) {
+    ConstValue v = insert_operand(d->insert);
+    if (v.kind == ConstValue::String) return parse_source_members(ast_, sm_, insert_source(v.s, d->loc));
+    const CodeEntry& c = code_entry(v);
+    if (!c.block) fail(c.loc, "only a #code block of member declarations can be inserted into a struct");
+    std::vector<Decl*> out;
+    for (Stmt* x : static_cast<Block*>(clone_stmt(ast_, c.block))->stmts) {
+      if (x->kind != NK::Decl || static_cast<Decl*>(x)->is_const)
+        fail(x->loc, "only member declarations can be inserted into a struct");
+      out.push_back(static_cast<Decl*>(x));
+    }
+    return out;
+  }
+
+  // The innermost macro expansion, for a construct (`what`) that must be at
+  // the top level of a macro body.
+  const MacroCtx& top_level_macro(SourceLoc loc, const char* what) {
+    if (macros_.empty()) fail(loc, what, " is only allowed in the body of an #expand macro");
+    if (scope_ != macros_.back().body_scope) fail(loc, what, " must be at the top level of the macro body");
+    return macros_.back();
+  }
+
+  // `name: a name of the scope the macro was called from.
+  Type* check_backtick_name(Expr*& e, Type* hint) {
+    auto* id = static_cast<Ident*>(e);
+    if (macros_.empty())
+      fail(id->loc, "backtick names (`", id->name, ") are only allowed in the body of an #expand macro");
+    MacroCtx m = macros_.back();
+    ContextGuard guard(*this);
+    macros_.pop_back();
+    scope_ = m.caller_scope;
+    in_run_operand_ = m.caller_in_run_operand;
+    Found f = find(id->name, id->loc);
+    if (!f.sym && !f.via && !f.enum_type)
+      fail(id->loc, "'`", id->name, "': '", id->name, "' is not declared where macro '", m.exp->macro->name,
+           "' is called (", sm_.describe(m.exp->loc), ")");
+    return check_name(e, hint);
+  }
+
+  // Expands a call of #expand macro `ms`.
+  Expr* expand_macro(Call* c, Symbol* ms, Type* hint) {
+    ProcLit* m = ms->proc;
+    if (macros_.size() >= kMaxMacroDepth) {
+      throw FinalError(c->loc, cat("#expand macro '", m->name, "' is expanded more than ", kMaxMacroDepth,
+                                   " levels deep; does it expand itself without end?\n    the outermost expansion is '",
+                                   macros_[0].exp->macro->name, "' at ", sm_.describe(macros_[0].exp->loc)));
+    }
+    c->proc_type = m->type;
+    bind_args(c, m->type, m);  // in the caller's context
+    auto* body = ast_.make<Block>(c->loc);
+    auto* x = ast_.make<MacroExpansion>(c->loc, m, body);
+    x->type = m->type->returns.empty() ? T.void_t : m->type->returns[0];
+    ContextGuard guard(*this);
+    MacroCtx ctx;
+    ctx.id = ++next_macro_id_;
+    ctx.exp = x;
+    ctx.caller_scope = scope_;
+    ctx.caller_in_run_operand = in_run_operand_;
+    ctx.caller_defer_depth = defer_depth_;
+    ctx.body_scope = new_scope(m->scope, proc_);
+    body->scope = ctx.body_scope;
+    // A bare break in the body may leave a loop of the caller, unless that
+    // would cross a defer or the #run boundary.
+    if (defer_depth_ > 0 || in_run_operand_) loops_.clear();
+    macros_.push_back(ctx);
+    scope_ = ctx.body_scope;
+    in_run_operand_ = false;
+    defer_depth_ = 0;
+    std::string name = m->name.empty() ? "<anonymous>" : m->name;
+    with_note("in the expansion of macro '" + name + "' at " + sm_.describe(c->loc), [&] {
+      for (size_t i = 0; i < m->params.size(); ++i) {
+        Decl* pd = m->params[i];
+        Expr* a = c->resolved_args[i];
+        const DeclName& pn = pd->names[0];
+        if (m->type->params[i]->kind == TypeKind::Code) {  // a constant: #insert can use it
+          if (!a->is_const())
+            fail(a->loc, "the argument for Code parameter '", pn.name, "' of macro '", name,
+                 "' must be a constant (#code ... or a Code constant)");
+          Symbol* s = declare(scope_, pn.name, SymKind::Const, pn.loc);
+          s->type = T.code_t;
+          s->cv = a->cv;
+          s->state = Symbol::State::Resolved;
+          continue;
+        }
+        auto* d = ast_.make<Decl>(a->loc);  // other parameters are locals, evaluated once, in order
+        d->names.push_back(pn);
+        d->values.push_back(a);
+        d->is_using = pd->is_using;
+        body->stmts.push_back(d);
+        check_local_decl(d);
+      }
+      auto* copy = static_cast<Block*>(clone_stmt(ast_, m->body));
+      for (Stmt* st : copy->stmts) {
+        body->stmts.push_back(st);
+        check_stmt(st);
+      }
+      if (!m->type->returns.empty() && !always_returns(body, x))
+        fail(m->loc, "macro '", name, "' does not return a value on all paths");
+      return 0;
+    });
+    (void)hint;
+    return x;
+  }
+
+  // ---- #modify
+
+  struct ModifyResult {
+    bool ok = true;
+    std::string message;
+    std::vector<Type*> types;  // the type variables afterwards, in binding order
+  };
+  std::map<std::pair<const Node*, std::string>, ModifyResult> modify_results_;
+
+  template <typename F>
+  static void for_each_return(Stmt* s, F& f) {
+    if (!s) return;
+    switch (s->kind) {
+      case NK::Return: f(static_cast<Return*>(s)); return;
+      case NK::Block:
+        for (Stmt* x : static_cast<Block*>(s)->stmts) for_each_return(x, f);
+        return;
+      case NK::If:
+        for_each_return(static_cast<If*>(s)->then_s, f);
+        for_each_return(static_cast<If*>(s)->else_s, f);
+        return;
+      case NK::While: for_each_return(static_cast<While*>(s)->body, f); return;
+      case NK::For: for_each_return(static_cast<For*>(s)->body, f); return;
+      case NK::Defer: for_each_return(static_cast<Defer*>(s)->body, f); return;
+      case NK::Switch:
+        for (auto& c : static_cast<Switch*>(s)->cases)
+          for (Stmt* x : c.body) for_each_return(x, f);
+        return;
+      case NK::StaticIf:
+        for (Stmt* x : static_cast<StaticIf*>(s)->then_s) for_each_return(x, f);
+        for (Stmt* x : static_cast<StaticIf*>(s)->else_s) for_each_return(x, f);
+        return;
+      default:
+        return;
+    }
+  }
+
+  // A checked-looking expression standing for type `t` (a constant).
+  Expr* type_const(Type* t, SourceLoc loc) {
+    auto* e = ast_.make<Ident>(loc, type_name(t));
+    e->type = T.type_t;
+    e->cv = ConstValue::of_type(t);
+    return e;
+  }
+
+  // Runs the #modify block of polymorphic procedure `tmpl` for bindings `b`
+  // (cached). The block becomes a procedure executed by the interpreter: the
+  // type variables are its `Type` parameters, and each `return ok[, message];`
+  // returns them along with the verdict. Compile-time values ($N) stay constants.
+  ModifyResult eval_modify(Symbol* tmpl, const Bindings& b, SourceLoc loc) {
+    ProcLit* p = tmpl->proc;
+    SourceLoc ml = p->modify->loc;
+    Type* rt = T.new_struct("#modify result");
+    rt->fields.push_back(StructField{"ok", T.bool_t});
+    rt->fields.push_back(StructField{"message", T.string_t});
+    auto* mp = ast_.make<ProcLit>(ml);
+    mp->name = "#modify of '" + p->name + "'";
+    Bindings values;
+    std::vector<Expr*> args;
+    std::vector<std::string> vars;
+    for (auto& x : b) {
+      if (x.is_value) {
+        values.push_back(x);
+        continue;
+      }
+      rt->fields.push_back(StructField{x.name, T.type_t});
+      auto* d = ast_.make<Decl>(x.loc);
+      d->names.push_back({x.name, x.loc});
+      d->type_expr = type_const(T.type_t, x.loc);
+      mp->params.push_back(d);
+      args.push_back(type_const(x.type, loc));
+      vars.push_back(x.name);
+    }
+    T.layout_struct(rt);
+    mp->returns.push_back(ReturnSpec{"", type_const(rt, ml), ml});
+    mp->body = static_cast<Block*>(clone_stmt(ast_, p->modify));
+    auto rewrite = [&](Return* r) {
+      if (r->backtick || r->values.empty() || r->values.size() > 2)
+        fail(r->loc, "#modify must return a bool, and optionally a message: return false, \"why\";");
+      auto* lit = ast_.make<StructLit>(r->loc, type_const(rt, r->loc));
+      lit->args.push_back(Arg{"", r->loc, r->values[0]});
+      lit->args.push_back(Arg{"", r->loc, r->values.size() == 2 ? r->values[1] : ast_.make<StringLit>(r->loc, "")});
+      for (auto& v : vars) lit->args.push_back(Arg{"", r->loc, ast_.make<Ident>(r->loc, v)});
+      r->values = {lit};
+    };
+    for_each_return(mp->body, rewrite);
+    Symbol* ms = new_symbol(mp->name, SymKind::Proc, ml);
+    ms->proc = mp;
+    ms->state = Symbol::State::Resolved;
+    ComptimeMode mode(*this, true, mp, false);
+    with_bindings(tmpl->scope, values, [&] {
+      define_proc(mp, /*for_codegen=*/false);
+      return 0;
+    });
+    ms->type = mp->type;
+    auto* id = ast_.make<Ident>(loc, mp->name);
+    id->sym = ms;
+    auto* call = ast_.make<Call>(loc, id);
+    for (Expr* a : args) call->args.push_back(Arg{"", loc, a});
+    Expr* e = call;
+    check(e, nullptr);
+    ConstValue v = interp_.run(e, loc, true);
+    ModifyResult r;
+    const auto& es = *v.elems;
+    r.ok = es.at(0).b;
+    r.message = es.at(1).s;
+    for (size_t i = 0; i < vars.size(); ++i) {
+      const ConstValue& t = es.at(2 + i);
+      if (t.kind != ConstValue::TypeV) fail(ml, "#modify of '", p->name, "' set '", vars[i], "' to null; it must be a type");
+      r.types.push_back(t.t);
+    }
+    return r;
+  }
+
+  // Applies the #modify block of `tmpl` (if any) to the inferred bindings:
+  // fails if it rejects them, and updates the type variables it changed.
+  void run_modify(Symbol* tmpl, Bindings& b, SourceLoc loc) {
+    ProcLit* p = tmpl->proc;
+    if (!p->modify) return;
+    auto key = std::make_pair((const Node*)p, binding_key(b));
+    auto it = modify_results_.find(key);
+    if (it == modify_results_.end()) {
+      ModifyResult r = with_note("in #modify of '" + p->name + "' with " + bindings_desc(b), [&] {
+        return eval_modify(tmpl, b, loc);
+      });
+      it = modify_results_.emplace(key, std::move(r)).first;
+    }
+    const ModifyResult& r = it->second;
+    if (!r.ok)
+      fail(loc, "#modify of '", p->name, "' rejected ", bindings_desc(b), r.message.empty() ? "" : ": ", r.message);
+    size_t k = 0;
+    for (auto& x : b)
+      if (!x.is_value) x.type = r.types[k++];
+  }
+
   // ------------------------------------------------------------------ calls
 
   Type* check_call(Call* c, Type* hint) {
@@ -3085,7 +3615,9 @@ class Checker : public InterpHost {
         c->callee = ast_.make<Ident>(m->loc, m->name);
       }
     }
-    if (c->callee->kind == NK::Ident && !static_cast<Ident*>(c->callee)->sym) {
+    // (A backtick callee is looked up in the macro caller's scope, below.)
+    if (c->callee->kind == NK::Ident && !static_cast<Ident*>(c->callee)->sym &&
+        !static_cast<Ident*>(c->callee)->backtick) {
       auto* id = static_cast<Ident*>(c->callee);
       Symbol* s = qualified ? qualified : find(id->name, id->loc).sym;
       if (s && is_poly_struct_decl(s)) {  // Vector(float, 3): an instance of a polymorphic struct
@@ -3122,6 +3654,20 @@ class Checker : public InterpHost {
         }
       } else if (qualified) {
         id->sym = s;
+      }
+    }
+    if (c->callee->kind == NK::Ident) {  // a call of an #expand macro is expanded in place
+      auto* id = static_cast<Ident*>(c->callee);
+      Symbol* s = id->sym;
+      if (!s && !id->backtick) s = find(id->name, id->loc).sym;
+      if (s && (s->kind == SymKind::Proc || is_proc_decl(s->decl, s->decl_index))) {
+        resolve(s);
+        if (s->kind == SymKind::Proc && s->proc && s->proc->is_macro) {
+          id->sym = s;
+          id->type = s->type;
+          c->expansion = expand_macro(c, s, hint);
+          return c->expansion->type;
+        }
       }
     }
     Type* ct = check_value(c->callee, nullptr);
@@ -3728,7 +4274,7 @@ class Checker : public InterpHost {
 
 }  // namespace
 
-void analyze(AstContext& ast, const SourceManager& sm, TypeTable& types, Program& prog, const SemaOptions& opts) {
+void analyze(AstContext& ast, SourceManager& sm, TypeTable& types, Program& prog, const SemaOptions& opts) {
   Checker c(ast, sm, types, prog, opts);
   c.run();
 }

@@ -29,8 +29,10 @@ enum TiKind : int64_t {
 struct CgScope {
   std::vector<Stmt*> defers;
   Stmt* loop = nullptr;  // set on the marker scope of a loop
-  llvm::BasicBlock* break_bb = nullptr;
+  llvm::BasicBlock* break_bb = nullptr;  // loops; for a macro expansion, its end
   llvm::BasicBlock* continue_bb = nullptr;
+  MacroExpansion* expansion = nullptr;  // set on the top-level scope of an inlined #expand macro
+  llvm::AllocaInst* result = nullptr;   // the expansion's value
 };
 
 class CodeGen {
@@ -122,6 +124,7 @@ class CodeGen {
         r = ptr_;
         break;
       case TypeKind::Any: r = llvm::StructType::get(ctx_, {ptr_, ptr_}); break;
+      case TypeKind::Code: r = i64_; break;  // the compiler's id of the syntax tree
       case TypeKind::Enum: r = lt(t->elem); break;
       case TypeKind::UntypedInt: r = i64_; break;
       case TypeKind::UntypedFloat: r = llvm::Type::getFloatTy(ctx_); break;
@@ -249,6 +252,8 @@ class CodeGen {
                                                llvm::PointerType::get(ctx_, 0));
       case ConstValue::TypeV:
         return type_info(cv.t);
+      case ConstValue::Code:
+        return llvm::ConstantInt::get(i64_, (uint64_t)cv.i);
       case ConstValue::Aggregate: {
         const auto& es = *cv.elems;
         if (es.empty()) return llvm::Constant::getNullValue(lt(t));  // zero value (an empty array view)
@@ -593,7 +598,15 @@ class CodeGen {
       case NK::Switch: emit_switch(static_cast<Switch*>(s)); return;
       case NK::While: emit_while(static_cast<While*>(s)); return;
       case NK::For: emit_for(static_cast<For*>(s)); return;
-      case NK::Return: emit_return(static_cast<Return*>(s)); return;
+      case NK::Return: {
+        auto* r = static_cast<Return*>(s);
+        if (r->expand_target) emit_macro_return(r);
+        else emit_return(r);
+        return;
+      }
+      case NK::Insert:  // inserted code runs in place: it opens no scope
+        emit_stmts(static_cast<Insert*>(s)->result->stmts);
+        return;
       case NK::Break:
       case NK::Continue: {
         auto* bc = static_cast<BreakContinue*>(s);
@@ -605,9 +618,13 @@ class CodeGen {
         b_.CreateBr(s->kind == NK::Break ? scopes_[idx].break_bb : scopes_[idx].continue_bb);
         return;
       }
-      case NK::Defer:
-        scopes_.back().defers.push_back(static_cast<Defer*>(s)->body);
+      case NK::Defer: {
+        auto* d = static_cast<Defer*>(s);
+        // `defer in a macro: runs when the scope the macro was called from ends.
+        if (d->backtick) scopes_[expansion_scope(d->target) - 1].defers.push_back(d->body);
+        else scopes_.back().defers.push_back(d->body);
         return;
+      }
       case NK::StaticIf: {
         auto* si = static_cast<StaticIf*>(s);
         emit_stmts(si->taken == 1 ? si->then_s : si->else_s);
@@ -618,9 +635,52 @@ class CodeGen {
     }
   }
 
+  // The index in scopes_ of the top-level scope of expansion `x`.
+  size_t expansion_scope(MacroExpansion* x) {
+    for (size_t i = scopes_.size(); i-- > 0;)
+      if (scopes_[i].expansion == x) return i;
+    throw CompileError(x->loc, "internal error: macro expansion not found");
+  }
+
+  // An inlined #expand macro: its statements, then its value (null if void).
+  llvm::Value* emit_expansion(MacroExpansion* x) {
+    CgScope sc;
+    sc.expansion = x;
+    sc.break_bb = llvm::BasicBlock::Create(ctx_, "macro.end");
+    if (x->type->kind != TypeKind::Void) sc.result = make_alloca(x->type, "macro.result");
+    llvm::BasicBlock* end_bb = sc.break_bb;
+    llvm::AllocaInst* result = sc.result;
+    scopes_.push_back(sc);
+    emit_stmts(x->body->stmts);
+    if (!terminated()) {
+      emit_defers_down_to(scopes_.size() - 1);
+      if (!terminated()) b_.CreateBr(end_bb);
+    }
+    scopes_.pop_back();
+    end_bb->insertInto(fn_);
+    b_.SetInsertPoint(end_bb);
+    return result ? b_.CreateLoad(lt(x->type), result) : nullptr;
+  }
+
+  // A plain `return` in a macro body: leaves the expansion with its value.
+  void emit_macro_return(Return* r) {
+    size_t idx = expansion_scope(r->expand_target);
+    if (!r->values.empty()) {
+      llvm::Value* v = rvalue(r->values[0]);
+      b_.CreateStore(v, scopes_[idx].result);
+    }
+    emit_defers_down_to(idx);
+    if (terminated()) return;
+    b_.CreateBr(scopes_[idx].break_bb);
+  }
+
   // Evaluates an expression whose result may be void or unused.
   void emit_expr_any(Expr* e) {
     if (e->is_const()) return;
+    if (e->kind == NK::Expansion) {
+      emit_expansion(static_cast<MacroExpansion*>(e));
+      return;
+    }
     if (e->kind == NK::Call) {
       emit_call(static_cast<Call*>(e));
       return;
@@ -1090,6 +1150,11 @@ class CodeGen {
         return agg;
       }
       case NK::ProcLit: return static_cast<ProcLit*>(e)->llvm_fn;
+      case NK::Expansion: {
+        llvm::Value* v = emit_expansion(static_cast<MacroExpansion*>(e));
+        if (!v) throw CompileError(e->loc, "internal error: void macro expansion used as value");
+        return v;
+      }
       case NK::Ifx: {
         auto* x = static_cast<Ifx*>(e);
         llvm::Value* c = cond(x->cond);

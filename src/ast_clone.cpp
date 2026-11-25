@@ -31,6 +31,7 @@ class Cloner {
         auto* id = as<Ident>(e);
         auto* n = ast_.make<Ident>(e->loc, id->name);
         n->poly = id->poly;
+        n->backtick = id->backtick;
         return n;
       }
       case NK::Unary: {
@@ -124,6 +125,13 @@ class Cloner {
         n->module_id = d->module_id;
         return n;
       }
+      case NK::CodeLit: {
+        auto* c = as<CodeLit>(e);
+        auto* n = ast_.make<CodeLit>(e->loc);
+        n->code_expr = expr(c->code_expr);
+        n->code_block = block(c->code_block);
+        return n;
+      }
       default:
         fail(e->loc, "internal error: cannot clone expression node");
     }
@@ -182,12 +190,18 @@ class Cloner {
         auto* r = as<Return>(s);
         auto* n = ast_.make<Return>(s->loc);
         for (Expr* x : r->values) n->values.push_back(expr(x));
+        n->backtick = r->backtick;
         return n;
       }
       case NK::Break:
       case NK::Continue:
         return ast_.make<BreakContinue>(s->kind, s->loc, as<BreakContinue>(s)->label);
-      case NK::Defer: return ast_.make<Defer>(s->loc, stmt(as<Defer>(s)->body));
+      case NK::Defer: {
+        auto* n = ast_.make<Defer>(s->loc, stmt(as<Defer>(s)->body));
+        n->backtick = as<Defer>(s)->backtick;
+        return n;
+      }
+      case NK::Insert: return ast_.make<Insert>(s->loc, expr(as<Insert>(s)->operand));
       case NK::Import: {
         auto* i = as<Import>(s);
         auto* n = ast_.make<Import>(s->loc, i->module);
@@ -246,6 +260,8 @@ class Cloner {
     n->is_vararg = d->is_vararg;
     n->is_baked = d->is_baked;
     n->is_global = d->is_global;
+    n->backtick = d->backtick;
+    n->insert = expr(d->insert);
     return n;
   }
 
@@ -262,6 +278,8 @@ class Cloner {
     n->symmetric = p->symmetric;
     n->is_poly = p->is_poly;
     n->poly_returns = p->poly_returns;
+    n->is_macro = p->is_macro;
+    n->modify = block(p->modify);
     n->name = p->name;
     return n;
   }

@@ -26,10 +26,10 @@ enum class NK {
   // expressions
   IntLit, FloatLit, StringLit, BoolLit, NullLit, Ident, Unary, Binary, Call, Index, Member,
   Cast, AutoCast, StructLit, ArrayLit, ProcLit, StructDef, EnumDef, PtrType, ArrType, ProcType,
-  Ifx, ImplicitConv, TupleGet, Library, Directive,
+  Ifx, ImplicitConv, TupleGet, Library, Directive, CodeLit, Expansion,
   // statements
   Block, ExprStmt, Decl, Assign, If, Switch, While, For, Return, Break, Continue, Defer, Import,
-  Load, StaticIf, Through, Using,
+  Load, StaticIf, Through, Using, Insert,
 };
 
 struct Node {
@@ -43,12 +43,13 @@ struct Node {
 // Constant values
 
 // Address: pointer to a fixed address (i).
+// Code: a `Code` value (#code); i is the checker's id of the syntax tree.
 // Aggregate: a fixed array (one element per array element) or a struct (one
 // element per field, in field order), e.g. the result of `#run`. An empty
 // element list is the zero value of the type (used for empty array views).
 // The elements are shared and never modified, so copies are cheap.
 struct ConstValue {
-  enum Kind { None, Int, Float, Bool, String, TypeV, Null, Address, Aggregate } kind = None;
+  enum Kind { None, Int, Float, Bool, String, TypeV, Null, Address, Aggregate, Code } kind = None;
   __int128 i = 0;
   double f = 0;
   bool b = false;
@@ -63,6 +64,7 @@ struct ConstValue {
   static ConstValue of_type(Type* v) { ConstValue c; c.kind = TypeV; c.t = v; return c; }
   static ConstValue null() { ConstValue c; c.kind = Null; return c; }
   static ConstValue address(__int128 v) { ConstValue c; c.kind = Address; c.i = v; return c; }
+  static ConstValue code(__int128 id) { ConstValue c; c.kind = Code; c.i = id; return c; }
   static ConstValue aggregate(std::vector<ConstValue> v) {
     ConstValue c;
     c.kind = Aggregate;
@@ -106,6 +108,7 @@ struct Ident : Expr {
   std::string name;
   Symbol* sym = nullptr;
   bool poly = false;  // written `$name`: introduces a type variable of a polymorphic procedure
+  bool backtick = false;  // written `` `name ``: in an #expand macro, a name of the caller's scope
   Ident(SourceLoc l, std::string n) : Expr(NK::Ident, l), name(std::move(n)) {}
 };
 
@@ -158,6 +161,7 @@ struct Call : Expr {
   std::vector<Expr*> resolved_args;  // in parameter order; includes defaults and the vararg pack
   Type* proc_type = nullptr;
   Type* type_arg = nullptr;          // for New(T), NewArray(n, T), size_of(T)
+  Expr* expansion = nullptr;         // sema: the MacroExpansion this call of an #expand macro stands for
   Call(SourceLoc l, Expr* c) : Expr(NK::Call, l), callee(c) {}
 };
 
@@ -228,6 +232,8 @@ struct ProcLit : Expr {
   bool symmetric = false; // #symmetric: a two-parameter operator also applies with its operands swapped
   bool is_poly = false;   // has `$T` in a parameter type or a compile-time parameter (`$N: int`)
   bool poly_returns = false;  // has `$T` in a return type
+  bool is_macro = false;  // #expand: inlined at each call (MacroExpansion), never called
+  Block* modify = nullptr;  // #modify { ... }: runs when a polymorphic procedure is instantiated
   std::string name;       // bound name, for diagnostics and symbol names
   // sema
   Scope* scope = nullptr;
@@ -316,6 +322,24 @@ struct DirectiveExpr : Expr {
   DirectiveExpr(SourceLoc l, std::string n, Expr* e) : Expr(NK::Directive, l), name(std::move(n)), operand(e) {}
 };
 
+// `#code expr` / `#code { statements }`: a compile-time value of type Code
+// holding syntax that stays unchecked; #insert checks a copy where it is used.
+struct CodeLit : Expr {
+  Expr* code_expr = nullptr;
+  Block* code_block = nullptr;
+  explicit CodeLit(SourceLoc l) : Expr(NK::CodeLit, l) {}
+};
+
+// Made by sema for a call of an #expand macro: the body, inlined. `body`
+// declares the parameters (evaluated once, in order) and holds a checked copy
+// of the macro's statements. A plain `return` in it (Return::expand_target)
+// leaves the expansion with its value; `` `return `` returns from the caller.
+struct MacroExpansion : Expr {
+  ProcLit* macro;
+  Block* body;
+  MacroExpansion(SourceLoc l, ProcLit* m, Block* b) : Expr(NK::Expansion, l), macro(m), body(b) {}
+};
+
 // ---------------------------------------------------------------------------
 // Statements
 
@@ -349,6 +373,8 @@ struct Decl : Stmt {
   bool is_vararg = false;   // parameter declared as `..T`
   bool is_baked = false;    // compile-time parameter `$N: int` / `$T: Type`
   bool is_global = false;
+  bool backtick = false;    // `` `x := v; `` in an #expand macro: declared in the caller's scope
+  Expr* insert = nullptr;   // a struct member `#insert expr;` (no names): members made by sema
   // sema
   std::vector<Symbol*> syms;
   Type* declared_type = nullptr;
@@ -410,6 +436,8 @@ struct For : Stmt {
 
 struct Return : Stmt {
   std::vector<Expr*> values;
+  bool backtick = false;                     // `` `return `` in an #expand macro: returns from the caller
+  MacroExpansion* expand_target = nullptr;   // sema: this return leaves that expansion, not a procedure
   explicit Return(SourceLoc l) : Stmt(NK::Return, l) {}
 };
 
@@ -421,6 +449,8 @@ struct BreakContinue : Stmt {
 
 struct Defer : Stmt {
   Stmt* body;
+  bool backtick = false;              // `` `defer `` in an #expand macro: runs at the end of the caller's scope
+  MacroExpansion* target = nullptr;   // sema: for ``defer`, the expansion whose caller gets it
   Defer(SourceLoc l, Stmt* b) : Stmt(NK::Defer, l), body(b) {}
 };
 
@@ -449,6 +479,14 @@ struct StaticIf : Stmt {
   std::vector<Stmt*> else_s;
   int taken = -1;  // sema: 1 = then, 0 = else
   StaticIf(SourceLoc l, Expr* c) : Stmt(NK::StaticIf, l), cond(c) {}
+};
+
+// `#insert expr;` as a statement (or at top level). Sema checks the inserted
+// statements into `result`, which runs in place: it opens no scope.
+struct Insert : Stmt {
+  Expr* operand;
+  Block* result = nullptr;
+  Insert(SourceLoc l, Expr* e) : Stmt(NK::Insert, l), operand(e) {}
 };
 
 // ---------------------------------------------------------------------------

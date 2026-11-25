@@ -33,6 +33,8 @@ TypeTable::TypeTable(TargetLayout layout) : layout_(layout) {
   // Any is { type: *Type_Info; value_pointer: *void; }
   any_t = make(TypeKind::Any, "Any", 2 * ps, ps);
   type_t = make(TypeKind::TypeT, "Type", ps, ps);
+  // A Code value is an id into the compiler's table of #code syntax trees.
+  code_t = make(TypeKind::Code, "Code", 8, 8);
   untyped_int = make(TypeKind::UntypedInt, "untyped integer", 8, 8);
   untyped_float = make(TypeKind::UntypedFloat, "untyped float", 8, 8);
   null_t = make(TypeKind::Null, "null", ps, ps);
