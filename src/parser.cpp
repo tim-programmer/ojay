@@ -88,7 +88,9 @@ class Parser {
   }
 
   // One parameter of a procedure or a polymorphic struct: [using] [$]name: T [= v] / name := v / name: ..T
-  Decl* parse_param(ProcLit* p) {
+  // `untyped_ok`: a short lambda's parameter may be just a name (`(x) => x * 2`);
+  // its type comes from the procedure type the lambda is used as.
+  Decl* parse_param(ProcLit* p, bool untyped_ok = false) {
     SourceLoc loc = cur().loc;
     auto* d = ast_.make<Decl>(loc);
     if (accept(Tok::KwUsing)) d->is_using = true;
@@ -98,6 +100,7 @@ class Parser {
       d->is_baked = true;
     }
     d->names.push_back({expect_ident("parameter name"), loc});
+    if (untyped_ok && (at(Tok::Comma) || at(Tok::RParen))) return d;
     if (accept(Tok::ColonEq)) {
       d->values.push_back(parse_expr());
     } else {
@@ -810,6 +813,7 @@ class Parser {
       else if (k == Tok::RParen && --depth == 0) break;
     }
     Tok after = peek(i + 1).kind;
+    if (after == Tok::FatArrow) return true;  // a short lambda: `(x) => ...`, `() => ...`
     if (i == 1) {
       // `()` followed by a body, return type or directive
       return after == Tok::LBrace || after == Tok::Arrow || after == Tok::Directive;
@@ -1091,6 +1095,19 @@ class Parser {
     return pt;
   }
 
+  // Whether the '(' at the cursor is closed by a ')' followed by `k`.
+  bool paren_followed_by(Tok k) const {
+    size_t i = 0;
+    int depth = 0;
+    for (;; ++i) {
+      Tok t = peek(i).kind;
+      if (t == Tok::Eof) return false;
+      if (t == Tok::LParen) ++depth;
+      else if (t == Tok::RParen && --depth == 0) break;
+    }
+    return peek(i + 1).kind == k;
+  }
+
   // In `-> (...)`, distinguishes a parenthesized return list from a procedure type
   // being returned: `-> (int) -> int` is a proc type.
   bool looks_like_proc_type_return() const {
@@ -1106,10 +1123,12 @@ class Parser {
   }
 
   ProcLit* parse_proc_lit() {
+    // A short lambda's parameters may leave out their types: `(a, b) => a + b`.
+    bool short_lambda = paren_followed_by(Tok::FatArrow);
     auto* p = ast_.make<ProcLit>(expect(Tok::LParen).loc);
     int polys = poly_idents_;
     while (!at(Tok::RParen)) {
-      Decl* d = parse_param(p);
+      Decl* d = parse_param(p, short_lambda);
       if (d->is_baked) p->is_poly = true;
       p->params.push_back(d);
       if (!accept(Tok::Comma)) break;
@@ -1152,6 +1171,12 @@ class Parser {
       }
     }
     if (p->is_macro && p->is_foreign) fail(p->loc, "an #expand macro cannot be #foreign");
+    if (at(Tok::FatArrow)) {
+      if (p->is_foreign) fail(cur().loc, "a #foreign procedure has no body ('=>')");
+      advance();
+      p->short_expr = parse_expr();
+      return p;
+    }
     if (!p->is_foreign) {
       if (!at(Tok::LBrace)) fail(cur().loc, "expected procedure body, found ", describe(cur()));
       p->body = parse_block();

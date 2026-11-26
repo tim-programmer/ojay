@@ -282,6 +282,7 @@ class Cloner {
     for (Decl* d : p->params) n->params.push_back(decl(d));
     for (auto& r : p->returns) n->returns.push_back(ReturnSpec{r.name, expr(r.type_expr), r.loc});
     n->body = block(p->body);
+    n->short_expr = expr(p->short_expr);
     n->is_foreign = p->is_foreign;
     n->foreign_lib = expr(p->foreign_lib);
     n->foreign_name = p->foreign_name;

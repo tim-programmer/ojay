@@ -265,9 +265,21 @@ Implemented:
   to `print` / `sprint`: `print(format, ..args)`; parameters after the
   variadic one are passed by name, as in `join("a", "b", separator = ", ")`,
   and those without a default must be), procedure values, nested (non-capturing)
-  procedures, order-independent top-level declarations, `#foreign` /
+  procedures, short lambdas (see below), order-independent top-level declarations, `#foreign` /
   `#c_call` with `#system_library`, structs and unions by value across the
   C boundary, `#program_export` (see *C interop* below)
+* Short lambdas: `(params) => expression` is a procedure whose body is
+  `return expression;` (or just the expression when it has no value):
+  `double :: (x: int) => x * 2;`, `apply((x) => x * x, 7)`. Parameters may
+  leave out their types where the lambda is used as a procedure type (a
+  typed variable, a parameter, `f: (int) -> int = (n) => n * 3;`), and take
+  that type's parameter types, results and `#c_call`. Without `-> T` (which
+  may be written: `(x: int) -> float => ...`) and without such a type, the
+  results are the expression's type. For a polymorphic parameter like
+  `f: (T) -> $R`, untyped parameters get the types the other arguments bind
+  (`map(xs, (x) => x * 2)`), and the lambda's result binds `$R`. Like nested
+  procedures, lambdas do not capture locals. Only the parenthesized form is
+  supported (not `x => x * 2`).
 * Overloading: procedures with the same name in a scope form an overload set
   (also across imported modules; user procedures can overload built-ins such
   as `max`). The best fit wins: exact types, then constants that fit, then

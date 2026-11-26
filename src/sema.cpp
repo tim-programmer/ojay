@@ -187,6 +187,8 @@ class Checker : public InterpHost {
   std::vector<std::pair<Stmt*, Scope*>> top_directives_;
   std::map<std::pair<Scope*, uint32_t>, Scope*> file_scopes_;  // (unit scope, file) -> the file's scope
   Scope* cur_file_scope_ = nullptr;  // collect: the file scope of nested statements
+  Type* lambda_hint_ = nullptr;      // define_proc: the procedure type a short lambda is used as
+  bool lambda_hint_results_ = true;  // ... including its results (else they are inferred)
   // The Preload (preload.jai): its declarations are resolved only when used.
   Scope* preload_ = nullptr;
   Scope* core_ = nullptr;           // core.jai: For_Flags, Type_Info and the Type_Info_* structs
@@ -1385,7 +1387,14 @@ class Checker : public InterpHost {
   // generation and body checking right away, except polymorphic instances,
   // which are registered once a call actually uses them (use_instance).
   void define_proc(ProcLit* p, bool for_codegen = true) {
+    // The procedure type a short lambda is used as (check of a ProcLit): it
+    // gives untyped parameters their types and, unless written, the results.
+    Type* hint = lambda_hint_;
+    bool hint_results = lambda_hint_results_;
+    lambda_hint_ = nullptr;
+    lambda_hint_results_ = true;
     if (p->signature_done) return;
+    if (hint && (!p->short_expr || hint->params.size() != p->params.size())) hint = nullptr;
     if (p->modify && !poly_instances_.count(p))
       fail(p->modify->loc, "#modify is only allowed on polymorphic procedures");
     p->scope = scope_;
@@ -1400,6 +1409,11 @@ class Checker : public InterpHost {
       if (d->type_expr) {
         t = resolve_type(d->type_expr);
         if (d->is_vararg) t = T.array_of(t, ArrayKind::View);
+      } else if (d->values.empty()) {  // a short lambda's `(x) => ...`
+        if (!hint)
+          fail(d->loc, "parameter '", d->names[0].name, "' needs a type: give it one ('", d->names[0].name,
+               ": int'), or use the lambda where a procedure type is expected (a typed variable or parameter)");
+        t = hint->params[i];
       }
       if (!d->values.empty()) {
         bool caller_loc = is_caller_location(d->values[0]);
@@ -1426,8 +1440,33 @@ class Checker : public InterpHost {
       rets.push_back(t);
     }
     if (rets.empty()) p->returns.clear();
+    if (p->short_expr) {
+      if (p->returns.empty()) {
+        // Without `-> T`: the results of the procedure type it is used as (if
+        // the parameters match), else the type of the expression.
+        bool same = hint != nullptr && hint_results;
+        for (size_t i = 0; same && i < params.size(); ++i) same = hint->params[i] == params[i];
+        if (same) {
+          rets = hint->returns;
+          if (hint->c_call) p->c_call = true;
+        } else {
+          rets = short_lambda_results(p, params);
+        }
+      }
+      if (!p->body) {
+        p->body = ast_.make<Block>(p->short_expr->loc);
+        if (rets.empty()) {
+          p->body->stmts.push_back(ast_.make<ExprStmt>(p->short_expr->loc, p->short_expr));
+        } else {
+          auto* r = ast_.make<Return>(p->short_expr->loc);
+          r->values.push_back(p->short_expr);
+          p->body->stmts.push_back(r);
+        }
+      }
+    }
     if (p->is_macro && rets.size() > 1)
-      fail(p->returns[1].loc, "#expand macros with more than one return value are not supported yet");
+      fail(p->returns.size() > 1 ? p->returns[1].loc : p->loc,
+           "#expand macros with more than one return value are not supported yet");
     if (p->is_macro && p->c_call) fail(p->loc, "an #expand macro cannot be #c_call");
     p->type = T.proc(params, rets, p->c_call, vararg_index(p));
     if (p->is_foreign && p->variadic) fail(p->loc, "variadic #foreign procedures are not supported yet");
@@ -1439,7 +1478,7 @@ class Checker : public InterpHost {
       for (size_t i = 0; i < params.size(); ++i)
         check_c_type(params[i], p->params[i]->loc, false);
       if (rets.size() > 1) fail(p->loc, "#c_call/#foreign procedures cannot return multiple values");
-      if (rets.size() == 1) check_c_type(rets[0], p->returns[0].loc, true);
+      if (rets.size() == 1) check_c_type(rets[0], p->returns.empty() ? p->loc : p->returns[0].loc, true);
     }
     if (p->is_foreign) {
       if (p->foreign_lib) {
@@ -1454,6 +1493,34 @@ class Checker : public InterpHost {
     }
     p->signature_done = true;
     if (for_codegen) want_proc(p);
+  }
+
+  // The result types of short lambda `p` without `-> T`: the type of its
+  // expression, checked (as a copy) with the parameters as locals; none if
+  // the expression has no value, several for a call with several results.
+  std::vector<Type*> short_lambda_results(ProcLit* p, const std::vector<Type*>& params) {
+    ContextGuard guard(*this);  // restores the context however this ends
+    in_run_operand_ = false;    // the parameters are the lambda's own, also in a #run expression
+    proc_ = p;
+    scope_ = new_scope(p->scope, p);
+    loops_.clear();
+    macros_.clear();
+    for (size_t i = 0; i < p->params.size(); ++i) {
+      Symbol* s = declare(scope_, p->params[i]->names[0].name, SymKind::Var, p->params[i]->names[0].loc);
+      s->type = params[i];
+      s->owner = p;
+      s->state = Symbol::State::Resolved;
+    }
+    Expr* e = clone_expr(ast_, p->short_expr);
+    std::vector<Type*> rets;
+    Type* t = check(e, nullptr);
+    if (t->kind == TypeKind::Tuple) {
+      rets = t->elems;
+    } else if (t->kind != TypeKind::Void) {
+      default_untyped(e);
+      rets.push_back(e->type);
+    }
+    return rets;
   }
 
   // Parameters and results of #c_call procedures must be C types (abi.h).
@@ -2645,6 +2712,10 @@ class Checker : public InterpHost {
         if (p->is_poly || p->poly_returns)
           fail(e->loc, "a polymorphic procedure must be declared as a named constant (name :: (x: $T) {...}); "
                "polymorphic procedure values are not supported yet");
+        if (lambda_hint_ != hint) {  // (infer_poly sets the hint itself, with lambda_hint_results_)
+          lambda_hint_ = hint && hint->is_proc() ? hint : nullptr;
+          lambda_hint_results_ = true;
+        }
         define_proc(p);
         return p->type;
       }
@@ -3541,29 +3612,36 @@ class Checker : public InterpHost {
     return -1;
   }
 
-  // Calls f on each `$X` in a type expression.
+  // Calls f on each `$X` in a type expression (each name, `$X` or `X`, if `all`).
   template <typename F>
-  static void for_each_poly(Expr* e, F& f) {
+  static void for_each_poly(Expr* e, F& f, bool all = false) {
     if (!e) return;
     switch (e->kind) {
       case NK::Ident:
-        if (static_cast<Ident*>(e)->poly) f(static_cast<Ident*>(e));
+        if (all || static_cast<Ident*>(e)->poly) f(static_cast<Ident*>(e));
         return;
-      case NK::PtrType: for_each_poly(static_cast<PtrType*>(e)->elem, f); return;
+      case NK::PtrType: for_each_poly(static_cast<PtrType*>(e)->elem, f, all); return;
       case NK::ArrType:
-        for_each_poly(static_cast<ArrType*>(e)->count, f);
-        for_each_poly(static_cast<ArrType*>(e)->elem, f);
+        for_each_poly(static_cast<ArrType*>(e)->count, f, all);
+        for_each_poly(static_cast<ArrType*>(e)->elem, f, all);
         return;
       case NK::Call:
-        for (auto& a : static_cast<Call*>(e)->args) for_each_poly(a.value, f);
+        for (auto& a : static_cast<Call*>(e)->args) for_each_poly(a.value, f, all);
         return;
       case NK::ProcType:
-        for (Expr* x : static_cast<ProcTypeExpr*>(e)->params) for_each_poly(x, f);
-        for (Expr* x : static_cast<ProcTypeExpr*>(e)->returns) for_each_poly(x, f);
+        for (Expr* x : static_cast<ProcTypeExpr*>(e)->params) for_each_poly(x, f, all);
+        for (Expr* x : static_cast<ProcTypeExpr*>(e)->returns) for_each_poly(x, f, all);
         return;
       default:
         return;
     }
+  }
+  // Whether type expression e names `name` (as `$name` or `name`).
+  static bool mentions(Expr* e, const std::string& name) {
+    bool found = false;
+    auto f = [&](Ident* id) { found |= id->name == name; };
+    for_each_poly(e, f, true);
+    return found;
   }
   static Ident* find_poly(Expr* e) {
     Ident* found = nullptr;
@@ -3938,7 +4016,17 @@ class Checker : public InterpHost {
     ProcLit* p = tmpl->proc;
     Bindings b = poly_vars(p);
     std::vector<std::pair<int, Type*>> untyped;  // `$T` given an untyped constant
+    struct Lambda {
+      ProcTypeExpr* pat;
+      Expr* arg;
+      std::string pname;
+    };
+    std::vector<Lambda> lambdas;  // short lambdas with untyped parameters, for procedure type patterns
     auto match_arg = [&](Expr* pat, Expr* a, const std::string& pname) {
+      if (!a->type && a->kind == NK::ProcLit && pat->kind == NK::ProcType && needs_hint(a)) {
+        lambdas.push_back({static_cast<ProcTypeExpr*>(pat), a, pname});
+        return;
+      }
       if (!a->type) return;  // .{...}, .[...], .NAME, xx: typed by the instance's parameter
       if (a->type->is_untyped()) {  // `$T` or a later plain `T`
         int k = pat->kind == NK::Ident ? binding_index(b, static_cast<Ident*>(pat)->name) : -1;
@@ -3987,6 +4075,24 @@ class Checker : public InterpHost {
       for (auto& [k2, t2] : untyped) any_float |= k2 == k && t2->kind == TypeKind::UntypedFloat;
       b[k].bound = true;
       b[k].type = any_float ? T.f32 : T.s64;
+    }
+    // `map(xs, (x) => x * 2)` for `f: (T) -> $R`: the lambda's parameters get
+    // the types the pattern has with the bindings so far, then its results
+    // (the type of its expression) bind what the pattern's results introduce.
+    for (Lambda& l : lambdas) {
+      std::vector<Type*> ps;
+      for (Expr* x : l.pat->params) {
+        for (auto& v : b)
+          if (!v.bound && mentions(x, v.name))
+            fail(l.arg->loc, "cannot infer the parameter types of this lambda for '", l.pname, "' of '", p->name,
+                 "' ('$", v.name, "' is not known from the other arguments); give its parameters types");
+        ps.push_back(param_type_in(tmpl, b, x));
+      }
+      lambda_hint_ = T.proc(ps, {}, false, -1);
+      lambda_hint_results_ = false;
+      Expr* a = l.arg;
+      check(a, lambda_hint_);
+      match_type(tmpl, l.pat, a->type, a, l.pname, b);
     }
     for (auto& x : b)
       if (!x.bound)
@@ -4620,6 +4726,10 @@ class Checker : public InterpHost {
   // Arguments whose type comes from the parameter they are passed to.
   static bool needs_hint(const Expr* e) {
     switch (e->kind) {
+      case NK::ProcLit:  // a short lambda with untyped parameters
+        for (const Decl* d : static_cast<const ProcLit*>(e)->params)
+          if (!d->type_expr && d->values.empty()) return true;
+        return false;
       case NK::StructLit: return static_cast<const StructLit*>(e)->type_expr == nullptr;
       case NK::ArrayLit: return static_cast<const ArrayLit*>(e)->elem_type_expr == nullptr;
       case NK::Member: return static_cast<const Member*>(e)->base == nullptr;
@@ -4634,6 +4744,8 @@ class Checker : public InterpHost {
       switch (e->kind) {
         case NK::StructLit: return p->kind == TypeKind::Struct ? 1 : -1;
         case NK::ArrayLit: return p->kind == TypeKind::Array ? 1 : -1;
+        case NK::ProcLit:
+          return p->is_proc() && p->params.size() == static_cast<ProcLit*>(e)->params.size() ? 1 : -1;
         case NK::Member:
           if (!p->is_enum()) return -1;
           for (auto& m : p->members)

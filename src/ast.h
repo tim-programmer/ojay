@@ -231,7 +231,8 @@ struct ReturnSpec {
 struct ProcLit : Expr {
   std::vector<Decl*> params;
   std::vector<ReturnSpec> returns;
-  Block* body = nullptr;  // null for #foreign
+  Block* body = nullptr;  // null for #foreign (and for a short lambda until sema makes it from short_expr)
+  Expr* short_expr = nullptr;  // `(x: int) => x * 2`: the value (sema: body is `return short_expr;`)
   bool is_foreign = false;
   Expr* foreign_lib = nullptr;
   std::string foreign_name;

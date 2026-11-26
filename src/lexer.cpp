@@ -54,6 +54,7 @@ const char* tok_name(Tok t) {
     case Tok::DotLBracket: return "'.['";
     case Tok::DotStar: return "'.*'";
     case Tok::Arrow: return "'->'";
+    case Tok::FatArrow: return "'=>'";
     case Tok::Dollar: return "'$'";
     case Tok::Backtick: return "'`'";
     case Tok::TripleDash: return "'---'";
@@ -432,7 +433,7 @@ class Lexer {
         else if (match('=')) t.kind = Tok::MinusEq;
         else t.kind = Tok::Minus;
         return;
-      case '=': t.kind = match('=') ? Tok::EqEq : Tok::Eq; return;
+      case '=': t.kind = match('=') ? Tok::EqEq : match('>') ? Tok::FatArrow : Tok::Eq; return;
       case '!': t.kind = match('=') ? Tok::NotEq : Tok::Bang; return;
       case '<':
         if (match('<')) t.kind = match('=') ? Tok::ShlEq : Tok::Shl;
