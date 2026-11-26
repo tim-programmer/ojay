@@ -40,18 +40,34 @@ class Parser {
   Parser(AstContext& ast, const SourceManager& sm, uint32_t file)
       : ast_(ast), sm_(sm), toks_(lex(sm, file)) {}
 
+  // Each file starts in #scope_export; #scope_module and #scope_file apply to
+  // the declarations after them, up to the next #scope_* directive.
   std::vector<Stmt*> parse_top_level() {
     std::vector<Stmt*> out;
+    ScopeVis vis = ScopeVis::Export;
     while (!at(Tok::Eof)) {
       if (accept(Tok::Semi)) continue;
       if (at(Tok::Directive) &&
           (cur().text == "scope_file" || cur().text == "scope_export" || cur().text == "scope_module")) {
+        vis = cur().text == "scope_file" ? ScopeVis::File : cur().text == "scope_module" ? ScopeVis::Module
+                                                                                         : ScopeVis::Export;
         advance();
         continue;
       }
-      out.push_back(parse_stmt(/*top_level=*/true));
+      Stmt* s = parse_stmt(/*top_level=*/true);
+      set_vis(s, vis);
+      out.push_back(s);
     }
     return out;
+  }
+
+  static void set_vis(Stmt* s, ScopeVis vis) {
+    s->vis = vis;
+    if (s->kind == NK::StaticIf) {
+      auto* si = static_cast<StaticIf*>(s);
+      for (Stmt* x : si->then_s) set_vis(x, vis);
+      for (Stmt* x : si->else_s) set_vis(x, vis);
+    }
   }
 
  private:

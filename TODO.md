@@ -4,8 +4,6 @@ What is implemented is documented in `README.md`; this file lists only what is n
 
 ## Language
 
-- [ ] `#scope_file`, `#scope_export` and `#scope_module`: parsed and ignored, so a module's
-      private declarations are visible to (and can clash with) the code that imports it
 - [ ] Short lambdas: `(x: int) => x * 2`
 - [ ] Smaller directives and intrinsics: `#procedure_name()`, `is_constant()`, `#bytes`,
       `#exists`, `initializer_of(T)`, `enum_highest_value` and the other enum helpers,

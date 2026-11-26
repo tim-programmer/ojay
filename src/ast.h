@@ -354,7 +354,13 @@ struct MacroExpansion : Expr {
 // ---------------------------------------------------------------------------
 // Statements
 
+// Who sees a top-level declaration: `#scope_export` (the default: also the
+// files that import its module), `#scope_module` (the files of its module or
+// program) or `#scope_file` (its own file).
+enum class ScopeVis : uint8_t { Export, Module, File };
+
 struct Stmt : Node {
+  ScopeVis vis = ScopeVis::Export;  // top-level statements: the #scope_* in effect where it is written
   Stmt(NK k, SourceLoc l) : Node(k, l) {}
 };
 

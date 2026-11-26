@@ -315,7 +315,13 @@ Implemented:
   module has its own scope: its declarations are visible where it is
   imported, imports are not transitive, and a program's own declarations take
   precedence. `M :: #import "Name";` makes them available only as `M.name`
-  (procedures, types, constants), for built-in modules too.
+  (procedures, types, constants), for built-in modules too. Each file starts
+  in `#scope_export`; declarations after `#scope_module` are visible only in
+  the module's own files (in the main program that changes nothing), and
+  after `#scope_file` only in their own file, so two files (of a module or
+  the program, `#load`ed or not) can each have a private declaration of the
+  same name. The directive in effect also applies inside top-level `#if` and
+  to what a top-level `#insert` declares.
 * Compile-time execution: `#run` (see *Compile-time execution* below)
 * Metaprogramming: `#code`, `#insert`, `#expand` macros and `#modify` (see
   *Metaprogramming* below)
@@ -383,9 +389,8 @@ Implemented:
   empty array.
 
 What is not implemented yet is listed in [`TODO.md`](TODO.md). Some
-directives are accepted and have no effect: `#scope_file`, `#scope_export`
-and `#scope_module` (every declaration is visible to importers), `#no_abc`,
-`#must`, `#deprecated` and call-site `inline`.
+directives are accepted and have no effect: `#no_abc`, `#must`,
+`#deprecated` and call-site `inline`.
 
 ### Struct layout, constants and distinct types
 

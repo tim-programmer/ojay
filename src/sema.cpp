@@ -185,6 +185,8 @@ class Checker : public InterpHost {
 
   std::vector<Symbol*> global_order_;
   std::vector<std::pair<Stmt*, Scope*>> top_directives_;
+  std::map<std::pair<Scope*, uint32_t>, Scope*> file_scopes_;  // (unit scope, file) -> the file's scope
+  Scope* cur_file_scope_ = nullptr;  // collect: the file scope of nested statements
   // The Preload (preload.jai): its declarations are resolved only when used.
   Scope* preload_ = nullptr;
   Scope* core_ = nullptr;           // core.jai: For_Flags, Type_Info and the Type_Info_* structs
@@ -430,8 +432,10 @@ class Checker : public InterpHost {
       for (Scope* im : s->imports) {
         auto jt = im->syms.find(name);
         if (jt != im->syms.end()) {
-          f.sym = jt->second;
-          return f;
+          if (Symbol* e = exported_sym(jt->second)) {
+            f.sym = e;
+            return f;
+          }
         }
       }
     }
@@ -444,14 +448,15 @@ class Checker : public InterpHost {
   void gather_procs(const std::string& name, std::vector<Symbol*>& procs, Builtin& builtin) {
     proc_distance_.clear();
     int distance = 0;
-    auto add = [&](Symbol* s) {
+    auto add = [&](Symbol* s, bool imported = false) {
       if (s->kind == SymKind::Builtin) {
         if (builtin == Builtin::None) builtin = s->builtin;
         return true;
       }
+      if (imported && !exported_sym(s)) return true;
       if (!is_proc_decl(s->decl, s->decl_index)) return false;
       for (Symbol* o : s->overloads.empty() ? std::vector<Symbol*>{s} : s->overloads)
-        if (std::find(procs.begin(), procs.end(), o) == procs.end()) {
+        if ((!imported || exported(o)) && std::find(procs.begin(), procs.end(), o) == procs.end()) {
           procs.push_back(o);
           proc_distance_[o] = distance;
         }
@@ -463,7 +468,7 @@ class Checker : public InterpHost {
       ++distance;
       for (Scope* im : sc->imports) {
         auto jt = im->syms.find(name);
-        if (jt != im->syms.end()) add(jt->second);
+        if (jt != im->syms.end()) add(jt->second, /*imported=*/true);
       }
       ++distance;
     }
@@ -481,15 +486,21 @@ class Checker : public InterpHost {
 
   Symbol* module_member(Scope* ms, Member* m) {
     auto it = ms->syms.find(m->name);
-    if (it == ms->syms.end())
-      fail(m->loc, "module '", static_cast<Ident*>(m->base)->name, "' has no member '", m->name, "'");
-    return it->second;
+    Symbol* s = it == ms->syms.end() ? nullptr : exported_sym(it->second);
+    if (!s) fail(m->loc, "module '", static_cast<Ident*>(m->base)->name, "' has no member '", m->name, "'",
+                 it == ms->syms.end() ? "" : " that it exports (it is declared after #scope_module or #scope_file)");
+    return s;
   }
 
   Symbol* lookup(const std::string& name, SourceLoc loc) {
     Found f = find(name, loc);
     if (f.sym) return f.sym;
     if (f.via || f.enum_type) fail(loc, "'", name, "' (brought in by 'using') cannot be used here");
+    for (Scope* sc = scope_; sc; sc = sc->parent)
+      for (Scope* im : sc->imports)
+        if (im->syms.count(name))
+          fail(loc, "undeclared identifier '", name, "' (an imported module declares it after #scope_module or "
+               "#scope_file, so it is private to that module)");
     if (is_basic_name(name)) {
       fail(loc, "undeclared identifier '", name, "' (did you forget #import \"Basic\"?)");
     }
@@ -900,10 +911,49 @@ class Checker : public InterpHost {
 
   // ------------------------------------------------------------------ collection
 
-  void collect(const std::vector<Stmt*>& stmts, bool) {
-    std::vector<StaticIf*> static_ifs;
-    std::vector<Insert*> inserts;
+  // The scope of a file's top level (`#scope_file` declarations), inside the
+  // current unit's scope. Every top-level declaration is resolved in its
+  // file's scope, so it sees the file's private declarations; the others are
+  // in the unit's scope. The Preload and the built-in modules have none.
+  Scope* file_scope_for(uint32_t file) {
+    if (lazy_collect_) return scope_;
+    Scope*& fs = file_scopes_[{scope_, file}];
+    if (!fs) {
+      fs = new_scope(scope_, nullptr);
+      fs->is_module = true;
+    }
+    return fs;
+  }
+
+  static void set_vis(Stmt* s, ScopeVis vis) {
+    s->vis = vis;
+    if (s->kind == NK::StaticIf) {
+      auto* si = static_cast<StaticIf*>(s);
+      for (Stmt* x : si->then_s) set_vis(x, vis);
+      for (Stmt* x : si->else_s) set_vis(x, vis);
+    }
+  }
+
+  // Whether a declaration of an imported module is visible to the importer
+  // (not #scope_module or #scope_file).
+  static bool exported(const Symbol* s) { return !s->decl || s->decl->vis == ScopeVis::Export; }
+
+  // Symbol `s` (from an imported module's table), or the first exported
+  // procedure of its overload set when `s` itself is not exported.
+  static Symbol* exported_sym(Symbol* s) {
+    if (exported(s)) return s;
+    for (Symbol* o : s->overloads)
+      if (exported(o)) return o;
+    return nullptr;
+  }
+
+  // `nested`: statements of a taken #if branch or a top-level #insert, which
+  // belong to the file of the statement that made them (cur_file_scope_).
+  void collect(const std::vector<Stmt*>& stmts, bool nested) {
+    std::vector<std::pair<StaticIf*, Scope*>> static_ifs;
+    std::vector<std::pair<Insert*, Scope*>> inserts;
     for (Stmt* s : stmts) {
+      Scope* fs = lazy_collect_ ? scope_ : nested ? cur_file_scope_ : file_scope_for(s->loc.file);
       switch (s->kind) {
         case NK::Decl: {
           auto* d = static_cast<Decl*>(s);
@@ -911,12 +961,14 @@ class Checker : public InterpHost {
           if (d->add_context) {  // a member of Context, added when Context is laid out
             if (context_type_ && context_type_->layout_state != Type::LayoutState::None)
               fail(d->loc, "#add_context after Context has been used (by #run code that ran earlier)");
-            context_additions_.push_back({d, scope_});
+            context_additions_.push_back({d, fs});
             break;
           }
+          Scope* into = d->vis == ScopeVis::File ? fs : scope_;
           for (size_t i = 0; i < d->names.size(); ++i) {
-            Symbol* sym = d->is_const ? declare_const(scope_, d, i)
-                                      : declare(scope_, d->names[i].name, SymKind::Var, d->names[i].loc);
+            Symbol* sym = d->is_const ? declare_const(into, d, i)
+                                      : declare(into, d->names[i].name, SymKind::Var, d->names[i].loc);
+            sym->scope = fs;  // resolved in its file's scope
             sym->decl = d;
             sym->decl_index = (int)i;
             sym->is_global = true;
@@ -934,14 +986,14 @@ class Checker : public InterpHost {
         case NK::Load:
           break;  // handled by the driver
         case NK::StaticIf:
-          static_ifs.push_back(static_cast<StaticIf*>(s));
+          static_ifs.push_back({static_cast<StaticIf*>(s), fs});
           break;
         case NK::Insert:
-          inserts.push_back(static_cast<Insert*>(s));
+          inserts.push_back({static_cast<Insert*>(s), fs});
           break;
         case NK::ExprStmt:
           if (static_cast<ExprStmt*>(s)->expr->kind == NK::Directive) {
-            top_directives_.push_back({s, scope_});
+            top_directives_.push_back({s, fs});
             break;
           }
           fail(s->loc, "only declarations are allowed at top level");
@@ -949,15 +1001,23 @@ class Checker : public InterpHost {
           fail(s->loc, "only declarations are allowed at top level");
       }
     }
-    for (StaticIf* si : static_ifs) {
+    Scope* unit = scope_;
+    Scope* saved_fs = cur_file_scope_;
+    for (auto [si, fs] : static_ifs) {
+      scope_ = fs;
       bool taken = eval_static_cond(si->cond);
+      scope_ = unit;
       si->taken = taken ? 1 : 0;
+      cur_file_scope_ = fs;
       collect(taken ? si->then_s : si->else_s, true);
+      cur_file_scope_ = saved_fs;
     }
     // Top-level #insert: declarations made at compile time. They are
     // evaluated once the unit's own declarations are known.
-    for (Insert* ins : inserts) {
+    for (auto [ins, fs] : inserts) {
+      scope_ = fs;
       ConstValue v = insert_operand(ins->operand);
+      scope_ = unit;
       auto* blk = ast_.make<Block>(ins->loc);
       ins->result = blk;
       with_note(insert_note(ins->loc), [&] {
@@ -968,9 +1028,13 @@ class Checker : public InterpHost {
           if (!c.block) fail(c.loc, "only a #code block of declarations can be inserted at top level");
           blk->stmts = static_cast<Block*>(clone_stmt(ast_, c.block))->stmts;
         }
-        for (Stmt* x : blk->stmts)
+        for (Stmt* x : blk->stmts) {
           if (x->kind == NK::Decl) static_cast<Decl*>(x)->is_global = true;
+          set_vis(x, ins->vis);  // the #scope_* of the #insert
+        }
+        cur_file_scope_ = fs;
         collect(blk->stmts, true);
+        cur_file_scope_ = saved_fs;
         return 0;
       });
     }
@@ -3785,7 +3849,7 @@ class Checker : public InterpHost {
       auto* m = static_cast<Member*>(callee);
       if (Scope* ms = module_of(m->base)) {
         auto it = ms->syms.find(m->name);
-        if (it != ms->syms.end()) s = it->second;
+        if (it != ms->syms.end()) s = exported_sym(it->second);
       }
     }
     return s && is_poly_struct_decl(s) ? s : nullptr;
@@ -4461,10 +4525,14 @@ class Checker : public InterpHost {
 
   Type* check_call(Call* c, Type* hint) {
     Symbol* qualified = nullptr;  // Module.proc(...)
+    bool from_module = false;     // qualified by a module: only its exported overloads
+    Symbol* qualified_set = nullptr;
     if (c->callee->kind == NK::Member && static_cast<Member*>(c->callee)->base) {
       auto* m = static_cast<Member*>(c->callee);
       if (Scope* ms = module_of(m->base)) {
         qualified = module_member(ms, m);
+        from_module = true;
+        qualified_set = ms->syms.at(m->name);  // the head of its overload set
         c->callee = ast_.make<Ident>(m->loc, m->name);
       } else if (Symbol* cs = member_constant(m)) {  // S.make(...): a procedure (or struct) constant of S
         qualified = cs;
@@ -4490,8 +4558,13 @@ class Checker : public InterpHost {
         std::vector<Symbol*> cands;
         Builtin fallback = Builtin::None;
         proc_distance_.clear();
-        if (qualified) cands = s->overloads.empty() ? std::vector<Symbol*>{s} : s->overloads;
-        else gather_procs(id->name, cands, fallback);
+        if (qualified) {
+          Symbol* set = from_module ? qualified_set : s;
+          cands = set->overloads.empty() ? std::vector<Symbol*>{set} : set->overloads;
+          if (from_module) std::erase_if(cands, [](Symbol* o) { return !exported(o); });
+        } else {
+          gather_procs(id->name, cands, fallback);
+        }
         bool any_poly = false;
         for (Symbol* o : cands) any_poly |= is_poly_proc_decl(o);
         if (cands.size() > 1 || fallback != Builtin::None || any_poly) {
