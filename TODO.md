@@ -4,7 +4,8 @@ What is implemented is documented in `README.md`; this file lists only what is n
 
 ## Language
 
-- [ ] Smaller directives and intrinsics: `#bytes`, `#asm`
+- [ ] Smaller directives and intrinsics: `#bytes`; Jai's `#asm` register declarations
+      (`reg: gpr;`, `===` pinning) and explicit clobber lists
 - [ ] Metaprogramming: `#insert (...)` options other than `remove`
 - [ ] Compiler integration: `#compiler` procedures, the message loop (`#run,stallable`),
       `Code_Node` introspection (`compiler_get_nodes`), `#insert,scope(...)`, `#procedure_of_call`

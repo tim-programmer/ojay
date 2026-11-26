@@ -7,6 +7,9 @@
 #include <llvm/IR/DataLayout.h>
 #include <llvm/IR/DerivedTypes.h>
 #include <llvm/IR/Function.h>
+#include <llvm/IR/InlineAsm.h>
+#include <llvm/Support/Error.h>
+#include <llvm/TargetParser/Triple.h>
 #include <llvm/IR/GlobalVariable.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Intrinsics.h>
@@ -1202,6 +1205,7 @@ class CodeGen {
         return;
       }
       case NK::PushContext: emit_push_context(static_cast<PushContext*>(s)); return;
+      case NK::Asm: emit_asm(static_cast<AsmStmt*>(s)); return;
       default:
         throw CompileError(s->loc, "internal error: unexpected statement in codegen");
     }
@@ -2148,6 +2152,56 @@ class CodeGen {
     llvm::Value* data = b_.CreateLoad(ptr_, b_.CreateStructGEP(dyn_t, arr, 1));
     llvm::Value* allocated = b_.CreateLoad(i64_, b_.CreateStructGEP(dyn_t, arr, 2));
     return b_.CreateSelect(b_.CreateICmpSGT(allocated, llvm::ConstantInt::get(i64_, 0)), data, null_ptr());
+  }
+
+  // `#asm { ... }`: one volatile inline asm call (Intel syntax on x86-64).
+  // Each variable operand is read and written: its value goes in as a tied
+  // input of an output register, and the output is stored back.
+  void emit_asm(AsmStmt* a) {
+    llvm::Triple tr(mod_->getTargetTriple());
+    bool x86 = tr.isX86(), arm = tr.isARM() || tr.isThumb(), riscv = tr.isRISCV();
+    std::vector<llvm::Type*> types;
+    std::vector<llvm::Value*> inputs;
+    std::string outs, ins;
+    size_t n = a->operands.size();
+    for (size_t i = 0; i < n; ++i) {
+      Symbol* s = a->operands[i];
+      Type* t = const_cast<Type*>(s->type->underlying());
+      std::string c = "r";
+      if (t->kind == TypeKind::Float) {
+        if (x86) c = "x";
+        else if (arm) c = t->bits == 32 ? "t" : "w";
+        else throw CompileError(a->loc, cat("#asm: float operand '", s->name, "': this target has no float registers"));
+      }
+      types.push_back(lt(s->type));
+      inputs.push_back(b_.CreateLoad(lt(s->type), s->llvm_value));
+      outs += (i ? "," : "") + std::string("=") + c;
+      ins += "," + std::to_string(i);
+    }
+    std::string constraints = outs + ins;
+    std::string clobbers = "~{memory}";
+    if (x86) clobbers += ",~{dirflag},~{fpsr},~{flags}";
+    else if (arm) clobbers += ",~{cc}";
+    (void)riscv;
+    constraints += (constraints.empty() ? "" : ",") + clobbers;
+    llvm::Type* rt = n == 0 ? void_ : n == 1 ? types[0] : llvm::StructType::get(ctx_, types);
+    std::vector<llvm::Type*> in_types(types.begin(), types.end());
+    auto* ft = llvm::FunctionType::get(rt, in_types, false);
+    if (llvm::Error err = llvm::InlineAsm::verify(ft, constraints))
+      throw CompileError(a->loc, cat("internal error: #asm constraints: ", llvm::toString(std::move(err))));
+    auto* ia = llvm::InlineAsm::get(ft, a->asm_text, constraints, /*hasSideEffects=*/true, /*isAlignStack=*/false,
+                                    x86 ? llvm::InlineAsm::AD_Intel : llvm::InlineAsm::AD_ATT);
+    auto* call = b_.CreateCall(ft, ia, inputs);
+    // Where the block is, for the assembler's errors: (file + 1) << 32 | line << 12 | column (see the driver).
+    uint64_t cookie = ((uint64_t)a->text_loc.file + 1) << 32 | (uint64_t)(a->text_loc.line & 0xFFFFF) << 12 |
+                      std::min<uint32_t>(a->text_loc.col, 4095);
+    call->setMetadata("srcloc", llvm::MDNode::get(ctx_, {llvm::ConstantAsMetadata::get(
+                                                           llvm::ConstantInt::get(i64_, cookie))}));
+    llvm::Value* r = call;
+    for (size_t i = 0; i < n; ++i) {
+      llvm::Value* v = n == 1 ? r : b_.CreateExtractValue(r, (unsigned)i);
+      b_.CreateStore(v, a->operands[i]->llvm_value);
+    }
   }
 
   // Type_Info_Struct.initializer: `(p: *void) { p.* = <t's default>; }`.

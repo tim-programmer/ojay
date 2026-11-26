@@ -114,6 +114,10 @@ struct Program {
 
 struct SemaOptions {
   bool require_main = false;
+  // The target, as the names of members of CPU_Tag and Operating_System_Tag
+  // (core.jai): the constants CPU and OS.
+  std::string cpu = "X64";
+  std::string os = "LINUX";
 };
 
 // Runs semantic analysis over `prog`. Throws CompileError on the first error.

@@ -235,6 +235,10 @@ class Cloner {
         auto* pc = as<PushContext>(s);
         return ast_.make<PushContext>(s->loc, expr(pc->ctx), block(pc->body));
       }
+      case NK::Asm: {
+        auto* a = as<AsmStmt>(s);
+        return ast_.make<AsmStmt>(s->loc, a->text, a->text_loc);
+      }
       default:
         fail(s->loc, "internal error: cannot clone statement node");
     }

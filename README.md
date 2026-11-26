@@ -588,6 +588,46 @@ Handle  :: #type,distinct u32;                          // a type of its own
   are not documented publicly); Type_Info_Variant has only `name`,
   `variant_of` and `variant_flags`.
 
+### Inline assembly
+
+```jai
+SHIFT :: 2;
+#if CPU == .ARM32 {
+    enable_interrupts :: () { #asm { cpsie i } }
+    add_and_shift :: (x: s32, y: s32) -> s32 {
+        #asm {
+            add x, x, y      // x and y are the variables: registers chosen by the compiler
+            lsl x, x, #SHIFT // a named integer constant becomes its value
+        }
+        return x;
+    }
+}
+```
+
+* `#asm { ... }` in a procedure body holds the target's own instructions
+  (Intel syntax on x86-64, as in Jai; ARM unified syntax on Cortex-M; the
+  RISC-V syntax on the ESP32-C6), separated by `;` or newlines, with `//`
+  and `/* */` comments. Text before the `{` (Jai's CPU feature list) is
+  ignored.
+* An identifier that names a variable (a local, parameter or global of an
+  integer, enum, float or pointer type) is an operand: the compiler puts it
+  in a register (a general one; on x86-64 an SSE register for floats, on ARM
+  a VFP one), reads it before the block and writes it back after. A named
+  integer constant becomes its value. Other names (registers such as `rsp`,
+  special registers such as `PRIMASK`, CSRs such as `mstatus`, mnemonic
+  suffixes such as `.f32`) stay as written, so a variable named like a
+  register hides it. Labels defined in the block (`again:`) are made unique to
+  each copy of it (inlining, macros); use them rather than numeric labels.
+  A line in quotes (`"wfi"`) is passed on unchanged.
+* Every block is volatile and clobbers memory (and the flags), so the
+  compiler neither removes nor moves it, and memory is reread after it.
+  Registers the instructions change other than the operands are not known to
+  the compiler: save them or use variables instead. Assembler errors are
+  reported at the block. `#asm` cannot run in `#run` code.
+* `CPU` (`CPU_Tag`: `.X64`, `.ARM32`, `.RISCV32`, `.ARM64`) and `OS`
+  (`Operating_System_Tag`: `.LINUX`, `.NONE` on bare metal, ...) are
+  constants for the target, for `#if`.
+
 ### C interop
 
 ```jai

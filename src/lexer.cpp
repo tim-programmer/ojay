@@ -138,6 +138,28 @@ class Lexer {
         out.push_back(t);
         return out;
       }
+      // `#asm [features] { raw text }`: the block is one String token (the
+      // instructions are not Jai tokens: `add r0, r0, #1`, `[p, #8]`).
+      if (t.kind == Tok::Directive && t.text == "asm") {
+        out.push_back(t);
+        while (peek() && peek() != '{' && peek() != '\n' && peek() != ';') get();  // features (ignored)
+        if (peek() != '{') continue;  // the parser reports the missing block
+        get();
+        Token s;
+        s.loc = here();
+        s.kind = Tok::String;
+        int depth = 1;
+        while (peek()) {
+          char c = peek();
+          if (c == '{') ++depth;
+          if (c == '}' && --depth == 0) break;
+          s.text += get();
+        }
+        if (!peek()) fail(t.loc, "unterminated #asm block (missing '}')");
+        get();
+        out.push_back(s);
+        continue;
+      }
       // `#string TERM ... TERM` here-strings are handled right after the directive.
       if (t.kind == Tok::Directive && t.text == "string") {
         out.push_back(t);

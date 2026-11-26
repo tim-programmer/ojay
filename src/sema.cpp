@@ -6,6 +6,7 @@
 #include "parser.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <filesystem>
 #include <map>
@@ -130,10 +131,16 @@ class Checker : public InterpHost {
     for (size_t i = prog_.modules.size(); i-- > 0;) {
       if (prog_.modules[i].kind == ModuleUnit::Kind::Builtin) continue;
       scope_ = prog_.modules[i].scope;
-      collect(prog_.modules[i].top_level, false);
-      // The Preload is visible in every module, after the module's own imports.
+      // The Preload is visible in every module, after the module's own imports
+      // (also to its top-level #if conditions: `#if CPU == .X64`).
       scope_->imports.push_back(preload_);
       scope_->imports.push_back(core_);
+      collect(prog_.modules[i].top_level, false);
+      auto& im = scope_->imports;
+      std::erase(im, preload_);
+      std::erase(im, core_);
+      im.push_back(preload_);
+      im.push_back(core_);
     }
     scope_ = global_;
 
@@ -713,6 +720,8 @@ class Checker : public InterpHost {
     core_ = new_scope(universe_, nullptr);
     core_->is_module = true;
     std::vector<Stmt*> stmts = parse_source_stmts(ast_, sm_, sm_.add("<core>", kCoreSource), true);
+    std::string target = "CPU :: CPU_Tag." + opts_.cpu + ";\nOS :: Operating_System_Tag." + opts_.os + ";\n";
+    for (Stmt* s : parse_source_stmts(ast_, sm_, sm_.add("<target>", target), true)) stmts.push_back(s);
     Scope* saved = scope_;
     scope_ = core_;
     lazy_collect_ = true;
@@ -2042,6 +2051,7 @@ class Checker : public InterpHost {
       }
       case NK::Using: check_using(static_cast<UsingStmt*>(s)); return;
       case NK::PushContext: check_push_context(static_cast<PushContext*>(s)); return;
+      case NK::Asm: check_asm(static_cast<AsmStmt*>(s)); return;
       case NK::Import:
       case NK::Load:
         fail(s->loc, "#import and #load are only allowed at top level");
@@ -3088,6 +3098,131 @@ class Checker : public InterpHost {
     if (v.kind == ConstValue::Proc) want_proc(v.proc);
     if ((v.kind == ConstValue::Aggregate || v.kind == ConstValue::Pointer) && v.elems)
       for (const ConstValue& e : *v.elems) want_const_procs(e);
+  }
+
+  // `#asm { ... }`: instructions separated by ';' or newlines (`//` comments
+  // allowed). In an instruction, the mnemonic (the first word) and words
+  // after a '.' are kept; any other identifier that names a variable becomes
+  // an operand, a named integer constant its value, and other names
+  // (registers, CSRs, labels) stay as written. A line in quotes is passed on
+  // unchanged.
+  void check_asm(AsmStmt* a) {
+    if (in_run_operand_ || !proc_) fail(a->loc, "#asm is only allowed in a procedure body");
+    // Labels defined in the block (`name:` at the start of an instruction) are
+    // made unique to each copy of it (inlining, macros): `name${:uid}`.
+    std::unordered_set<std::string> labels;
+    {
+      bool start = true;
+      for (size_t k = 0; k < a->text.size(); ++k) {
+        char c = a->text[k];
+        if (c == '\n' || c == ';') { start = true; continue; }
+        if (c == ' ' || c == '\t' || c == '\r') continue;
+        if (start && (std::isalpha((unsigned char)c) || c == '_')) {
+          size_t e = k;
+          while (e < a->text.size() && (std::isalnum((unsigned char)a->text[e]) || a->text[e] == '_')) ++e;
+          if (e < a->text.size() && a->text[e] == ':') labels.insert(a->text.substr(k, e - k));
+          k = e - 1;
+        }
+        start = false;
+      }
+    }
+    std::vector<std::string> out;
+    std::unordered_map<Symbol*, size_t> index;
+    const std::string& t = a->text;
+    SourceLoc loc = a->text_loc;
+    size_t i = 0;
+    std::string cur;
+    bool at_mnemonic = true;
+    auto finish = [&] {
+      size_t b = cur.find_first_not_of(" \t\r"), e = cur.find_last_not_of(" \t\r");
+      if (b != std::string::npos) out.push_back(cur.substr(b, e - b + 1));
+      cur.clear();
+      at_mnemonic = true;
+    };
+    auto escape = [](char c) { return c == '$' ? std::string("$$") : std::string(1, c); };
+    while (i < t.size()) {
+      char c = t[i];
+      if (c == '\n' || c == ';') {
+        finish();
+        if (c == '\n') { ++loc.line; loc.col = 0; }
+        ++i;
+        continue;
+      }
+      if (c == '/' && i + 1 < t.size() && t[i + 1] == '/') {
+        while (i < t.size() && t[i] != '\n') ++i;
+        continue;
+      }
+      if (c == '/' && i + 1 < t.size() && t[i + 1] == '*') {
+        size_t e = t.find("*/", i + 2);
+        for (size_t k = i; k < (e == std::string::npos ? t.size() : e); ++k)
+          if (t[k] == '\n') { ++loc.line; loc.col = 0; }
+        i = e == std::string::npos ? t.size() : e + 2;
+        continue;
+      }
+      if (c == '"' && cur.find_first_not_of(" \t\r") == std::string::npos) {  // a raw line
+        size_t e = t.find('"', i + 1);
+        if (e == std::string::npos) fail(loc, "#asm: unterminated string");
+        cur.clear();
+        for (size_t k = i + 1; k < e; ++k) cur += t[k] == '\\' && k + 1 < e && t[k + 1] == 'n' ? (++k, '\n') : t[k];
+        finish();
+        i = e + 1;
+        continue;
+      }
+      if (std::isalpha((unsigned char)c) || c == '_') {
+        size_t e = i;
+        while (e < t.size() && (std::isalnum((unsigned char)t[e]) || t[e] == '_')) ++e;
+        std::string word = t.substr(i, e - i);
+        bool after_dot = i > 0 && t[i - 1] == '.';
+        bool label = e < t.size() && t[e] == ':' && at_mnemonic;
+        if (labels.count(word) && !after_dot) {  // a label of this block (defined or used)
+          cur += word + "${:uid}";
+          if (!label) at_mnemonic = false;
+          i = e;
+          continue;
+        }
+        if (at_mnemonic || after_dot || label) {
+          cur += word;
+          if (!after_dot && !label) at_mnemonic = false;
+          i = e;
+          continue;
+        }
+        Found f = find(word, loc);
+        Symbol* s = f.sym;
+        if (f.via || f.enum_type)
+          fail(loc, "#asm: '", word, "' is a member brought in by 'using'; copy it into a local variable first");
+        if (s && s->kind == SymKind::Const) {
+          resolve(s);
+          if (s->cv.kind != ConstValue::Int) fail(loc, "#asm: constant '", word, "' is not an integer");
+          cur += i128_str(s->cv.i);
+        } else if (s && s->kind == SymKind::Var) {
+          resolve(s);
+          Type* vt = const_cast<Type*>(s->type->underlying());
+          bool ok = vt->kind == TypeKind::Int || vt->kind == TypeKind::Enum || vt->is_pointer() ||
+                    vt->kind == TypeKind::Float;
+          if (!ok)
+            fail(loc, "#asm: variable '", word, "' has type ", type_name(s->type),
+                 "; only integers, enums, floats and pointers can be operands (use a pointer to the value)");
+          if (s->is_context) fail(loc, "#asm: 'context' cannot be an operand");
+          auto it = index.find(s);
+          if (it == index.end()) {
+            it = index.emplace(s, a->operands.size()).first;
+            a->operands.push_back(s);
+          }
+          cur += "${" + std::to_string(it->second) + "}";
+        } else {
+          cur += word;  // a register, CSR, label, ...
+        }
+        i = e;
+        continue;
+      }
+      if (c != ' ' && c != '\t' && c != '\r' && c != ':') at_mnemonic = false;
+      cur += escape(c);
+      ++i;
+    }
+    finish();
+    if (out.empty()) fail(a->loc, "#asm block is empty");
+    a->asm_text.clear();
+    for (size_t k = 0; k < out.size(); ++k) a->asm_text += (k ? "\n\t" : "") + out[k];
   }
 
   // `#exists(name)` / `#exists(Module.name)`: whether the name is visible here.

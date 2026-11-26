@@ -1138,6 +1138,8 @@ class Machine {
         }
         return Flow::Normal;
       }
+      case NK::Asm:
+        err(s->loc, "#asm cannot run during compile-time execution (it is code for the target machine)");
       case NK::PushContext: {
         auto* pc = static_cast<PushContext*>(s);
         Val v = eval(pc->ctx);  // the block runs with a copy of the context it was given

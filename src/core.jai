@@ -11,6 +11,28 @@ For_Flags :: enum_flags u32 {
     REVERSE :: 0x2;
 }
 
+// ------------------------------------------------------------------ the target
+//
+// CPU and OS (constants of these types) say what the program is compiled for:
+// `#if CPU == .X64 { ... }`. ARM32 (Cortex-M), RISCV32 and OS NONE (bare
+// metal) are ojay's.
+
+CPU_Tag :: enum u32 {
+    X64;
+    ARM64;
+    ARM32;
+    RISCV32;
+}
+
+Operating_System_Tag :: enum u32 {
+    WINDOWS;
+    LINUX;
+    MACOS;
+    ANDROID;
+    IOS;
+    NONE;  // bare metal
+}
+
 // ------------------------------------------------------------------ runtime type information
 //
 // A `Type` value points to its Type_Info, and type_info(T) returns it as the

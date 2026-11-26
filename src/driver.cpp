@@ -3,6 +3,9 @@
 // objects against the runtime for each target.
 #include "driver.h"
 
+#include <llvm/IR/DiagnosticHandler.h>
+#include <llvm/IR/DiagnosticInfo.h>
+#include <llvm/IR/DiagnosticPrinter.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IR/Module.h>
@@ -311,7 +314,12 @@ int driver_main(int argc, char** argv, const TargetDesc& target) {
   try {
     Loader loader(ast, sm, prog, o.import_dirs);
     loader.load_main(o.input);
-    analyze(ast, sm, types, prog, SemaOptions{});
+    SemaOptions so;
+    llvm::Triple tr(llvm::Triple::normalize(o.triple));
+    so.cpu = tr.isX86() ? "X64" : tr.isAArch64() ? "ARM64" : tr.isARM() || tr.isThumb() ? "ARM32"
+           : tr.isRISCV() ? "RISCV32" : "X64";
+    so.os = tr.isOSLinux() ? "LINUX" : tr.isOSWindows() ? "WINDOWS" : tr.isMacOSX() ? "MACOS" : "NONE";
+    analyze(ast, sm, types, prog, so);
   } catch (const CompileError& e) {
     print_warnings(sm, prog);
     print_error(sm, e);
@@ -350,6 +358,39 @@ int driver_main(int argc, char** argv, const TargetDesc& target) {
   }
 
   llvm::LLVMContext ctx;
+  // Errors LLVM reports while emitting code (e.g. a bad #asm instruction) fail the compilation.
+  struct DiagHandler : llvm::DiagnosticHandler {
+    bool* failed;
+    const SourceManager& sm;
+    DiagHandler(bool* f, const SourceManager& s) : failed(f), sm(s) {}
+    bool handleDiagnostics(const llvm::DiagnosticInfo& di) override {
+      if (di.getSeverity() == llvm::DS_Error) *failed = true;
+      // An #asm block's error: the cookie codegen set is the block's file and line.
+      uint64_t cookie = 0;
+      std::string msg;
+      if (auto* sd = llvm::dyn_cast<llvm::DiagnosticInfoSrcMgr>(&di)) {
+        cookie = sd->getLocCookie();
+        msg = sd->getSMDiag().getMessage().str();
+      } else if (auto* ad = llvm::dyn_cast<llvm::DiagnosticInfoInlineAsm>(&di)) {
+        cookie = ad->getLocCookie();
+        msg = ad->getMsgStr().str();
+      }
+      if (cookie >> 32) {
+        SourceLoc loc{(uint32_t)(cookie >> 32) - 1, (uint32_t)(cookie >> 12) & 0xFFFFF, (uint32_t)cookie & 0xFFF};
+        print_diagnostic(sm, loc, di.getSeverity() == llvm::DS_Error ? "error" : "warning", "in #asm: " + msg);
+        return true;
+      }
+      if (di.getSeverity() == llvm::DS_Error || di.getSeverity() == llvm::DS_Warning) {
+        llvm::DiagnosticPrinterRawOStream dp(llvm::errs());
+        llvm::errs() << (di.getSeverity() == llvm::DS_Error ? "error: " : "warning: ");
+        di.print(dp);
+        llvm::errs() << "\n";
+      }
+      return true;
+    }
+  };
+  bool llvm_failed = false;
+  ctx.setDiagnosticHandler(std::make_unique<DiagHandler>(&llvm_failed, sm));
   std::unique_ptr<llvm::Module> mod;
   try {
     CodegenOptions copts;
@@ -401,6 +442,11 @@ int driver_main(int argc, char** argv, const TargetDesc& target) {
     return 1;
   }
   pm.run(*mod);
+  if (llvm_failed) {
+    os.close();
+    llvm::sys::fs::remove(o.output);
+    return 1;
+  }
   return 0;
 }
 

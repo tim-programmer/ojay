@@ -29,7 +29,7 @@ enum class NK {
   Ifx, ImplicitConv, TupleGet, Library, Directive, CodeLit, Expansion,
   // statements
   Block, ExprStmt, Decl, Assign, If, Switch, While, For, Return, Break, Continue, Defer, Import,
-  Load, StaticIf, Through, Using, Insert, PushContext, Remove,
+  Load, StaticIf, Through, Using, Insert, PushContext, Remove, Asm,
 };
 
 struct Node {
@@ -568,6 +568,18 @@ struct PushContext : Stmt {
   Expr* ctx;
   Block* body;
   PushContext(SourceLoc l, Expr* c, Block* b) : Stmt(NK::PushContext, l), ctx(c), body(b) {}
+};
+
+// `#asm { instructions }`: inline assembly in the target's own syntax (Intel
+// syntax on x86-64). Sema turns `text` into LLVM inline asm text in which
+// each variable named is an operand (`${k}`, k indexing `operands`).
+struct AsmStmt : Stmt {
+  std::string text;   // the block, as written
+  SourceLoc text_loc; // where it starts
+  // sema
+  std::string asm_text;
+  std::vector<Symbol*> operands;
+  AsmStmt(SourceLoc l, std::string t, SourceLoc tl) : Stmt(NK::Asm, l), text(std::move(t)), text_loc(tl) {}
 };
 
 // ---------------------------------------------------------------------------

@@ -313,6 +313,14 @@ class Parser {
       advance();
       return parse_static_if(loc, top_level);
     }
+    if (d == "asm") {  // `#asm { ... }` (the lexer made the block one String token)
+      advance();
+      if (top_level) fail(loc, "#asm is only allowed in a procedure body");
+      if (!at(Tok::String)) fail(cur().loc, "expected '{' after #asm");
+      const Token& t = advance();
+      accept(Tok::Semi);
+      return ast_.make<AsmStmt>(loc, t.text, t.loc);
+    }
     if (d == "assert") {
       advance();
       Expr* c = parse_expr();
