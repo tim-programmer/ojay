@@ -25,6 +25,7 @@ namespace {
 
 // Type_Info_Tag (core.jai, runtime/ojay_runtime.c)
 enum TiTag : int64_t {
+  TI_VARIANT = 15,
   TI_INTEGER = 0, TI_FLOAT = 1, TI_BOOL = 2, TI_STRING = 3, TI_POINTER = 4, TI_PROCEDURE = 5, TI_VOID = 6,
   TI_STRUCT = 7, TI_ARRAY = 8, TI_ANY = 10, TI_ENUM = 11, TI_TYPE = 13, TI_CODE = 14,
 };
@@ -111,11 +112,19 @@ class CodeGen {
 
   std::unordered_map<std::string, llvm::GlobalVariable*> strings_;
   std::unordered_map<Type*, llvm::Constant*> defaults_;
+  // Structs whose members are not simply the LLVM struct's elements in order
+  // (#align padding, #place overlaps): for each field, its element index, or
+  // -1 for a member that overlaps an earlier one (reached by byte offset).
+  struct StructLayout {
+    std::vector<int> elem;
+    bool simple = true;  // field i is element i, and there is no padding element
+  };
+  std::unordered_map<const Type*, StructLayout> layouts_;
   std::map<std::pair<const void*, Type*>, llvm::Constant*> const_globals_;
 
   // runtime functions
   llvm::FunctionCallee rt_print_, rt_sprint_, rt_write_, rt_alloc_, rt_free_, rt_realloc_, rt_bounds_,
-      rt_assert_, rt_streq_, rt_exit_, rt_args_, rt_array_reserve_, rt_init_, rt_cstring_;
+      rt_assert_, rt_streq_, rt_exit_, rt_args_, rt_array_reserve_, rt_init_, rt_cstring_, rt_alloc_aligned_;
 
   // The context: a pointer to the current Context (the default context's global
   // initially), replaced by push_context. Only programs that use the context
@@ -130,6 +139,7 @@ class CodeGen {
 
   llvm::Type* lt(Type* t) {
     if (t->llvm_type) return t->llvm_type;
+    if (t->distinct_of) return t->llvm_type = lt(t->distinct_of);  // the base's representation
     llvm::Type* r = nullptr;
     switch (t->kind) {
       case TypeKind::Void: r = void_; break;
@@ -172,9 +182,7 @@ class CodeGen {
           if (t->size > best_size) body.push_back(llvm::ArrayType::get(i8_, t->size - best_size));
           st->setBody(body);
         } else {
-          std::vector<llvm::Type*> body;
-          for (auto& f : t->fields) body.push_back(lt(f.type));
-          st->setBody(body);
+          st->setBody(struct_body(t));
         }
         return st;
       }
@@ -187,6 +195,75 @@ class CodeGen {
     }
     t->llvm_type = r;
     return r;
+  }
+
+  // The elements of struct t's LLVM type: its members at the offsets the type
+  // table gives (layout_struct), with i8 arrays as padding where LLVM's own
+  // placement would differ (#align), and without the members that overlap an
+  // earlier one (#place). Ordinary structs get exactly their members.
+  std::vector<llvm::Type*> struct_body(Type* t) {
+    StructLayout& L = layouts_[t];
+    size_t n = t->fields.size();
+    L.elem.assign(n, -1);
+    std::vector<size_t> order(n);
+    for (size_t i = 0; i < n; ++i) order[i] = i;
+    std::stable_sort(order.begin(), order.end(),
+                     [&](size_t a, size_t b) { return t->fields[a].offset < t->fields[b].offset; });
+    std::vector<llvm::Type*> body;
+    uint64_t cur = 0, al = 1;
+    for (size_t k = 0; k < n; ++k) {
+      size_t i = order[k];
+      if (i != k) L.simple = false;
+      const StructField& f = t->fields[i];
+      if ((uint64_t)f.offset < cur || (f.type->size == 0 && t->has_place)) {  // overlaps an earlier member
+        L.simple = false;
+        continue;
+      }
+      llvm::Type* et = lt(f.type);
+      uint64_t ea = dl_.getABITypeAlign(et).value();
+      uint64_t natural = (cur + ea - 1) / ea * ea;
+      if (natural > (uint64_t)f.offset)
+        throw CompileError(SourceLoc{}, cat("internal error: member '", f.name, "' of ", type_name(t),
+                                            " cannot be placed at offset ", f.offset));
+      if (natural < (uint64_t)f.offset) {
+        body.push_back(llvm::ArrayType::get(i8_, f.offset - cur));
+        L.simple = false;
+      }
+      L.elem[i] = (int)body.size();
+      body.push_back(et);
+      cur = (uint64_t)f.offset + dl_.getTypeAllocSize(et);
+      al = std::max(al, ea);
+    }
+    if ((cur + al - 1) / al * al != (uint64_t)t->size) {
+      body.push_back(llvm::ArrayType::get(i8_, (uint64_t)t->size - cur));
+      L.simple = false;
+    }
+    return body;
+  }
+
+  const StructLayout& layout(Type* t) {
+    t = const_cast<Type*>(t->underlying());
+    lt(t);
+    return layouts_.at(t);
+  }
+
+  // Struct values that are handled in memory rather than as LLVM aggregates
+  // (insertvalue / extractvalue): unions, and structs with padding or overlaps.
+  bool in_memory(Type* t) { return t->is_union || !layout(t).simple; }
+
+  // The address of field i of the struct (of type t) at `base`.
+  llvm::Value* field_addr(Type* t, llvm::Value* base, int i) {
+    if (t->is_union) return base;
+    const StructLayout& L = layout(t);
+    if (L.simple) return b_.CreateStructGEP(lt(t), base, (unsigned)i, t->fields[i].name);
+    if (L.elem[i] >= 0) return b_.CreateStructGEP(lt(t), base, (unsigned)L.elem[i], t->fields[i].name);
+    return b_.CreateConstInBoundsGEP1_64(i8_, base, (uint64_t)t->fields[i].offset, t->fields[i].name);
+  }
+
+  // The alignment of memory holding a t: LLVM's, or more for #align members.
+  uint64_t align_of(Type* t) {
+    uint64_t a = dl_.getPrefTypeAlign(mem_t(t)).value();
+    return std::max<uint64_t>(a, t->kind == TypeKind::Void ? 1 : (uint64_t)t->align);
   }
 
   // Memory type: void has no storage, so pointers to void elements use i8.
@@ -208,6 +285,12 @@ class CodeGen {
   const AbiSignature& c_sig(Type* pt, SourceLoc loc = {}) {
     auto it = c_sigs_.find(pt);
     if (it != c_sigs_.end()) return it->second;
+    for (Type* x : pt->params)
+      if (std::string why = c_abi_unsupported(x); !why.empty())
+        throw CompileError(loc, cat("#c_call/#foreign parameters of type ", type_name(x), " are not supported: ", why));
+    for (Type* x : pt->returns)
+      if (std::string why = c_abi_unsupported(x); !why.empty())
+        throw CompileError(loc, cat("#c_call/#foreign return type ", type_name(x), " is not supported: ", why));
     try {
       return c_sigs_.emplace(pt, cabi_->classify(pt)).first->second;
     } catch (const std::runtime_error& e) {
@@ -253,7 +336,7 @@ class CodeGen {
   llvm::AllocaInst* coerce_slot(Type* t, llvm::Type* coerced, uint64_t min_align = 1) {
     llvm::Type* vt = lt(t);
     uint64_t size = std::max<uint64_t>(dl_.getTypeAllocSize(vt), coerced ? dl_.getTypeAllocSize(coerced) : 0);
-    uint64_t align = std::max<uint64_t>(dl_.getPrefTypeAlign(vt).value(), min_align);
+    uint64_t align = std::max<uint64_t>(align_of(t), min_align);
     if (coerced) align = std::max<uint64_t>(align, dl_.getABITypeAlign(coerced).value());
     auto* a = make_alloca_raw(llvm::ArrayType::get(i8_, std::max<uint64_t>(size, 1)), "c_abi");
     a->setAlignment(llvm::Align(align));
@@ -390,6 +473,7 @@ class CodeGen {
     rt_sprint_ = rt("__ojay_sprint", void_, {ptr_, ptr_, i64_, ptr_, i64_, ptr_, ptr_});
     rt_write_ = rt("__ojay_write_string", void_, {ptr_, i64_, i32_});
     rt_alloc_ = rt("__ojay_alloc", ptr_, {i64_});
+    rt_alloc_aligned_ = rt("__ojay_alloc_aligned", ptr_, {i64_, i64_});
     rt_free_ = rt("__ojay_free", void_, {ptr_});
     rt_realloc_ = rt("__ojay_realloc", ptr_, {ptr_, i64_, i64_});
     rt_bounds_ = rt("__ojay_bounds_fail", void_, {i64_, i64_, ptr_, i64_, i32_}, true);
@@ -450,12 +534,12 @@ class CodeGen {
           std::vector<llvm::Constant*> elems;
           elems.reserve(es.size());
           for (const ConstValue& e : es) elems.push_back(const_value(e, t->elem));
-          return llvm::ConstantArray::get(llvm::cast<llvm::ArrayType>(lt(t)), elems);
+          return array_const(t, elems);
         }
         if (t->kind == TypeKind::Struct && !t->is_union && es.size() == t->fields.size()) {
           std::vector<llvm::Constant*> fields;
           for (size_t i = 0; i < es.size(); ++i) fields.push_back(const_value(es[i], t->fields[i].type));
-          return llvm::ConstantStruct::get(llvm::cast<llvm::StructType>(lt(t)), fields);
+          return struct_const(t, fields, /*consistent=*/true);
         }
         break;
       }
@@ -465,16 +549,92 @@ class CodeGen {
     throw CompileError(SourceLoc{}, "internal error: const_value of non-constant");
   }
 
+  // A constant fixed array. Elements whose constant has another LLVM type than
+  // the element type (a struct constant with overlapping members, see
+  // struct_const) make an equivalent literal struct of the same layout.
+  llvm::Constant* array_const(Type* t, const std::vector<llvm::Constant*>& elems) {
+    llvm::Type* et = lt(t->elem);
+    bool same = true;
+    for (llvm::Constant* c : elems) same &= c->getType() == et;
+    if (same) return llvm::ConstantArray::get(llvm::cast<llvm::ArrayType>(lt(t)), elems);
+    return llvm::ConstantStruct::getAnon(ctx_, elems, /*Packed=*/true);
+  }
+
+  // A constant of struct t (not a union) from one constant per field (null:
+  // zero). Normally a constant of lt(t). When a member that is not an element
+  // of lt(t) (it overlaps another, #place) has a value, or a value's LLVM type
+  // differs from the element's, the result is a packed literal struct with the
+  // same bytes: the values at their offsets, zero bytes between them. Values
+  // of overlapping members cannot both be kept; sema allows that only for
+  // `consistent` ones (#run results, whose bytes agree), where the larger is kept.
+  llvm::Constant* struct_const(Type* t, const std::vector<llvm::Constant*>& vals, bool consistent = false) {
+    const StructLayout& L = layout(t);
+    auto* st = llvm::cast<llvm::StructType>(lt(t));
+    bool fits = true;
+    for (size_t i = 0; i < vals.size(); ++i) {
+      if (!vals[i]) continue;
+      int el = L.simple ? (int)i : L.elem[i];
+      if (el < 0) {
+        if (!vals[i]->isNullValue()) fits = false;
+      } else if (vals[i]->getType() != st->getElementType((unsigned)el)) {
+        fits = false;
+      }
+    }
+    if (fits) {
+      std::vector<llvm::Constant*> es(st->getNumElements(), nullptr);
+      for (size_t i = 0; i < vals.size(); ++i) {
+        int el = L.simple ? (int)i : L.elem[i];
+        if (el >= 0 && vals[i]) es[(size_t)el] = vals[i];
+      }
+      for (unsigned k = 0; k < es.size(); ++k)
+        if (!es[k]) es[k] = llvm::Constant::getNullValue(st->getElementType(k));
+      return llvm::ConstantStruct::get(st, es);
+    }
+    // Pieces at their offsets.
+    std::vector<size_t> order;
+    for (size_t i = 0; i < vals.size(); ++i)
+      if (vals[i] && !vals[i]->isNullValue() && t->fields[i].type->size > 0) order.push_back(i);
+    std::stable_sort(order.begin(), order.end(),
+                     [&](size_t a, size_t b) { return t->fields[a].type->size > t->fields[b].type->size; });
+    std::vector<size_t> placed;
+    for (size_t i : order) {
+      bool clash = false;
+      for (size_t j : placed) clash |= fields_overlap(t, i, j);
+      if (!clash) placed.push_back(i);
+      else if (!consistent)
+        throw CompileError(SourceLoc{}, cat("internal error: overlapping values in a constant of ", type_name(t)));
+    }
+    std::sort(placed.begin(), placed.end(),
+              [&](size_t a, size_t b) { return t->fields[a].offset < t->fields[b].offset; });
+    std::vector<llvm::Constant*> es;
+    uint64_t cur = 0;
+    for (size_t i : placed) {
+      uint64_t off = (uint64_t)t->fields[i].offset;
+      if (off > cur) es.push_back(llvm::Constant::getNullValue(llvm::ArrayType::get(i8_, off - cur)));
+      es.push_back(vals[i]);
+      cur = off + dl_.getTypeAllocSize(vals[i]->getType());
+    }
+    if ((uint64_t)t->size > cur) es.push_back(llvm::Constant::getNullValue(llvm::ArrayType::get(i8_, t->size - cur)));
+    return llvm::ConstantStruct::getAnon(ctx_, es, /*Packed=*/true);
+  }
+
+  // A constant as a value of type t (an SSA value of lt(t)).
+  llvm::Value* const_rvalue(const ConstValue& cv, Type* t) {
+    llvm::Constant* c = const_value(cv, t);
+    if (c->getType() == lt(t)) return c;
+    return b_.CreateLoad(lt(t), const_global(cv, t));
+  }
+
   // A read-only global holding an aggregate constant, for code that needs its
   // address (indexing a table made by #run with a runtime index, iterating it).
   llvm::Constant* const_global(const ConstValue& cv, Type* t) {
     auto key = std::make_pair(static_cast<const void*>(cv.elems.get()), t);
     auto it = const_globals_.find(key);
     if (it != const_globals_.end()) return it->second;
-    auto* gv = new llvm::GlobalVariable(*mod_, lt(t), true, llvm::GlobalValue::PrivateLinkage, const_value(cv, t),
-                                        ".const");
+    llvm::Constant* c = const_value(cv, t);
+    auto* gv = new llvm::GlobalVariable(*mod_, c->getType(), true, llvm::GlobalValue::PrivateLinkage, c, ".const");
     gv->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
-    gv->setAlignment(dl_.getPrefTypeAlign(lt(t)));
+    gv->setAlignment(llvm::Align(align_of(t)));
     const_globals_[key] = gv;
     return gv;
   }
@@ -485,22 +645,15 @@ class CodeGen {
     if (it != defaults_.end()) return it->second;
     llvm::Constant* c = nullptr;
     if (t->kind == TypeKind::Struct && !t->is_union) {
-      std::vector<llvm::Constant*> fields;
-      bool all_zero = true;
-      for (auto& f : t->fields) {
-        llvm::Constant* fc = f.default_value ? const_init(f.default_value, f.type) : default_value(f.type);
-        if (!fc->isNullValue()) all_zero = false;
-        fields.push_back(fc);
-      }
-      c = all_zero ? llvm::Constant::getNullValue(lt(t))
-                   : llvm::ConstantStruct::get(llvm::cast<llvm::StructType>(lt(t)), fields);
+      c = struct_const(t, field_defaults(t, {}));
+      if (c->isNullValue()) c = llvm::Constant::getNullValue(lt(t));
     } else if (t->is_fixed_array()) {
       llvm::Constant* e = default_value(t->elem);
       if (e->isNullValue()) {
         c = llvm::Constant::getNullValue(lt(t));
       } else {
         std::vector<llvm::Constant*> elems(t->count, e);
-        c = llvm::ConstantArray::get(llvm::cast<llvm::ArrayType>(lt(t)), elems);
+        c = array_const(t, elems);
       }
     } else {
       c = llvm::Constant::getNullValue(lt(t));
@@ -509,26 +662,39 @@ class CodeGen {
     return c;
   }
 
+  // The initial value of each field of struct t (null: zero): its default, or
+  // its type's, except for members overlapping one that `given` sets (#place).
+  std::vector<llvm::Constant*> field_defaults(Type* t, const std::vector<Expr*>& given) {
+    std::vector<llvm::Constant*> out(t->fields.size(), nullptr);
+    for (size_t i = 0; i < t->fields.size(); ++i) {
+      const StructField& f = t->fields[i];
+      if (f.uninit) continue;
+      bool overridden = false;
+      for (size_t j = 0; j < given.size() && t->has_place; ++j)
+        overridden |= j != i && given[j] && fields_overlap(t, i, j);
+      if (overridden) continue;
+      llvm::Constant* fc = f.default_value ? const_init(f.default_value, f.type) : default_value(f.type);
+      if (!fc->isNullValue() || !t->has_place) out[i] = fc;
+    }
+    return out;
+  }
+
   // Constant initializer for a statically-initializable expression.
   llvm::Constant* const_init(Expr* e, Type* t) {
     if (e->is_const()) return const_value(e->cv, e->type);
     switch (e->kind) {
       case NK::StructLit: {
         auto* s = static_cast<StructLit*>(e);
-        std::vector<llvm::Constant*> fields;
-        for (size_t i = 0; i < s->field_values.size(); ++i) {
-          auto& f = s->type->fields[i];
-          if (s->field_values[i]) fields.push_back(const_init(s->field_values[i], f.type));
-          else if (f.default_value) fields.push_back(const_init(f.default_value, f.type));
-          else fields.push_back(default_value(f.type));
-        }
-        return llvm::ConstantStruct::get(llvm::cast<llvm::StructType>(lt(s->type)), fields);
+        std::vector<llvm::Constant*> fields = field_defaults(s->type, s->field_values);
+        for (size_t i = 0; i < s->field_values.size(); ++i)
+          if (s->field_values[i]) fields[i] = const_init(s->field_values[i], s->type->fields[i].type);
+        return struct_const(s->type, fields);
       }
       case NK::ArrayLit: {
         auto* a = static_cast<ArrayLit*>(e);
         std::vector<llvm::Constant*> elems;
         for (Expr* x : a->elems) elems.push_back(const_init(x, a->type->elem));
-        return llvm::ConstantArray::get(llvm::cast<llvm::ArrayType>(lt(a->type)), elems);
+        return array_const(a->type, elems);
       }
       case NK::ProcLit:
         return static_cast<ProcLit*>(e)->llvm_fn;
@@ -605,6 +771,19 @@ class CodeGen {
     const auto& ti = prog_.type_info;
     Type* st = ti.info;
     int64_t tag = TI_VOID;
+    if (t->distinct_of) {  // Type_Info_Variant: the name, and the base's Type_Info
+      std::string name = type_name(t);
+      auto* gv = new llvm::GlobalVariable(*mod_, lt(ti.variant), true, llvm::GlobalValue::PrivateLinkage, nullptr,
+                                          "__type_info." + name);
+      t->type_info = gv;
+      TiFields v;
+      v["type"] = llvm::ConstantInt::get(i64_, TI_VARIANT);
+      v["runtime_size"] = llvm::ConstantInt::get(i64_, size_of(t));
+      v["name"] = string_const(name);
+      v["variant_of"] = type_info(t->distinct_of);
+      gv->setInitializer(ti_const(ti.variant, v));
+      return gv;
+    }
     switch (t->kind) {
       case TypeKind::Int: tag = TI_INTEGER; st = ti.integer; break;
       case TypeKind::Float: tag = TI_FLOAT; st = ti.float_; break;
@@ -660,20 +839,32 @@ class CodeGen {
       }
       case TypeKind::Struct: {
         v["name"] = string_const(name);
-        v["textual_flags"] = i32c(t->is_union ? 0x2 : 0);
-        auto* sty = llvm::cast<llvm::StructType>(lt(t));
-        const llvm::StructLayout* sl = t->is_union ? nullptr : dl_.getStructLayout(sty);
+        v["textual_flags"] = i32c((t->is_union ? 0x2 : 0) | (t->has_align ? 0x10 : 0));
         std::vector<llvm::Constant*> ms;
+        size_t next_const = 0;
+        auto add_constants = [&](size_t before) {  // the constants declared before field `before`
+          for (; next_const < t->constants.size() && t->constants[next_const].field_index <= before; ++next_const) {
+            const StructConstant& k = t->constants[next_const];
+            TiFields mv;
+            mv["name"] = string_const(k.name);
+            mv["type"] = type_info(k.type);
+            mv["offset_in_bytes"] = llvm::ConstantInt::get(i64_, 0);
+            mv["flags"] = i32c(0x1 | (k.type->is_proc() ? 0x8 : 0));  // CONSTANT
+            ms.push_back(ti_const(prog_.type_info.member, mv));
+          }
+        };
         for (size_t i = 0; i < t->fields.size(); ++i) {
+          add_constants(i);
           const StructField& f = t->fields[i];
           TiFields mv;
           mv["name"] = string_const(f.name);
           mv["type"] = type_info(f.type);
-          mv["offset_in_bytes"] = llvm::ConstantInt::get(i64_, sl ? sl->getElementOffset(i) : 0);
+          mv["offset_in_bytes"] = llvm::ConstantInt::get(i64_, (uint64_t)f.offset);
           uint32_t flags = (f.is_using ? 0x4 : 0) | (f.anonymous ? 0x100 : 0) | (f.type->is_proc() ? 0x8 : 0);
           mv["flags"] = i32c(flags);
           ms.push_back(ti_const(prog_.type_info.member, mv));
         }
+        add_constants(SIZE_MAX);
         v["members"] = ti_view(lt(prog_.type_info.member), ms, "__type_info_members." + name);
         break;
       }
@@ -725,14 +916,27 @@ class CodeGen {
   }
 
   void declare_global(Symbol* g) {
-    g->llvm_value = new llvm::GlobalVariable(*mod_, lt(g->type), false, llvm::GlobalValue::InternalLinkage, nullptr,
-                                             g->name);
+    auto* gv = new llvm::GlobalVariable(*mod_, lt(g->type), false, llvm::GlobalValue::InternalLinkage, nullptr, g->name);
+    gv->setAlignment(llvm::Align(align_of(g->type)));
+    g->llvm_value = gv;
   }
 
   void init_global(Symbol* g) {
     llvm::Constant* init = g->init ? const_init(g->init, g->type) : default_value(g->type);
     if (g->decl && g->decl->uninit) init = llvm::Constant::getNullValue(lt(g->type));
-    llvm::cast<llvm::GlobalVariable>(g->llvm_value)->setInitializer(init);
+    auto* gv = llvm::cast<llvm::GlobalVariable>(g->llvm_value);
+    if (init->getType() != gv->getValueType()) {
+      // A constant of the same layout but another LLVM type (struct_const):
+      // the global takes its type; uses only need its address.
+      auto* ng = new llvm::GlobalVariable(*mod_, init->getType(), false, gv->getLinkage(), init, "", gv);
+      ng->setAlignment(gv->getAlign());
+      ng->takeName(gv);
+      gv->replaceAllUsesWith(ng);
+      gv->eraseFromParent();
+      g->llvm_value = ng;
+      return;
+    }
+    gv->setInitializer(init);
   }
 
   void emit_context_pointer() {
@@ -773,7 +977,7 @@ class CodeGen {
   llvm::AllocaInst* make_alloca(Type* t, const std::string& name = "") {
     llvm::IRBuilder<> eb(entry_, entry_->begin());
     auto* a = eb.CreateAlloca(lt(t), nullptr, name);
-    a->setAlignment(dl_.getPrefTypeAlign(lt(t)));
+    a->setAlignment(llvm::Align(align_of(t)));
     return a;
   }
 
@@ -1370,7 +1574,7 @@ class CodeGen {
         switch (m->mkind) {
           case MemberKind::Field:
             for (int i : m->field_path) {
-              if (!bt->is_union) base = b_.CreateStructGEP(lt(bt), base, i, bt->fields[i].name);
+              base = field_addr(bt, base, i);
               bt = bt->fields[i].type;
             }
             return base;
@@ -1450,7 +1654,7 @@ class CodeGen {
   }
 
   llvm::Value* rvalue(Expr* e) {
-    if (e->is_const()) return const_value(e->cv, e->type);
+    if (e->is_const()) return const_rvalue(e->cv, e->type);
     switch (e->kind) {
       case NK::Ident: {
         Symbol* s = static_cast<Ident*>(e)->sym;
@@ -1488,7 +1692,17 @@ class CodeGen {
             if (s->field_values[i]) b_.CreateStore(rvalue(s->field_values[i]), tmp);
           return b_.CreateLoad(lt(t), tmp);
         }
-        llvm::Value* agg = default_value(t);
+        llvm::Constant* defaults = default_value(t);
+        if (in_memory(t) || defaults->getType() != lt(t)) {
+          // Built in memory: the defaults (but not of members overlapping a
+          // given one, #place), then the given members.
+          auto* tmp = make_alloca(t, "struct.tmp");
+          b_.CreateStore(struct_const(t, field_defaults(t, s->field_values)), tmp);
+          for (size_t i = 0; i < s->field_values.size(); ++i)
+            if (s->field_values[i]) b_.CreateStore(rvalue(s->field_values[i]), field_addr(t, tmp, (int)i));
+          return b_.CreateLoad(lt(t), tmp);
+        }
+        llvm::Value* agg = defaults;
         for (size_t i = 0; i < s->field_values.size(); ++i)
           if (s->field_values[i]) agg = b_.CreateInsertValue(agg, rvalue(s->field_values[i]), i);
         return agg;
@@ -1539,7 +1753,7 @@ class CodeGen {
         {
           std::vector<unsigned> idx;
           for (Type* t = m->base->type; int i : m->field_path) {
-            if (t->is_union) return b_.CreateLoad(lt(m->type), lvalue(m));
+            if (in_memory(t)) return b_.CreateLoad(lt(m->type), lvalue(m));
             idx.push_back(i);
             t = t->fields[i].type;
           }
@@ -1721,7 +1935,7 @@ class CodeGen {
   }
 
   llvm::Value* convert(llvm::Value* v, Type* from, Type* to) {
-    if (from == to) return v;
+    if (from == to || from->underlying() == to->underlying()) return v;  // distinct types: the same representation
     auto intlike = [](Type* t) { return t->kind == TypeKind::Int || t->kind == TypeKind::Enum; };
     llvm::Type* dst = lt(to);
     if (intlike(from) && intlike(to)) {
@@ -1750,7 +1964,7 @@ class CodeGen {
 
   llvm::Value* emit_call(Call* c) {
     if (c->builtin != Builtin::None) return emit_builtin(c);
-    if (c->is_const()) return const_value(c->cv, c->type);
+    if (c->is_const()) return const_rvalue(c->cv, c->type);
     llvm::Value* callee;
     Ident* id = c->callee->kind == NK::Ident ? static_cast<Ident*>(c->callee) : nullptr;
     if (id && id->sym->kind == SymKind::Proc) callee = id->sym->proc->llvm_fn;
@@ -1821,7 +2035,13 @@ class CodeGen {
                              allocator});
   }
 
-  llvm::Value* alloc_bytes(Call* c, llvm::Value* size) {
+  // `t`: the type allocated (New / NewArray), whose alignment may be more than the heap's.
+  llvm::Value* alloc_bytes(Call* c, llvm::Value* size, Type* t = nullptr) {
+    if (t && t->align > T.heap_align()) {
+      llvm::Value* al = llvm::ConstantInt::get(i64_, (uint64_t)t->align);
+      if (!prog_.uses_context) return b_.CreateCall(rt_alloc_aligned_, {size, al});
+      return b_.CreateCall(prog_.allocate_aligned_proc->llvm_fn, {size, al, allocator_arg(c)});
+    }
     if (!prog_.uses_context) return b_.CreateCall(rt_alloc_, {size});
     return allocate(MODE_ALLOCATE, size, llvm::ConstantInt::get(i64_, 0), null_ptr(), allocator_arg(c));
   }
@@ -1903,13 +2123,15 @@ class CodeGen {
       }
       case Builtin::RawAlloc:
         return b_.CreateCall(rt_alloc_, {rvalue(a[0])});
+      case Builtin::RawAllocAligned:
+        return b_.CreateCall(rt_alloc_aligned_, {rvalue(a[0]), rvalue(a[1])});
       case Builtin::RawFree:
         b_.CreateCall(rt_free_, {rvalue(a[0])});
         return nullptr;
       case Builtin::RawRealloc:
         return b_.CreateCall(rt_realloc_, {rvalue(a[0]), rvalue(a[1]), rvalue(a[2])});
       case Builtin::New: {
-        llvm::Value* p = alloc_bytes(c, llvm::ConstantInt::get(i64_, size_of(c->type_arg)));
+        llvm::Value* p = alloc_bytes(c, llvm::ConstantInt::get(i64_, size_of(c->type_arg)), c->type_arg);
         if (!c->no_init) store_default(p, c->type_arg);
         return p;
       }
@@ -1917,7 +2139,7 @@ class CodeGen {
         Type* et = c->type_arg;
         llvm::Value* n = rvalue(a[0]);
         llvm::Value* bytes = b_.CreateMul(n, llvm::ConstantInt::get(i64_, size_of(et)));
-        llvm::Value* p = alloc_bytes(c, bytes);
+        llvm::Value* p = alloc_bytes(c, bytes, et);
         llvm::Constant* d = default_value(et);
         if (c->no_init) {
           // left uninitialized

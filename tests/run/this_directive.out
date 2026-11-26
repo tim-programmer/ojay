@@ -1,0 +1,5 @@
+3 nodes, sum 6, List(s32) self true, fact 120
+type_of(Node.next) = *Node
+2.5 1.5 
+List(int).Self = List(s64), List(float).Self = List(float32)
+f == main: true, factorial(6) = 720

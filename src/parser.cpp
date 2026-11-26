@@ -579,15 +579,24 @@ class Parser {
     return e->kind == NK::StructDef || e->kind == NK::EnumDef;
   }
 
-  void parse_decl_rest(Decl* d) {
+  // `member` (a struct member): `#align N` may follow the type or the value.
+  void parse_decl_rest(Decl* d, bool member = false) {
+    auto align = [&] {
+      if (!member || !at_directive("align")) return;
+      SourceLoc loc = advance().loc;
+      if (d->align) fail(loc, "a member can only have one #align");
+      d->align = parse_unary();
+    };
     if (accept(Tok::ColonColon)) {
       d->is_const = true;
       d->values = parse_expr_list();
     } else if (accept(Tok::ColonEq)) {
       d->values = parse_expr_list();
+      align();
     } else {
       expect(Tok::Colon);
       d->type_expr = parse_type();
+      align();
       if (accept(Tok::Eq)) {
         if (accept(Tok::TripleDash)) d->uninit = true;
         else d->values = parse_expr_list();
@@ -595,7 +604,11 @@ class Parser {
         d->is_const = true;
         d->values = parse_expr_list();
       }
+      if (!d->is_const && !d->uninit && !d->values.empty()) align();
     }
+    if (at_directive("align"))
+      fail(cur().loc, member ? "#align must follow the member's type or value"
+                             : "#align is only supported on struct members yet (not on variables)");
     if (!d->values.empty() && ends_with_block(d->values.back())) {
       accept(Tok::Semi);
     } else {
@@ -896,7 +909,8 @@ class Parser {
       lit->here_string = true;
       return lit;
     }
-    if (d == "type") return parse_type();
+    if (d == "type") return parse_type_directive(loc);
+    if (d == "this") return ast_.make<DirectiveExpr>(loc, "this", nullptr);
     if (d == "system_library" || d == "library") {
       skip_directive_modifiers();
       std::string n = expect(Tok::String, "library name").text;
@@ -964,7 +978,11 @@ class Parser {
       case Tok::Directive:
         if (cur().text == "type") {
           advance();
-          return parse_type();
+          return parse_type_directive(loc);
+        }
+        if (cur().text == "this") {
+          advance();
+          return ast_.make<DirectiveExpr>(loc, "this", nullptr);
         }
         fail(loc, "unexpected directive '#", cur().text, "' in type");
       case Tok::Dollar: {
@@ -998,6 +1016,20 @@ class Parser {
       default:
         fail(loc, "expected a type, found ", describe(cur()));
     }
+  }
+
+  // After `#type`: a type, or `#type,distinct T` (a distinct type).
+  Expr* parse_type_directive(SourceLoc loc) {
+    if (accept(Tok::Comma)) {
+      std::string m = at(Tok::Ident) ? cur().text : "";
+      if (m == "distinct") {
+        advance();
+        return ast_.make<DirectiveExpr>(loc, "distinct", parse_type());
+      }
+      if (m == "isa") fail(cur().loc, "#type,isa is not supported yet (use #type,distinct)");
+      fail(cur().loc, "unknown #type modifier ", describe(cur()), " (expected 'distinct')");
+    }
+    return parse_type();
   }
 
   Expr* parse_proc_type() {
@@ -1156,8 +1188,14 @@ class Parser {
       expect(Tok::RParen, "after struct parameters");
       if (s->params.empty()) fail(s->loc, "a parameterized struct needs at least one parameter");
     }
+    auto reject_align = [&] {
+      if (at_directive("align"))
+        fail(cur().loc, "#align cannot be applied to a struct (in Jai it has no effect there); "
+             "put #align on its members");
+    };
     while (at(Tok::Directive)) {
       if (cur().text == "modify") fail(cur().loc, "#modify on structs is not supported yet");
+      reject_align();
       // #type_info_none etc. are accepted and ignored
       advance();
     }
@@ -1168,17 +1206,23 @@ class Parser {
       s->members.push_back(parse_struct_member());
     }
     advance();
+    reject_align();
     return s;
   }
 
  public:
   // One member declaration of a struct body (or `#insert expr;`).
   Decl* parse_struct_member() {
-    if (at(Tok::Directive) && (cur().text == "as" || cur().text == "place" || cur().text == "align")) {
-      fail(cur().loc, "#", cur().text, " in structs is not supported yet");
-    }
+    if (at_directive("as")) fail(cur().loc, "#as in structs is not supported yet");
+    if (at_directive("align")) fail(cur().loc, "#align must follow a member's type: name: T #align N;");
     SourceLoc loc = cur().loc;
     auto* d = ast_.make<Decl>(loc);
+    if (at_directive("place")) {  // `#place m;`: the next members start at m's offset
+      advance();
+      d->place_name = expect_ident("member name after #place");
+      expect(Tok::Semi, "after #place");
+      return d;
+    }
     if (at_directive("insert")) {  // members made at compile time
       advance();
       reject_insert_modifiers();
@@ -1197,8 +1241,8 @@ class Parser {
       d->names.push_back({expect_ident("member name"), cur().loc});
       if (!accept(Tok::Comma)) break;
     }
-    parse_decl_rest(d);
-    if (d->is_const) fail(loc, "constants inside structs are not supported yet");
+    parse_decl_rest(d, /*member=*/true);
+    if (d->is_const && d->is_using) fail(loc, "'using' is not allowed on a struct constant");
     return d;
   }
 

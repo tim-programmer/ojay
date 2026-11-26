@@ -324,9 +324,11 @@ class Machine {
     return r.base + off;
   }
   u64 alloc_stack(Type* t, SourceLoc loc) { return alloc(stack_, sz(t), al(t), loc); }
-  u64 heap_alloc(int64_t size, SourceLoc loc) {
+  u64 heap_alloc(int64_t size, SourceLoc loc, int64_t align = 16) {
     if (size < 0) err(loc, "cannot allocate a negative number of bytes (", size, ")");
-    u64 a = alloc(heap_, size > 0 ? size : 1, 16, loc);
+    if (align < 16) align = 16;
+    if ((align & (align - 1)) != 0) err(loc, "alignment ", align, " is not a power of two");
+    u64 a = alloc(heap_, size > 0 ? size : 1, align, loc);
     heap_blocks_[a] = size;
     return a;
   }
@@ -441,6 +443,10 @@ class Machine {
     t = conc(t);
     Type* st = ti.info;
     int64_t g = 6;  // VOID
+    if (t->distinct_of) {
+      if (tag) *tag = 15;  // VARIANT
+      return ti.variant;
+    }
     switch (t->kind) {
       case TypeKind::Int: g = 0; st = ti.integer; break;
       case TypeKind::Float: g = 1; st = ti.float_; break;
@@ -463,6 +469,7 @@ class Machine {
   void fill_type_info(size_t off, Type* t, SourceLoc loc) {
     const Program::TypeInfoTypes& ti = in_.host.type_info_types();
     t = conc(t);
+    in_.host.prepare_type(t);
     int64_t tag;
     Type* st = type_info_struct(t, &tag);
     if (sz(st) > (int64_t)kTypeStride)
@@ -475,6 +482,14 @@ class Machine {
     };
     put("type", 4, (u64)tag);
     put("runtime_size", 8, (t->kind == TypeKind::Void || t->kind == TypeKind::Tuple) ? 0 : (u64)sz(t));
+    if (t->distinct_of) {  // Type_Info_Variant
+      std::string name = type_name(t);
+      u64 name_str = intern(name, loc);
+      put("name", 8, name.size());
+      store_u(typeinfo_.data() + off + ti_offset(st, "name") + 8, ps_, name_str);
+      put("variant_of", ps_, in_.type_id(t->distinct_of));
+      return;
+    }
     switch (t->kind) {
       case TypeKind::Int: put("signed", 1, t->is_signed ? 1 : 0); break;
       case TypeKind::Pointer: put("pointer_to", ps_, in_.type_id(t->elem)); break;
@@ -512,22 +527,38 @@ class Machine {
         u64 name_str = name.empty() ? 0 : intern(name, loc);
         put("name", 8, name.size());
         store_u(typeinfo_.data() + off + ti_offset(st, "name") + 8, ps_, name_str);
-        put("textual_flags", 4, t->is_union ? 0x2 : 0);
+        put("textual_flags", 4, (t->is_union ? 0x2 : 0) | (t->has_align ? 0x10 : 0));
         Type* mt = ti.member;
-        int64_t n = (int64_t)t->fields.size();
+        // The fields with the constants among them (as codegen lists them).
+        struct M { const std::string* name; Type* type; int64_t offset; uint32_t flags; };
+        std::vector<M> list;
+        size_t k = 0;
+        auto consts_before = [&](size_t i) {
+          for (; k < t->constants.size() && t->constants[k].field_index <= i; ++k) {
+            const StructConstant& c = t->constants[k];
+            list.push_back({&c.name, c.type, 0, 0x1u | (c.type->is_proc() ? 0x8u : 0u)});
+          }
+        };
+        for (size_t i = 0; i < t->fields.size(); ++i) {
+          consts_before(i);
+          const StructField& f = t->fields[i];
+          uint32_t flags = (f.is_using ? 0x4 : 0) | (f.anonymous ? 0x100 : 0) | (conc(f.type)->is_proc() ? 0x8 : 0);
+          list.push_back({&f.name, f.type, f.offset, flags});
+        }
+        consts_before(SIZE_MAX);
+        int64_t n = (int64_t)list.size();
         int64_t msz = sz(mt);
         u64 members = ti_array(n, msz, mt->align, loc);
         for (int64_t i = 0; i < n; ++i) {
-          const StructField& f = t->fields[(size_t)i];
-          u64 s_addr = f.name.empty() ? 0 : intern(f.name, loc);
+          const M& m = list[(size_t)i];
+          u64 s_addr = m.name->empty() ? 0 : intern(*m.name, loc);
           uint8_t* p = at(members + (u64)(i * msz), msz, loc);
           int64_t no = ti_offset(mt, "name");
-          store_u(p + no, 8, f.name.size());
+          store_u(p + no, 8, m.name->size());
           store_u(p + no + 8, ps_, s_addr);
-          store_u(p + ti_offset(mt, "type"), ps_, in_.type_id(f.type));
-          store_u(p + ti_offset(mt, "offset_in_bytes"), 8, (u64)f.offset);
-          uint32_t flags = (f.is_using ? 0x4 : 0) | (f.anonymous ? 0x100 : 0) | (conc(f.type)->is_proc() ? 0x8 : 0);
-          store_u(p + ti_offset(mt, "flags"), 4, flags);
+          store_u(p + ti_offset(mt, "type"), ps_, in_.type_id(m.type));
+          store_u(p + ti_offset(mt, "offset_in_bytes"), 8, (u64)m.offset);
+          store_u(p + ti_offset(mt, "flags"), 4, m.flags);
         }
         put_view("members", n, members);
         break;
@@ -1394,6 +1425,21 @@ class Machine {
         auto* s = static_cast<StructLit*>(e);
         Type* t = s->type;
         Val v = t->is_union ? Val(sz(t)) : default_val(t, s->loc);
+        if (t->has_place) {  // no defaults of members that overlap a given one (as codegen does)
+          v = Val(sz(t));
+          for (size_t i = 0; i < t->fields.size(); ++i) {
+            const StructField& f = t->fields[i];
+            bool overridden = false;
+            for (size_t j = 0; j < s->field_values.size(); ++j)
+              overridden |= j != i && s->field_values[j] && fields_overlap(t, i, j);
+            if (overridden || f.uninit) continue;
+            Val fv;
+            if (f.default_value) fv = eval(f.default_value);
+            else if (needs_default(f.type)) fv = default_val(f.type, s->loc);
+            else continue;
+            std::memcpy(v.data() + f.offset, fv.data(), (size_t)fv.size());
+          }
+        }
         for (size_t i = 0; i < s->field_values.size(); ++i) {
           if (!s->field_values[i]) continue;
           Val fv = eval(s->field_values[i]);
@@ -1639,7 +1685,7 @@ class Machine {
   Val convert(const Val& v, Type* from, Type* to, SourceLoc loc) {
     from = conc(from);
     to = conc(to);
-    if (from == to) return v;
+    if (from == to || from->underlying() == to->underlying()) return v;  // distinct types: the same bytes
     if (intlike(from) && intlike(to)) return make_int(to, get_int(v, from));
     if (intlike(from) && to->kind == TypeKind::Float) {
       u64 x = get_int(v, from);
@@ -1959,6 +2005,21 @@ class Machine {
   }
   u64 allocator_arg(Call* c) { return c->allocator ? addr_of(c->allocator) : 0; }
 
+  // New / NewArray of `size` bytes of t: as the compiled program does, with
+  // __allocate_aligned when t is aligned more than the heap guarantees.
+  u64 allocate_for(Type* t, i64 size, u64 allocator, SourceLoc loc) {
+    if (al(t) <= T.heap_align()) return allocate(ALLOCATE, size, 0, 0, allocator, loc);
+    ProcLit* p = in_.host.allocate_aligned_proc();
+    if (!p || !in_.host.allocate_proc()) return heap_alloc(size, loc, al(t));
+    size_t base = args_.size();
+    args_.push_back(make_int(T.s64, (u64)size));
+    args_.push_back(make_int(T.s64, (u64)al(t)));
+    args_.push_back(make_ptr(allocator));
+    Val r = invoke(p, base, loc);
+    args_.resize(base);
+    return get_ptr(r);
+  }
+
   // As __ojay_array_reserve in the runtime.
   void reserve(u64 arr, int64_t esz, i64 needed, SourceLoc loc, bool exact = false) {
     i64 allocated = load_i64(arr + (u64)dyn_allocated_off(), loc);
@@ -2057,6 +2118,10 @@ class Machine {
         return make_ptr(allocate(RESIZE, n, old, p, allocator_arg(c), loc));
       }
       case Builtin::RawAlloc: return make_ptr(heap_alloc((i64)get_int(eval(a[0]), a[0]->type), loc));
+      case Builtin::RawAllocAligned: {
+        i64 n = (i64)get_int(eval(a[0]), a[0]->type);
+        return make_ptr(heap_alloc(n, loc, (i64)get_int(eval(a[1]), a[1]->type)));
+      }
       case Builtin::RawFree: heap_free(get_ptr(eval(a[0])), loc); return Val();
       case Builtin::RawRealloc: {
         u64 p = get_ptr(eval(a[0]));
@@ -2065,7 +2130,7 @@ class Machine {
         return make_ptr(heap_realloc(p, n, loc));
       }
       case Builtin::New: {
-        u64 p = allocate(ALLOCATE, sz(c->type_arg), 0, 0, allocator_arg(c), loc);
+        u64 p = allocate_for(c->type_arg, sz(c->type_arg), allocator_arg(c), loc);
         if (!c->no_init && needs_default(c->type_arg)) store(p, default_val(c->type_arg, loc), loc);
         else if (!c->no_init && sz(c->type_arg)) std::memset(at(p, sz(c->type_arg), loc), 0, (size_t)sz(c->type_arg));
         return make_ptr(p);
@@ -2074,7 +2139,7 @@ class Machine {
         Type* et = c->type_arg;
         i64 n = (i64)get_int(eval(a[0]), a[0]->type);
         if (n < 0) err(loc, "NewArray with a negative count (", n, ")");
-        u64 p = allocate(ALLOCATE, n * sz(et), 0, 0, allocator_arg(c), loc);
+        u64 p = allocate_for(et, n * sz(et), allocator_arg(c), loc);
         if (c->no_init) {
           // left as it is
         } else if (!needs_default(et)) {

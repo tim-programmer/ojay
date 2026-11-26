@@ -138,26 +138,76 @@ Type* TypeTable::new_enum(const std::string& name, Type* base, bool flags) {
   return t;
 }
 
+Type* TypeTable::new_distinct(const std::string& name, Type* base) {
+  owned_.push_back(std::make_unique<Type>(base->kind));
+  Type* t = owned_.back().get();
+  t->distinct_of = base;
+  t->name = name;
+  copy_distinct(t);
+  return t;
+}
+
+void TypeTable::copy_distinct(Type* t) {
+  const Type* b = t->distinct_of;
+  t->size = b->size;
+  t->align = b->align;
+  t->bits = b->bits;
+  t->is_signed = b->is_signed;
+  t->elem = b->elem;
+  t->array_kind = b->array_kind;
+  t->count = b->count;
+  t->fields = b->fields;
+  t->is_union = b->is_union;
+  t->has_place = b->has_place;
+  t->has_align = b->has_align;
+  t->constants = b->constants;
+  t->layout_state = b->layout_state;
+  t->members = b->members;
+  t->is_flags = b->is_flags;
+  t->params = b->params;
+  t->returns = b->returns;
+  t->c_call = b->c_call;
+  t->variadic = b->variadic;
+  t->elems = b->elems;
+}
+
+// Members are placed in order, each at the next offset that is a multiple of
+// its alignment (its #align, if larger than its type's). A member after
+// `#place m;` starts from m's offset instead of the end of the previous one,
+// so members can overlap; the size covers the furthest member.
 void TypeTable::layout_struct(Type* t) {
-  int64_t off = 0, al = 1;
+  int64_t off = 0, end = 0, al = 1;
   for (auto& f : t->fields) {
+    int64_t fa = std::max(f.type->align, f.align);
     if (t->is_union) {
       f.offset = 0;
-      off = std::max(off, f.type->size);
+      off = f.type->size;
     } else {
-      off = align_up(off, f.type->align);
+      if (f.place >= 0) off = t->fields[(size_t)f.place].offset;
+      off = align_up(off, fa);
       f.offset = off;
       off += f.type->size;
     }
-    al = std::max(al, f.type->align);
+    end = std::max(end, off);
+    al = std::max(al, fa);
   }
-  t->size = align_up(off, al);
+  t->size = align_up(end, al);
   t->align = al;
   t->layout_state = Type::LayoutState::Done;
 }
 
+bool fields_overlap(const Type* t, size_t i, size_t j) {
+  if (i == j) return true;
+  const StructField& a = t->fields[i];
+  const StructField& b = t->fields[j];
+  if (a.type->size == 0 || b.type->size == 0) return false;
+  if (t->is_union) return true;
+  return a.offset < b.offset + b.type->size && b.offset < a.offset + a.type->size;
+}
+
 std::string type_name(const Type* t) {
   if (!t) return "<null type>";
+  if (t->distinct_of) return t->name;
   switch (t->kind) {
     case TypeKind::Pointer:
       return "*" + type_name(t->elem);

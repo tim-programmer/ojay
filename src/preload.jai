@@ -175,6 +175,22 @@ __allocate :: (mode: Allocator_Mode, size: s64, old_size: s64, old_memory: *void
     return allocator.proc(mode, size, old_size, old_memory, allocator.data);
 }
 
+// New / NewArray of a type aligned more than the heap guarantees (#align
+// members): the runtime's heap is asked for an aligned block (which free
+// accepts as usual). Other allocators are not asked for an alignment (their
+// procedures have no parameter for it): what they return is checked.
+__allocate_aligned :: (size: s64, alignment: s64, a: *Allocator) -> *void {
+    allocator := a;
+    if !allocator || !allocator.proc  allocator = *context.allocator;
+    if allocator.proc == default_allocator_proc  return __ojay_raw_alloc_aligned(size, alignment);
+    p := allocator.proc(.ALLOCATE, size, 0, null, allocator.data);
+    if (cast(u64) p) & cast(u64) (alignment - 1) {
+        write_string("New: the allocator returned memory that is not aligned as the type needs (#align)\n", true);
+        exit(1);
+    }
+    return p;
+}
+
 __default_temporary_storage: Temporary_Storage;
 
 __default_context: Context = .{

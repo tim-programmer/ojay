@@ -53,7 +53,7 @@ typedef struct {
 enum {
   TI_INTEGER = 0, TI_FLOAT = 1, TI_BOOL = 2, TI_STRING = 3, TI_POINTER = 4, TI_PROCEDURE = 5, TI_VOID = 6,
   TI_STRUCT = 7, TI_ARRAY = 8, TI_OVERLOAD_SET = 9, TI_ANY = 10, TI_ENUM = 11, TI_POLYMORPHIC_VARIABLE = 12,
-  TI_TYPE = 13, TI_CODE = 14,
+  TI_TYPE = 13, TI_CODE = 14, TI_VARIANT = 15,
 };
 
 typedef struct OTypeInfo {
@@ -88,6 +88,14 @@ typedef struct {
 } OTypeInfoMember;
 
 enum { TI_STRUCT_UNION = 0x2 };
+enum { TI_MEMBER_CONSTANT = 0x1 };
+
+/* Type_Info_Variant: a distinct type. */
+typedef struct {
+  OTypeInfo info;
+  OString name;
+  const OTypeInfo *variant_of;
+} OTypeInfoVariant;
 
 typedef struct {
   OTypeInfo info;
@@ -477,6 +485,13 @@ static void *plat_alloc(int64_t size) {
   return p;
 }
 static void plat_free(void *p) { free(p); }
+int posix_memalign(void **p, size_t align, size_t n);
+static void *plat_alloc_aligned(int64_t size, int64_t align) {
+  if (align <= 16) return plat_alloc(size);
+  void *p = 0;
+  if (size < 0 || posix_memalign(&p, (size_t)align, size > 0 ? (size_t)size : 1) != 0) heap_out_of_memory(size);
+  return p;
+}
 static void *plat_realloc(void *p, int64_t size) {
   void *q = size < 0 ? 0 : realloc(p, size > 0 ? (size_t)size : 1);
   if (!q) heap_out_of_memory(size);
@@ -628,6 +643,33 @@ static void *plat_alloc(int64_t n) {
       return blk_payload(b);
     }
     if (!heap_add_arena(need)) heap_out_of_memory(n);
+  }
+}
+
+/* A block whose payload is `align`-aligned (a power of two above HEAP_ALIGN):
+ * the first free block with room for it after a gap that is big enough to be
+ * a free block of its own (or no gap at all). free() takes it as usual. */
+static void *plat_alloc_aligned(int64_t n, int64_t align) {
+  if (align <= (int64_t)HEAP_ALIGN) return plat_alloc(n);
+  size_t need = heap_need(n);
+  if (!need || (uint64_t)align > (uint64_t)(SIZE_MAX / 4)) heap_out_of_memory(n);
+  uintptr_t a = (uintptr_t)align;
+  for (;;) {
+    for (HeapBlock *b = heap_free_list; b; b = b->next) {
+      uintptr_t start = (uintptr_t)b, end = start + blk_size(b);
+      uintptr_t p = (start + HEAP_HDR + a - 1) & ~(a - 1);
+      while (p - HEAP_HDR != start && p - HEAP_HDR - start < HEAP_MIN_BLOCK) p += a;
+      if (p - HEAP_HDR + need > end) continue;
+      heap_unlink(b);
+      HeapBlock *nb = (HeapBlock *)(p - HEAP_HDR);
+      size_t gap = (size_t)((uintptr_t)nb - start);
+      nb->head = (blk_size(b) - gap) | HEAP_INUSE | HEAP_PREV_INUSE;
+      if (gap) heap_make_free(b, gap); /* the gap stays free; nb's PREV_INUSE is cleared */
+      blk_next(nb)->head |= HEAP_PREV_INUSE;
+      heap_trim(nb, need);
+      return blk_payload(nb);
+    }
+    if (!heap_add_arena(need + (size_t)align + HEAP_MIN_BLOCK)) heap_out_of_memory(n);
   }
 }
 
@@ -931,6 +973,11 @@ static void print_type_name(Out *o, const OTypeInfo *t, int depth) {
       out_bytes(o, e->name.data, e->name.count);
       return;
     }
+    case TI_VARIANT: {
+      const OTypeInfoVariant *d = (const OTypeInfoVariant *)t;
+      out_bytes(o, d->name.data, d->name.count);
+      return;
+    }
     case TI_PROCEDURE: {
       const OTypeInfoProcedure *p = (const OTypeInfoProcedure *)t;
       out_cstr(o, "(");
@@ -956,21 +1003,26 @@ static void print_type_name(Out *o, const OTypeInfo *t, int depth) {
 }
 
 /* The members of a struct, or the first of a union. Anonymous struct and
-   union members (no name) are shown inline, as members of the enclosing one. */
+   union members (no name) are shown inline, as members of the enclosing one.
+   Constants are skipped; members that overlap (#place) are all shown, each
+   read from its own offset. */
 static void print_members(Out *o, const OTypeInfo *ti, const void *v, int depth, int *first) {
   const OTypeInfoStruct *t = (const OTypeInfoStruct *)ti;
   int64_t n = t->members.count;
-  if ((t->textual_flags & TI_STRUCT_UNION) && n > 0) n = 1; /* unions: first member */
+  int union_ = (t->textual_flags & TI_STRUCT_UNION) != 0; /* unions: first member */
   for (int64_t i = 0; i < n; ++i) {
     const OTypeInfoMember *m = &t->members.data[i];
+    if (m->flags & TI_MEMBER_CONSTANT) continue;
     const uint8_t *p = (const uint8_t *)v + m->offset_in_bytes;
     if (m->name.count == 0 && m->type->type == TI_STRUCT) {
       print_members(o, m->type, p, depth, first);
+      if (union_) return;
       continue;
     }
     if (!*first) out_cstr(o, ", ");
     *first = 0;
     print_value(o, m->type, p, depth + 1);
+    if (union_) return;
   }
 }
 
@@ -1030,6 +1082,7 @@ static void print_value(Out *o, const OTypeInfo *t, const void *v, int depth) {
       return;
     }
     case TI_ENUM: print_enum(o, t, v); return;
+    case TI_VARIANT: print_value(o, ((const OTypeInfoVariant *)t)->variant_of, v, depth); return;
     case TI_ANY: {
       const OAny *a = (const OAny *)v;
       print_value(o, a->type, a->value, depth + 1);
@@ -1161,6 +1214,8 @@ void __ojay_sprint(OString *result, const uint8_t *fmt, int64_t len, const OAny 
 void __ojay_write_string(const uint8_t *data, int64_t len, int fd) { plat_write(fd, data, len); }
 
 void *__ojay_alloc(int64_t size) { return plat_alloc(size); }
+/* New / NewArray of a type aligned more than the heap guarantees (#align). */
+void *__ojay_alloc_aligned(int64_t size, int64_t align) { return plat_alloc_aligned(size, align); }
 void __ojay_free(void *p) { plat_free(p); }
 void *__ojay_realloc(void *p, int64_t new_size, int64_t old_size) {
   (void)old_size;

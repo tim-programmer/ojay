@@ -58,6 +58,7 @@ struct Scope {
   std::vector<UsingEntry> usings;
   bool is_module = false;        // top-level scope of the program or of a module
   std::vector<Scope*> imports;   // module scopes made visible by #import (not transitive)
+  Type* this_type = nullptr;     // a struct body's scope (its constants): the struct, which #this names
 };
 
 // The main program or an imported module: its files' top-level statements.
@@ -84,6 +85,7 @@ struct Program {
   bool uses_context = false;
   Symbol* default_context = nullptr;  // the global Context `context` starts as
   ProcLit* allocate_proc = nullptr;   // __allocate: an allocation through an Allocator (or the context's)
+  ProcLit* allocate_aligned_proc = nullptr;  // __allocate_aligned: New / NewArray of an over-aligned type (#align)
   Type* allocator_type = nullptr;     // Allocator
   // Runtime type information (core.jai): the structs codegen and the
   // #run interpreter fill in for each type's Type_Info.
@@ -97,6 +99,7 @@ struct Program {
     Type* member = nullptr;     // Type_Info_Struct_Member
     Type* enum_ = nullptr;      // Type_Info_Enum
     Type* procedure = nullptr;  // Type_Info_Procedure
+    Type* variant = nullptr;    // Type_Info_Variant (distinct types)
   } type_info;
   // Storage for symbols and scopes (they are referenced from the AST).
   std::vector<std::unique_ptr<Scope>> scopes;

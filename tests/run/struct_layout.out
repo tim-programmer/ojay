@@ -1,0 +1,19 @@
+Overlay 8 [a@0 b@0 lo@0 hi@4]
+Aligned 32 [tag@0 x@16 y@20]
+Big 64 [a@0 v@32]
+Outer 48 [c@0 inner@16]
+Al(8) 16 [c@0 x@8]
+size_of: Overlay 8 Aligned 32 Big 64 Outer 48 Mixed 8
+ALIGNED: true false
+o = {4607182418800017408, 1, 0, 1072693248} (a 4607182418800017408, lo 0, hi 1072693248)
+o.a = 5
+p.lo = 4294967295, p.hi = 4294967295
+m = {7, 0, 3} (tag 7)
+m2 = {1069547520, 1.5, 3}
+g_mixed = {1069547520, 1.5, 3}, g_over = {8589934593, 0, 1, 2}, CONST_OVER = {8589934593, 0, 1, 2}
+lit.hi = 1073741824
+make_overlay().a = 8589934593
+local true, global true, nested true, member x true
+New true, NewArray true
+New again true
+checks: lo 0 hi 1072693248 aligned local true heap true array true arena true

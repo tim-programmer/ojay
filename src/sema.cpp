@@ -142,9 +142,12 @@ class Checker : public InterpHost {
       check_directive_stmt(stmt);
     }
     scope_ = global_;
-    for (size_t i = 0; i < all_structs_.size(); ++i) complete_type(all_structs_[i], SourceLoc{});
-    for (size_t i = 0; i < pending_.size(); ++i) check_proc_body(pending_[i]);
-    for (size_t i = 0; i < all_structs_.size(); ++i) complete_type(all_structs_[i], SourceLoc{});
+    // Laying out a struct can register procedures (its constants), and
+    // checking a body can make structs: until neither has more to do.
+    for (size_t ns = 0, np = 0; ns < all_structs_.size() || np < pending_.size();) {
+      for (; ns < all_structs_.size(); ++ns) complete_type(all_structs_[ns], SourceLoc{});
+      for (; np < pending_.size(); ++np) check_proc_body(pending_[np]);
+    }
 
     // `main` is optional (an object may be a library); when present it becomes
     // the program entry point.
@@ -287,8 +290,10 @@ class Checker : public InterpHost {
     ComptimeMode mode(*this, !p->registered, p, false);
     check_proc_body(p);
   }
+  void prepare_type(Type* t) override { complete_type(t, SourceLoc{}); }
   Symbol* default_context() override { return prog_.default_context; }
   ProcLit* allocate_proc() override { return prog_.allocate_proc; }
+  ProcLit* allocate_aligned_proc() override { return prog_.allocate_aligned_proc; }
   const Program::TypeInfoTypes& type_info_types() override { return prog_.type_info; }
 
  private:
@@ -627,6 +632,7 @@ class Checker : public InterpHost {
     add_builtin(internals, "__ojay_raw_alloc", Builtin::RawAlloc);
     add_builtin(internals, "__ojay_raw_free", Builtin::RawFree);
     add_builtin(internals, "__ojay_raw_realloc", Builtin::RawRealloc);
+    add_builtin(internals, "__ojay_raw_alloc_aligned", Builtin::RawAllocAligned);
     preload_ = new_scope(universe_, nullptr);
     preload_->is_module = true;
     preload_->imports.push_back(internals);
@@ -694,6 +700,7 @@ class Checker : public InterpHost {
     ti.member = get("Type_Info_Struct_Member");
     ti.enum_ = get("Type_Info_Enum");
     ti.procedure = get("Type_Info_Procedure");
+    ti.variant = get("Type_Info_Variant");
     for_flags_t_ = get("For_Flags");
     source_loc_t_ = get("Source_Code_Location");
     scope_ = saved;
@@ -703,13 +710,14 @@ class Checker : public InterpHost {
   bool is_type_info_struct(const Type* t) const {
     const auto& ti = prog_.type_info;
     return t == ti.info || t == ti.integer || t == ti.float_ || t == ti.pointer || t == ti.array ||
-           t == ti.struct_ || t == ti.enum_ || t == ti.procedure;
+           t == ti.struct_ || t == ti.enum_ || t == ti.procedure || t == ti.variant;
   }
   bool is_type_info_ptr(const Type* t) const { return t->is_pointer() && is_type_info_struct(t->elem); }
 
   // The Type_Info_* struct type_info(t) returns for t.
   Type* type_info_struct_for(Type* t) const {
     const auto& ti = prog_.type_info;
+    if (t->distinct_of) return ti.variant;
     switch (t->kind) {
       case TypeKind::Int: return ti.integer;
       case TypeKind::Float: return ti.float_;
@@ -745,6 +753,15 @@ class Checker : public InterpHost {
     prog_.allocate_proc = ap->proc;
     context_resolving_ = false;
     context_ready_ = true;
+  }
+
+  // New / NewArray of t, whose alignment (#align) may be more than the heap
+  // guarantees: allocations go through __allocate_aligned.
+  void want_aligned_allocation(Type* t) {
+    if (t->align <= T.heap_align() || prog_.allocate_aligned_proc) return;
+    Symbol* s = preload_sym("__allocate_aligned");
+    resolve(s);
+    prog_.allocate_aligned_proc = s->proc;
   }
 
   Type* allocator_type() {
@@ -1107,6 +1124,14 @@ class Checker : public InterpHost {
           s->module_scope = prog_.modules.at(de->module_id).scope;
           return;
         }
+        if (de->name == "distinct") {
+          s->kind = SymKind::Type;
+          s->type = T.type_t;
+          s->cv = ConstValue::of_type(define_distinct(de, s->name));
+          v->type = T.type_t;
+          v->cv = s->cv;
+          return;
+        }
         break;
       }
       default:
@@ -1191,8 +1216,71 @@ class Checker : public InterpHost {
     Type* t = T.new_struct(name.empty() ? (sd->is_union ? "union" : "struct") : name);
     t->is_union = sd->is_union;
     sd->struct_type = t;
-    struct_defs_[t] = {sd, scope_};
+    // The body's own scope holds its constants; #this names the struct there.
+    Scope* ss = new_scope(scope_, scope_->proc);
+    ss->this_type = t;
+    struct_defs_[t] = {sd, ss};
     all_structs_.push_back(t);
+    for (Decl* d : sd->members)
+      if (d->is_const) declare_struct_constant(ss, d);
+    return t;
+  }
+
+  // Declares the names of constant member `d` (`N :: 3;`) in struct scope ss;
+  // they are resolved when used, and all of them once the struct is laid out.
+  void declare_struct_constant(Scope* ss, Decl* d) {
+    if (d->values.size() != d->names.size()) fail(d->loc, "constant declaration needs one value per name");
+    for (size_t i = 0; i < d->names.size(); ++i) {
+      Symbol* sym = declare_const(ss, d, i);
+      sym->decl = d;
+      sym->decl_index = (int)i;
+      sym->is_global = ss->proc == nullptr;
+      d->syms.push_back(sym);
+    }
+  }
+
+  // The constant `name` of struct t (or of the struct a distinct type copies), or null.
+  Symbol* struct_constant(Type* t, const std::string& name, SourceLoc loc) {
+    while (t->distinct_of) t = t->distinct_of;
+    auto it = struct_defs_.find(t);
+    if (it == struct_defs_.end()) return nullptr;
+    Scope* ss = it->second.second;
+    auto jt = ss->syms.find(name);
+    if (jt == ss->syms.end() && t->layout_state == Type::LayoutState::None) {
+      complete_type(t, loc);  // constants made by an #insert in the body
+      jt = ss->syms.find(name);
+    }
+    return jt == ss->syms.end() ? nullptr : jt->second;
+  }
+
+  // `S.N` or `value.N` (also through a pointer): the struct constant it names, if any.
+  Symbol* member_constant(Member* m) {
+    Type* bt = check_rv(m->base, nullptr);
+    Type* st = nullptr;
+    bool type_base = m->base->is_const() && m->base->cv.kind == ConstValue::TypeV;
+    if (type_base) st = m->base->cv.t;
+    else st = bt->is_pointer() ? bt->elem : bt;
+    if (!st || st->kind != TypeKind::Struct) return nullptr;
+    if (!type_base) {
+      complete_type(st, m->loc);
+      std::vector<int> path;
+      if (find_field(st, m->name, path)) return nullptr;  // a field
+    }
+    return struct_constant(st, m->name, m->loc);
+  }
+
+  // `name :: #type,distinct Base;`
+  Type* define_distinct(DirectiveExpr* de, const std::string& name) {
+    Type* base = resolve_type(de->operand);
+    switch (base->kind) {
+      case TypeKind::Void: case TypeKind::Tuple: case TypeKind::Code: case TypeKind::UntypedInt:
+      case TypeKind::UntypedFloat: case TypeKind::Null:
+        fail(de->loc, "a distinct type of ", type_name(base), " is not supported");
+      default:
+        break;
+    }
+    Type* t = T.new_distinct(name, base);
+    if (t->kind == TypeKind::Struct) all_structs_.push_back(t);  // laid out as its base is
     return t;
   }
 
@@ -1305,6 +1393,9 @@ class Checker : public InterpHost {
 
   // Parameters and results of #c_call procedures must be C types (abi.h).
   void check_c_type(Type* t, SourceLoc loc, bool is_return) {
+    // Its layout decides (#align / #place); codegen checks again the structs
+    // that are still being laid out here (a member's procedure type).
+    if (t->kind == TypeKind::Struct && t->layout_state == Type::LayoutState::None) complete_type(t, loc);
     std::string why = c_abi_unsupported(t);
     if (why.empty()) return;
     if (is_return) fail(loc, "#c_call/#foreign return type ", type_name(t), " is not supported: ", why);
@@ -1315,6 +1406,11 @@ class Checker : public InterpHost {
     switch (t->kind) {
       case TypeKind::Struct: {
         if (t->layout_state == Type::LayoutState::Done) return;
+        if (t->distinct_of) {  // laid out as its base
+          complete_type(t->distinct_of, loc);
+          TypeTable::copy_distinct(t);
+          return;
+        }
         if (t->layout_state == Type::LayoutState::InProgress)
           fail(loc, "struct '", t->name, "' contains itself by value (use a pointer)");
         t->layout_state = Type::LayoutState::InProgress;
@@ -1331,6 +1427,7 @@ class Checker : public InterpHost {
       }
       case TypeKind::Array:
         if (t->array_kind == ArrayKind::Fixed) {
+          if (t->distinct_of) complete_type(t->distinct_of, loc);
           complete_type(t->elem, loc);
           t->size = t->elem->size * t->count;
           t->align = t->elem->align;
@@ -1357,6 +1454,9 @@ class Checker : public InterpHost {
     if (t == context_type_)  // #add_context members come after Context's own
       for (auto it = context_additions_.rbegin(); it != context_additions_.rend(); ++it) todo.push_back(*it);
     for (auto it = sd->members.rbegin(); it != sd->members.rend(); ++it) todo.push_back({*it, sc});
+    struct ConstMember { Symbol* sym; size_t pos; bool listed; };  // pos: the number of fields before it
+    std::vector<ConstMember> consts;
+    int place = -1;  // a `#place m;` before the next member: m's field index
     while (!todo.empty()) {
       auto [d, dsc] = todo.back();
       todo.pop_back();
@@ -1366,6 +1466,39 @@ class Checker : public InterpHost {
         std::vector<Decl*> more = with_note(insert_note(d->loc), [&] { return inserted_members(d); });
         for (auto it = more.rbegin(); it != more.rend(); ++it) todo.push_back({*it, dsc});
         continue;
+      }
+      if (d->is_const) {  // a constant (declared with the struct, or made by an #insert just now)
+        if (d->syms.empty()) declare_struct_constant(sc, d);
+        for (size_t i = 0; i < d->syms.size(); ++i) {
+          // A further procedure of an overload set is not listed again.
+          bool further = sc->syms.at(d->names[i].name) != d->syms[i];
+          if (!further && !names.insert(d->names[i].name).second)
+            fail(d->names[i].loc, "duplicate member '", d->names[i].name, "'");
+          consts.push_back({d->syms[i], t->fields.size(), !further});
+        }
+        continue;
+      }
+      if (!d->place_name.empty()) {  // `#place m;`
+        if (t->is_union) fail(d->loc, "#place is not allowed in a union (its members all start at offset 0)");
+        place = -1;
+        for (size_t j = 0; j < t->fields.size(); ++j)
+          if (!t->fields[j].anonymous && t->fields[j].name == d->place_name) place = (int)j;
+        if (place < 0)
+          fail(d->loc, "#place ", d->place_name, ": '", d->place_name, "' is not an earlier member of struct ",
+               type_name(t));
+        t->has_place = true;
+        continue;
+      }
+      int64_t align = 0;
+      if (d->align) {
+        check_value(d->align, nullptr);
+        if (!d->align->is_const() || d->align->cv.kind != ConstValue::Int || !d->align->type->is_integer())
+          fail(d->align->loc, "#align needs a compile-time integer constant");
+        i128 n = d->align->cv.i;
+        if (n <= 0 || (n & (n - 1)) != 0 || n > (i128(1) << 30))
+          fail(d->align->loc, "#align ", i128_str(n), ": the alignment must be a power of two");
+        align = (int64_t)n;
+        t->has_align = true;
       }
       Type* ft = d->type_expr ? resolve_type(d->type_expr) : nullptr;
       if (!d->values.empty() && d->values.size() != 1 && d->values.size() != d->names.size())
@@ -1400,11 +1533,56 @@ class Checker : public InterpHost {
         if (mt->kind == TypeKind::Void) fail(d->loc, "member cannot have type void");
         complete_type(mt, d->loc);
         f.type = mt;
+        f.align = align;
+        if (i == 0) {
+          f.place = place;
+          place = -1;
+        }
         t->fields.push_back(f);
       }
     }
     restore(c);
     T.layout_struct(t);
+    if (t->has_place) check_overlapping_defaults(t);
+    // Every constant, now that the struct's size is known (`N :: size_of(S);`).
+    for (auto& [sym, pos, listed] : consts) {
+      resolve(sym);
+      if (!listed) continue;
+      Type* ct = nullptr;
+      switch (sym->kind) {
+        case SymKind::Const:
+          ct = sym->type->kind == TypeKind::UntypedInt ? T.s64 : sym->type->kind == TypeKind::UntypedFloat ? T.f32
+               : sym->type->kind == TypeKind::Null ? T.void_ptr : sym->type;
+          break;
+        case SymKind::Type: ct = T.type_t; break;
+        case SymKind::Proc: ct = sym->type; break;
+        default: break;  // polymorphic procedures and structs, libraries, modules: not in Type_Info
+      }
+      if (ct) t->constants.push_back({sym->name, ct, pos});
+    }
+  }
+
+  // A value other than zero initializes member f (its default, or its type's).
+  bool has_default(const StructField& f) {
+    if (f.uninit) return false;
+    return f.default_value || type_has_default(f.type);
+  }
+  bool type_has_default(Type* t) {
+    if (t->is_fixed_array()) return t->count > 0 && type_has_default(t->elem);
+    if (t->kind != TypeKind::Struct || t->is_union) return false;
+    for (auto& f : t->fields)
+      if (has_default(f)) return true;
+    return false;
+  }
+
+  // Overlapping members (#place) are initialized by at most one default.
+  void check_overlapping_defaults(Type* t) {
+    for (size_t i = 0; i < t->fields.size(); ++i)
+      for (size_t j = i + 1; j < t->fields.size(); ++j)
+        if (fields_overlap(t, i, j) && has_default(t->fields[i]) && has_default(t->fields[j]))
+          fail(t->fields[j].default_value ? t->fields[j].default_value->loc : struct_defs_.at(t).first->loc, "members '",
+               t->fields[i].name, "' and '", t->fields[j].name, "' of ", type_name(t),
+               " overlap (#place) and both have default values; at most one of them may");
   }
 
   // ------------------------------------------------------------------ procedure bodies
@@ -1764,6 +1942,8 @@ class Checker : public InterpHost {
   }
 
   void require_lvalue(Expr* e, const char* what) {
+    if (e->kind == NK::Ident && static_cast<Ident*>(e)->sym && static_cast<Ident*>(e)->sym->kind == SymKind::Const)
+      fail(e->loc, "cannot ", what, " constant '", static_cast<Ident*>(e)->name, "'");
     if (!is_lvalue(e)) fail(e->loc, "cannot ", what, " this expression (not an lvalue)");
   }
 
@@ -2096,11 +2276,13 @@ class Checker : public InterpHost {
   bool implicit_ok(Type* from, Type* to) {
     if (from == to) return true;
     if (to->kind == TypeKind::Any) return from->kind != TypeKind::Void && from->kind != TypeKind::Tuple;
+    // A distinct type converts to and from nothing implicitly (cast or xx it).
+    if (from->distinct_of || to->distinct_of) return false;
     if (from->kind == TypeKind::Int && to->kind == TypeKind::Int) {
       if (from->is_signed == to->is_signed) return from->bits < to->bits;
       return !from->is_signed && to->is_signed && from->bits < to->bits;
     }
-    if (from == T.f32 && to == T.f64) return true;
+    if (from == T.f32 && to == T.f64) return true;  // (distinct types never get here)
     if (from->is_pointer() && to->is_pointer()) {
       if (to->elem == prog_.type_info.info && is_type_info_struct(from->elem)) return true;  // *Type_Info_Struct -> *Type_Info
       return to->elem->kind == TypeKind::Void || from->elem->kind == TypeKind::Void;
@@ -2135,7 +2317,7 @@ class Checker : public InterpHost {
       }
       if (to->kind == TypeKind::Float) {
         e->cv = ConstValue::of_float((double)e->cv.i);
-        if (to == T.f32) e->cv.f = (float)e->cv.f;
+        if (to->is_f32()) e->cv.f = (float)e->cv.f;
         e->type = to;
         return;
       }
@@ -2150,7 +2332,7 @@ class Checker : public InterpHost {
     }
     if (from->kind == TypeKind::UntypedFloat) {
       if (to->kind == TypeKind::Float) {
-        if (to == T.f32) e->cv.f = (float)e->cv.f;
+        if (to->is_f32()) e->cv.f = (float)e->cv.f;
         e->type = to;
         return;
       }
@@ -2348,6 +2530,22 @@ class Checker : public InterpHost {
             e = id;
             return check_ident(id, hint);
           }
+        if (m->base)
+          if (Symbol* s = member_constant(m)) {  // S.N / value.N: a constant of the struct
+            auto* id = ast_.make<Ident>(m->loc, m->name);
+            if (s->overloads.size() > 1) {
+              Symbol* pick = nullptr;
+              for (Symbol* o : s->overloads) {
+                resolve(o);
+                if (hint && o->type == hint) pick = o;
+              }
+              if (!pick) fail(m->loc, "'", m->name, "' is overloaded; the expected procedure type is needed to pick one");
+              s = pick;
+            }
+            id->sym = s;
+            e = id;
+            return check_ident(id, hint);
+          }
         return check_member(m, hint);
       }
       case NK::Cast: return check_cast(static_cast<Cast*>(e));
@@ -2435,12 +2633,35 @@ class Checker : public InterpHost {
           e->cv = location_value(e->loc);
           return e->type;
         }
+        if (d->name == "this") return check_this(e);
+        if (d->name == "distinct")
+          fail(e->loc, "a distinct type must be declared as a named constant: Name :: #type,distinct T;");
         if (d->name.rfind("import:", 0) == 0) fail(e->loc, "named #import is only supported as `Name :: #import \"...\";`");
         fail(e->loc, "#", d->name, " is not supported here");
       }
       default:
         fail(e->loc, "unexpected node in expression");
     }
+  }
+
+  // `#this`: the struct whose body it is in (in a polymorphic struct, the
+  // instance), or else the procedure whose body it is in.
+  Type* check_this(Expr*& e) {
+    for (Scope* s = scope_; s; s = s->parent) {
+      if (s->this_type) {
+        e->cv = ConstValue::of_type(s->this_type);
+        return T.type_t;
+      }
+      if (s->proc && (!s->parent || s->parent->proc != s->proc)) {  // the outermost scope of a procedure body
+        if (!macros_.empty()) fail(e->loc, "#this is not supported in an #expand macro");
+        ProcLit* p = s->proc;
+        if (in_run_operand_) fail(e->loc, "#this cannot be used in a #run expression");
+        want_proc(p);
+        e = p;
+        return p->type;
+      }
+    }
+    fail(e->loc, "#this is only allowed inside a struct body or a procedure");
   }
 
   // A name: a symbol, or a member brought in by `using` (rewritten).
@@ -2554,7 +2775,8 @@ class Checker : public InterpHost {
         if (overloadable(t)) {
           if ((u->overload = operator_call(u->op == UnOp::Neg ? "-" : "+", {u->operand}, u->loc)))
             return u->overload->type;
-          fail(u->loc, "no unary 'operator ", u->op == UnOp::Neg ? "-" : "+", "' for ", type_name(t));
+          if (t->kind == TypeKind::Struct || t->kind == TypeKind::Array)
+            fail(u->loc, "no unary 'operator ", u->op == UnOp::Neg ? "-" : "+", "' for ", type_name(t));
         }
         if (!t->is_numeric()) fail(u->loc, "unary '", u->op == UnOp::Neg ? "-" : "+", "' needs a number, not ",
                                    type_name(t));
@@ -2808,7 +3030,7 @@ class Checker : public InterpHost {
       if ((b->op == BinOp::Div || b->op == BinOp::Mod) && b->rhs->cv.kind == ConstValue::Int && b->rhs->cv.i == 0)
         fail(b->loc, "division by zero");
       b->cv = fold(b->op, b->lhs->cv, b->rhs->cv, t, b->loc);
-      if (b->cv.kind == ConstValue::Float && t == T.f32) b->cv.f = (float)b->cv.f;
+      if (b->cv.kind == ConstValue::Float && t->is_f32()) b->cv.f = (float)b->cv.f;
     } else if ((b->op == BinOp::Div || b->op == BinOp::Mod) && b->rhs->is_const() &&
                b->rhs->cv.kind == ConstValue::Int && b->rhs->cv.i == 0) {
       fail(b->loc, "division by zero");
@@ -3014,7 +3236,7 @@ class Checker : public InterpHost {
       }
       if (to->kind == TypeKind::Float) {
         double f = v.kind == ConstValue::Float ? v.f : (double)v.i;
-        c->cv = ConstValue::of_float(to == T.f32 ? (double)(float)f : f);
+        c->cv = ConstValue::of_float(to->is_f32() ? (double)(float)f : f);
         return to;
       }
       if (to->kind == TypeKind::Bool && v.kind == ConstValue::Int) {
@@ -3047,6 +3269,7 @@ class Checker : public InterpHost {
     else if ((from->is_pointer() || from->is_proc()) && to->kind == TypeKind::Int && to->bits == 64) ok = true;
     else if (from->kind == TypeKind::Int && (to->is_pointer() || to->is_proc())) ok = true;
     else if (implicit_ok(from, to)) ok = true;
+    else if (from->underlying() == to->underlying()) ok = true;  // to or from a distinct type: the same layout
     if (!ok) fail(c->loc, "cannot cast ", type_name(from), " to ", type_name(to));
     // Fold typed numeric constants.
     if (c->operand->is_const()) {
@@ -3057,7 +3280,7 @@ class Checker : public InterpHost {
         c->cv = ConstValue::of_int(int_wrap(iv, it));
       } else if (to->kind == TypeKind::Float && (v.kind == ConstValue::Int || v.kind == ConstValue::Float)) {
         double f = v.kind == ConstValue::Float ? v.f : (double)v.i;
-        c->cv = ConstValue::of_float(to == T.f32 ? (double)(float)f : f);
+        c->cv = ConstValue::of_float(to->is_f32() ? (double)(float)f : f);
       } else if ((to->is_pointer() || to->is_proc()) && (v.kind == ConstValue::Null || v.kind == ConstValue::Address)) {
         c->cv = v;
       } else if ((to->is_pointer() || to->is_proc()) && v.kind == ConstValue::Int && from->kind == TypeKind::Int) {
@@ -3096,6 +3319,11 @@ class Checker : public InterpHost {
         if (idx >= t->fields.size()) fail(a.value->loc, "too many values for struct ", type_name(t));
       }
       if (s->field_values[idx]) fail(a.value->loc, "member '", t->fields[idx].name, "' is set twice");
+      if (t->has_place)
+        for (size_t j = 0; j < t->fields.size(); ++j)
+          if (j != idx && s->field_values[j] && fields_overlap(t, idx, j))
+            fail(a.value->loc, "members '", t->fields[j].name, "' and '", t->fields[idx].name, "' of ", type_name(t),
+                 " overlap (#place); a struct literal can only set one of them");
       check_value(a.value, t->fields[idx].type);
       s->field_values[idx] = a.value;
     }
@@ -3459,7 +3687,7 @@ class Checker : public InterpHost {
       x.type = pt;
       x.value = a->cv;
       if (pt->kind == TypeKind::Float && x.value.kind == ConstValue::Int) x.value = ConstValue::of_float((double)x.value.i);
-      if (pt == T.f32 && x.value.kind == ConstValue::Float) x.value.f = (float)x.value.f;
+      if (pt->is_f32() && x.value.kind == ConstValue::Float) x.value.f = (float)x.value.f;
     }
     x.bound = true;
   }
@@ -3937,8 +4165,7 @@ class Checker : public InterpHost {
     if (!c.block) fail(c.loc, "only a #code block of member declarations can be inserted into a struct");
     std::vector<Decl*> out;
     for (Stmt* x : static_cast<Block*>(clone_stmt(ast_, c.block))->stmts) {
-      if (x->kind != NK::Decl || static_cast<Decl*>(x)->is_const)
-        fail(x->loc, "only member declarations can be inserted into a struct");
+      if (x->kind != NK::Decl) fail(x->loc, "only member declarations can be inserted into a struct");
       out.push_back(static_cast<Decl*>(x));
     }
     return out;
@@ -4205,6 +4432,9 @@ class Checker : public InterpHost {
       if (Scope* ms = module_of(m->base)) {
         qualified = module_member(ms, m);
         c->callee = ast_.make<Ident>(m->loc, m->name);
+      } else if (Symbol* cs = member_constant(m)) {  // S.make(...): a procedure (or struct) constant of S
+        qualified = cs;
+        c->callee = ast_.make<Ident>(m->loc, m->name);
       }
     }
     // (A backtick callee is looked up in the macro caller's scope, below.)
@@ -4462,7 +4692,10 @@ class Checker : public InterpHost {
 
   // ---- operator overloading
 
-  static bool overloadable(Type* t) { return t->kind == TypeKind::Struct || t->kind == TypeKind::Array; }
+  // Types whose operators may be overloaded (distinct types too: `operator +` on Handle).
+  static bool overloadable(Type* t) {
+    return t->kind == TypeKind::Struct || t->kind == TypeKind::Array || t->distinct_of;
+  }
 
   // A call of `operator<op>` with `args` (checked, except hint-dependent ones),
   // or null if no `operator<op>` is declared or none fits. A first parameter
@@ -4881,6 +5114,7 @@ class Checker : public InterpHost {
         c->type_arg = t;
         set_initialized_arg(c, args[1]);
         set_allocator_arg(c, args[2]);
+        want_aligned_allocation(t);
         return T.pointer_to(t);
       }
       case Builtin::NewArray: {
@@ -4894,7 +5128,14 @@ class Checker : public InterpHost {
         c->type_arg = t;
         set_initialized_arg(c, args[2]);
         set_allocator_arg(c, args[3]);
+        want_aligned_allocation(t);
         return T.array_of(t, ArrayKind::View);
+      }
+      case Builtin::RawAllocAligned: {
+        auto& a = positional(c, 2, 2, "__ojay_raw_alloc_aligned");
+        check_value(a[0], T.s64);
+        check_value(a[1], T.s64);
+        return T.void_ptr;
       }
       case Builtin::RawAlloc: {
         auto& a = positional(c, 1, 1, "__ojay_raw_alloc");

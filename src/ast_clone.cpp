@@ -272,6 +272,8 @@ class Cloner {
     n->backtick = d->backtick;
     n->add_context = d->add_context;
     n->insert = expr(d->insert);
+    n->place_name = d->place_name;
+    n->align = expr(d->align);
     return n;
   }
 

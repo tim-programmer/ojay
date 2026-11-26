@@ -23,11 +23,15 @@ class InterpHost {
   // Called before procedure `p` is executed: checks its body if that has not
   // happened yet. May throw CompileError.
   virtual void prepare_proc(ProcLit* p) = 0;
+  // Called before t's Type_Info is laid out: completes t (a struct's layout).
+  virtual void prepare_type(Type* t) = 0;
   // The context (Preload), once the program uses it: the global holding the
   // default Context, and __allocate. Null before (allocations then go to the
   // interpreter's heap directly).
   virtual Symbol* default_context() = 0;
   virtual ProcLit* allocate_proc() = 0;
+  // __allocate_aligned (New of an over-aligned type), or null.
+  virtual ProcLit* allocate_aligned_proc() = 0;
   // The Type_Info_* structs (core.jai), for laying out Type_Info in
   // compile-time memory.
   virtual const Program::TypeInfoTypes& type_info_types() = 0;

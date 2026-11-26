@@ -149,7 +149,7 @@ enum class Builtin {
   Print, Sprint, WriteString, Alloc, Free, Realloc, New, NewArray, ArrayAdd, ArrayReserve, ArrayFree, ArrayReset,
   Assert, Exit, Memcpy, Memset, Min, Max, Abs, ToCString, CommandLineArguments,
   // Preload internals: the runtime's own heap, bypassing the context's allocator
-  RawAlloc, RawFree, RawRealloc,
+  RawAlloc, RawFree, RawRealloc, RawAllocAligned,
   // Math
   Sqrt, Sin, Cos, Tan, Atan2, Pow, Floor, Ceil, Round, Exp, Log,
   // Hardware (ojay extension for memory-mapped I/O)
@@ -387,6 +387,10 @@ struct Decl : Stmt {
   bool backtick = false;    // `` `x := v; `` in an #expand macro: declared in the caller's scope
   bool add_context = false; // `#add_context name: T = v;`: a member added to Context
   Expr* insert = nullptr;   // a struct member `#insert expr;` (no names): members made by sema
+  // Struct members: `#place name;` (no names, place_name set): the members after it start at
+  // member `name`'s offset; `x: T #align N;`: member x's offset is a multiple of N.
+  std::string place_name;
+  Expr* align = nullptr;
   // sema
   std::vector<Symbol*> syms;
   Type* declared_type = nullptr;

@@ -1,0 +1,14 @@
+S.N = 3, size_of(S) = 32
+s = {[10, 11, 12], 1.5}, s.N = 3, s.scale = 1.5
+p.N = 3, p.LIMIT = 100, type_of(S.LIMIT) = s16
+S.T: 2.25 (float32)
+Buf(4).SIZE = 8, b.SIZE = 8, items.count = 8, Buf(10).SIZE = 20
+node: 7
+Inserted: 4 8 32 size 32
+members N(C) data(@0) T(C) make(C) scale(@24) LIMIT(C)
+  N : s64
+  T : Type
+  make : (s64) -> S
+  LIMIT : s16
+Node: members KIND(C) value(@0)
+summary: N 3 count 3 size 32 BUF 8 T float32 make 5

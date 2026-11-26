@@ -1,0 +1,23 @@
+h = 7, h2 = 40, back = 40
+h + h2 = 47, h + 1 = 8, h < h2 = true, h == 7 = true
+types: Handle Handle bool
+xx: 40 7
+describe: Handle u32 Meters
+kind_of: Handle u32 Other
+Alias: 3 (Handle)
+m * 2 = 50 (Meters)
+r = {11, 22} (Point), r.x = 11, size 8
+lit = {3, 4} (Point)
+v = {11, 22} (Vec2)
+c = BLUE (Code)
+row = [0, 5, 0], arr = [0, 5, 0], row.count = 3
+ip.* = 42, (IntPtr)
+name = jai, count 3
+Handle 8 VARIANT u32
+Point 16 VARIANT Vec2
+not a variant
+summary: Handle 8 VARIANT u32 Handle Meters 3.5 Point {1, 2} Code_A 1
+C: next_handle 8 (Handle)
+C: swap_point {2, 1}
+C: pair_sum 3.5
+C: apply_twice 20

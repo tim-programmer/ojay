@@ -39,6 +39,7 @@ Type_Info_Tag :: enum u32 {
     POLYMORPHIC_VARIABLE :: 12;
     TYPE                 :: 13;
     CODE                 :: 14;
+    VARIANT              :: 15;  // a distinct type (Type_Info_Variant)
 }
 
 Type_Info :: struct {
@@ -74,7 +75,7 @@ Type_Info_Array :: struct {
 }
 
 Type_Info_Struct_Member_Flags :: enum_flags u32 {
-    CONSTANT        :: 0x1;
+    CONSTANT        :: 0x1;   // a constant (`N :: 3;`): no storage, offset_in_bytes is 0
     IMPORTED        :: 0x2;
     USING           :: 0x4;   // `using name: T;`
     PROCEDURE_VALUE :: 0x8;
@@ -93,7 +94,7 @@ Struct_Textual_Flags :: enum_flags u32 {
     UNION      :: 0x2;
     NO_PADDING :: 0x4;
     TYPE_TAG   :: 0x8;
-    ALIGNED    :: 0x10;
+    ALIGNED    :: 0x10;  // some member has #align
 }
 
 Type_Info_Struct :: struct {
@@ -127,6 +128,14 @@ Type_Info_Procedure :: struct {
     argument_types: [] *Type_Info;
     return_types: [] *Type_Info;
     procedure_flags: Type_Info_Procedure_Flags;
+}
+
+// A distinct type (`Handle :: #type,distinct u32;`): its name and the
+// Type_Info of the type it was made from. runtime_size is the base's size.
+Type_Info_Variant :: struct {
+    using info: Type_Info;
+    name: string;
+    variant_of: *Type_Info;
 }
 
 // ------------------------------------------------------------------ source locations

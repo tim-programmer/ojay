@@ -36,9 +36,12 @@
 - [x] `#caller_location` / `#location` and `Source_Code_Location` (not yet: `log` with
       `loc := #caller_location` and `Log_Info.location` (needs parameters after a variadic
       one), a `loc` argument for `assert`, `#procedure_of_call`)
-- [ ] Struct layout and members: constants inside structs (`S :: struct { N :: 3; }`), `#place`,
-      `#align`, `#this`
-- [ ] Distinct types (`#type,distinct`)
+- [x] Struct layout and members: constants inside structs (`S :: struct { N :: 3; }`), `#place`,
+      `#align`, `#this` (not yet: `#align` on variables, `void` members as `#place` markers,
+      `#place` / `#align` structs by value across the C ABI, alignment requests to custom
+      allocators and for dynamic arrays of over-aligned types)
+- [x] Distinct types (`#type,distinct`) (not yet: `#type,isa`, Jai's other Type_Info_Variant
+      members)
 - [ ] Short lambdas: `(x: int) => x * 2`
 - [ ] Smaller directives and intrinsics: `#procedure_name()`, `is_constant()`, `#bytes`,
       `#exists`, `initializer_of(T)`, `enum_highest_value` and the other enum helpers,

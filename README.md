@@ -256,8 +256,10 @@ Implemented:
 * Types: `s8..s64`, `u8..u64`, `int`, `float`/`float32`, `float64`, `bool`,
   `string`, `*T`, `[N]T`, `[]T`, `[..]T`, `Any`, `Type`, procedure types,
   `struct` (member defaults, anonymous `struct { }` / `union { }` members,
-  `using` members), `union`, `enum` / `enum_flags` with explicit base types and
-  values, type aliases
+  `using` members, constants, `#place`, `#align`, `#this`), `union`, `enum` /
+  `enum_flags` with explicit base types and values, type aliases, distinct
+  types (`#type,distinct`) (see *Struct layout, constants and distinct types*
+  below)
 * Procedures: default and named arguments, multiple return values,
   variadic `..T` parameters (an array is passed to one as `f(..array)`, also
   to `print` / `sprint`: `print(format, ..args)`), procedure values, nested (non-capturing)
@@ -377,10 +379,87 @@ Not yet implemented: `#compiler` procedures and the compiler message loop
 (`#run,stallable`), `Code_Node` introspection (`compiler_get_nodes`),
 `#insert,scope(...)`, `#procedure_of_call`, `#procedure_name()`, variadic `#foreign` procedures (C varargs), parameters after a
 variadic one (Jai's `join(..strings, separator = ", ")`; Basic has no `join`), `using` on pointer members
-and at top level, `#as`, threads and thread contexts. Polymorphism does not yet cover `$$` auto-baking,
+and at top level, `#as`, `#type,isa`, `#align` on variables (only struct members have it),
+threads and thread contexts. Polymorphism does not yet cover `$$` auto-baking,
 `#bake_arguments`, `$T/Interface` constraints, `$R` introduced in a return
 type, `#modify` on structs, or polymorphic procedure values (using a template
 without calling it).
+
+### Struct layout, constants and distinct types
+
+```jai
+S :: struct {
+    N :: 3;                  // a constant: S.N, also s.N
+    data: [N] int;
+    T :: float32;            // a type constant: x: S.T;
+    make :: () -> S { ... }  // a procedure constant: S.make()
+    next: *#this;            // #this: the struct (in a polymorphic struct, the instance)
+}
+Overlay :: struct { a: s64; #place a; b: float64; }   // b overlaps a
+Aligned :: struct { tag: u8; v: [4] float32 #align 16; }   // v at offset 16
+Handle  :: #type,distinct u32;                          // a type of its own
+```
+
+* Constants: `name :: value;` (and `name : T : value;`) in a struct body.
+  They take no space. Inside the body (member types, defaults, the
+  procedures declared there) they are visible by name, outside as `S.N`,
+  `value.N` or `pointer.N` (a member of the same name wins; the value before
+  the `.` is not evaluated). A constant can be a number, string, bool, type,
+  procedure (overloads, polymorphic procedures and `#expand` macros
+  included), struct or enum. In a polymorphic struct each instance has its own
+  (`Buf :: struct ($N: int) { SIZE :: N * 2; }`, `Buf(4).SIZE`). Constants
+  made by an `#insert` in the body work the same way. They are resolved once
+  the struct is laid out, so `N :: size_of(S);` works; a member type that
+  needs such a constant is circular. Assigning to one is an error.
+* `#place m;` before members makes the next member start at earlier member
+  `m`'s offset (aligned up to its own alignment); the ones after it follow on
+  from there, as Jai's pre-union idiom. The struct's size and alignment
+  cover every member. Rules for initialization: two members that overlap may
+  not both have a default value (their own or their type's); a struct literal
+  may not set two members that overlap; and a member set in a literal
+  replaces the defaults of the members it overlaps (they are not written at
+  all, so the bytes outside the set member are zero). `print` shows every
+  member, each read from its own offset. `#place` is not allowed in a union.
+* `x: T #align N;` (after the type, or after `= value`): the member's offset
+  is a multiple of N, a power-of-two constant, and the struct's alignment is
+  at least N; it sets `Struct_Textual_Flags.ALIGNED`. Locals, globals,
+  temporaries and struct members of such a type get that alignment. `New` and
+  `NewArray` of a type aligned more than the heap guarantees (8 bytes on
+  32-bit targets, 16 on x86-64) ask the runtime's heap for an aligned block,
+  which `free` takes as usual. Allocators other than the default one cannot be
+  asked for an alignment (Allocator_Proc has no parameter for it), so their
+  result is checked: a misaligned block stops the program with a message.
+  `#align` on a struct (`} #align 64`) is rejected: in Jai it has no effect
+  there.
+* `#this` in a struct body is the struct (`next: *#this;`, the instance in a
+  polymorphic struct); in a procedure body it is the procedure itself
+  (`return n * #this(n - 1);`). Elsewhere, and in `#expand` macro bodies, it is
+  an error.
+* The layout is computed once (the type table), and codegen, the `#run`
+  interpreter, `size_of`, `Type_Info` and the C ABI all use it, so it is the
+  same on every target and at compile time. In LLVM, a struct with `#align`
+  padding has explicit padding elements, and members that overlap an earlier
+  one are reached by byte offset.
+* `Name :: #type,distinct T;` makes a type with T's layout (and kind) that is
+  not T: there is no implicit conversion between them, in either direction,
+  nor to other types (also not `Handle` to `u64`). `cast` and `xx` convert
+  either way (also between a distinct struct or array and its base). The
+  operators of T work on two values of the distinct type, and an untyped
+  constant converts to it (`h: Handle = 5;`, `h + 1` is a Handle), as for T
+  itself; mixing it with a T (`h + u`) is a type mismatch. Overload
+  resolution, polymorphic inference (`$T` binds to Handle) and `operator`
+  overloads see it as a type of its own. It works for numbers, floats,
+  strings, pointers, arrays, enums (their values) and structs (members,
+  defaults, literals `Point.{1, 2}`, `S.N` constants), and across
+  the C ABI it is its base type. `Alias :: Handle;` is an alias of it, not
+  another distinct type. A distinct type must be declared as a named
+  constant. `type_info(Handle)` is a `*Type_Info_Variant` (see *Runtime type
+  information*), and diagnostics, `type_of` and `print` use its name.
+* Differences from Jai: `#type,isa`, `#align` on variables and `void`
+  members (Jai uses them as `#place` markers) are not supported; struct
+  constants' `offset_in_bytes` is 0; an untyped constant converts to a
+  distinct numeric type implicitly (Jai's exact rules for distinct types are
+  not documented publicly).
 
 ### C interop
 
@@ -412,6 +491,8 @@ on_event :: (e: Event) -> s32 #c_call #program_export "app_on_event" { ... }  //
   dynamic arrays, `Any`, `Type` and fixed arrays (C passes arrays as
   pointers; put the array in a struct). Also rejected: more than one return
   value and variadic `#foreign` procedures (C varargs).
+* Structs with `#place` or `#align` members cannot be passed or returned by
+  value (pass a pointer); distinct types are passed as their base type.
 * Empty structs (`struct {}`) are what GNU C makes of `struct {}`: size 0,
   and as a parameter or result they take no register or stack slot (as with
   clang and GCC; C++ would give them size 1).
@@ -575,7 +656,9 @@ reset_temporary_storage();
 * Differences from Jai: `push_context` always pushes a copy; `log` has no
   optional parameters (see *Built-in modules*); there are no threads; `Allocator_Mode` has only the four modes
   above (no `STARTUP`, `CAPS`, ...), and allocators are not asked for
-  alignment; `print` (which does not allocate) is allowed without a
+  alignment (`New` of an over-aligned type checks what they return; see
+  *Struct layout*); a dynamic array of an over-aligned type is only as
+  aligned as the heap's blocks; `print` (which does not allocate) is allowed without a
   context.
 
 ### Runtime type information
@@ -600,19 +683,28 @@ for e.names  print("% = %\n", it, e.values[it_index]);
   Members of a `Type` value are those of its `Type_Info`
   (`value.type.runtime_size`). `type_info(T)` returns the struct for T's
   kind: `*Type_Info_Integer`, `_Float`, `_Pointer`, `_Array`, `_Struct`,
-  `_Enum`, `_Procedure`, or `*Type_Info` for the others.
+  `_Enum`, `_Procedure`, `_Variant` (distinct types), or `*Type_Info` for the
+  others.
 * `Type_Info` has `type` (a `Type_Info_Tag`: `INTEGER`, `FLOAT`, `BOOL`,
   `STRING`, `POINTER`, `PROCEDURE`, `VOID`, `STRUCT`, `ARRAY`, `ANY`, `ENUM`,
-  `TYPE`, `CODE`) and `runtime_size`. The others start with
+  `TYPE`, `CODE`, `VARIANT`) and `runtime_size`. The others start with
   `using info: Type_Info` and add: `signed` (integers); `pointer_to`;
   `element_type`, `array_type` (`FIXED`, `VIEW`, `RESIZABLE`) and
   `array_count` (-1 unless fixed); `name`, `members`
   (`Type_Info_Struct_Member`: `name`, `type`, `offset_in_bytes`, `flags`)
-  and `textual_flags` (`.UNION`) for structs and unions; `name`,
+  and `textual_flags` (`.UNION`, `.ALIGNED` when a member has `#align`) for
+  structs and unions; the members include the struct's constants in
+  declaration order, with flag `CONSTANT`, offset 0 and the constant's type
+  (`Type` for a type constant, the procedure type for a procedure; untyped
+  numbers as `s64` / `float32`; polymorphic procedures and structs are not
+  listed), and members that overlap (`#place`) have the same offsets; `name`,
   `internal_type`, `enum_type_flags` (`.FLAGS`), `names` and `values` for
   enums; `argument_types`, `return_types` and `procedure_flags`
-  (`IS_C_CALL`, `HAS_VARARGS`) for procedure types. The declarations are in
-  `src/core.jai`.
+  (`IS_C_CALL`, `HAS_VARARGS`) for procedure types; `name` and `variant_of`
+  (the base type's Type_Info) for distinct types (`Type_Info_Variant`, tag
+  `VARIANT`, with the base's `runtime_size`). Generic code follows
+  `variant_of` to reach the base's kind; `print` does, and prints the name as
+  the type. The declarations are in `src/core.jai`.
 * `print` reads the same tables, so they are one copy per type in
   read-only data. On 32-bit targets they are smaller than the tables used
   before (e.g. 2657 -> 2162 bytes of text and read-only data for
@@ -625,8 +717,9 @@ for e.names  print("% = %\n", it, e.values[it_index]);
   top-level (`Type_Info_Array_Type`, `Type_Info_Struct_Member_Flags`,
   `Enum_Type_Flags`, `Type_Info_Procedure_Flags`); members have no `notes`,
   structs no `initializer`, `polymorph_source_struct` or parameters; there
-  are no `Type_Info_Variant`, `_Overload_Set` or `_Polymorphic_Variable`
-  (ojay has no distinct types); `ANONYMOUS` (0x100) marks anonymous struct
+  are no `Type_Info_Overload_Set` or `_Polymorphic_Variable`; a distinct
+  type is a `Type_Info_Variant` with only `name` and `variant_of` (Jai's has
+  more); `ANONYMOUS` (0x100) marks anonymous struct
   and union members; and `Any.type` has type `Type`, which converts to
   `*Type_Info` as needed.
 

@@ -53,6 +53,16 @@ struct StructField {
   bool is_using = false;          // `using name: T;` - T's members are also members of the enclosing struct
   bool anonymous = false;         // `struct { ... }` / `union { ... }` member without a name: its members are
                                   // accessed as if they were members of the enclosing struct
+  int place = -1;                 // `#place m;` before this member: it starts at the offset of field `place`
+  int64_t align = 0;              // `#align N`: the offset is a multiple of N (0: the type's alignment)
+};
+
+// A constant declared in a struct body (`N :: 3;`): no storage, but listed in
+// the struct's Type_Info members (flag CONSTANT) at its place among the fields.
+struct StructConstant {
+  std::string name;
+  Type* type = nullptr;      // the constant's type (Type for a type constant)
+  size_t field_index = 0;    // how many fields come before it
 };
 
 struct EnumMember {
@@ -81,6 +91,9 @@ struct Type {
   // Struct
   std::vector<StructField> fields;
   bool is_union = false;
+  bool has_place = false;    // some member follows a `#place`: members may overlap
+  bool has_align = false;    // some member has `#align` (Struct_Textual_Flags.ALIGNED)
+  std::vector<StructConstant> constants;
   enum class LayoutState { None, InProgress, Done } layout_state = LayoutState::None;
   Decl* struct_decl = nullptr;  // for diagnostics
 
@@ -96,6 +109,10 @@ struct Type {
 
   // Tuple
   std::vector<Type*> elems;
+
+  // `Name :: #type,distinct Base;`: a type of its own with Base's kind and
+  // layout (a copy of Base's description), but never implicitly converted.
+  Type* distinct_of = nullptr;
 
   // Backend caches.
   llvm::Type* llvm_type = nullptr;
@@ -119,7 +136,17 @@ struct Type {
   bool is_dynamic() const { return kind == TypeKind::Array && array_kind == ArrayKind::Dynamic; }
   // An integer-like value (ints and enums).
   bool is_intlike() const { return is_integer() || is_enum(); }
+  bool is_f32() const { return kind == TypeKind::Float && bits == 32; }
+  // The type a chain of distinct types ends in.
+  const Type* underlying() const {
+    const Type* t = this;
+    while (t->distinct_of) t = t->distinct_of;
+    return t;
+  }
 };
+
+// Whether fields i and j of struct t share bytes (#place).
+bool fields_overlap(const Type* t, size_t i, size_t j);
 
 struct TargetLayout {
   int pointer_size = 8;
@@ -150,11 +177,17 @@ class TypeTable {
   Type* tuple(const std::vector<Type*>& elems);
   Type* new_struct(const std::string& name);
   Type* new_enum(const std::string& name, Type* base, bool flags);
+  // A distinct type: a copy of base's description under a new identity. A
+  // struct base must be laid out first (copy_distinct refreshes it).
+  Type* new_distinct(const std::string& name, Type* base);
+  static void copy_distinct(Type* t);
 
   // Computes size/alignment for a struct whose fields are filled in.
   void layout_struct(Type* t);
 
   const TargetLayout& target() const { return layout_; }
+  // The alignment the runtime's heap guarantees (8 on 32-bit targets, 16 on 64-bit).
+  int64_t heap_align() const { return 2 * layout_.pointer_size; }
 
  private:
   TargetLayout layout_;

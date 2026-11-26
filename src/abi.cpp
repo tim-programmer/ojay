@@ -50,6 +50,11 @@ bool is_scalar(const Type* t) {
 std::string member_unsupported(const Type* t) {
   switch (t->kind) {
     case TypeKind::Struct:
+      // #align and #place give layouts that the C ABI lowering here does not
+      // classify (over-aligned and overlapping members).
+      if (t->has_place || t->has_align)
+        return type_name(t) + " has #place or #align members, which are not supported by value across the C "
+               "boundary (pass a pointer to it)";
       for (auto& f : t->fields)
         if (std::string why = member_unsupported(f.type); !why.empty()) return why;
       return "";
