@@ -31,6 +31,12 @@ TARGETS = {
     "arm32": ("ojay-arm32", ["--target=thumbv8m.main-none-eabihf", "-mcpu=cortex-m33", "-mfloat-abi=hard",
                              "-mfpu=fpv5-sp-d16"]),
     "riscv": ("ojay-riscv", ["--target=riscv32-unknown-none-elf", "-march=rv32imac", "-mabi=ilp32"]),
+    # Other ABIs of the same compilers, and targets without a compiler of their own.
+    "riscv-ilp32f": ("ojay-riscv", ["--target=riscv32-unknown-none-elf", "-march=rv32imafc", "-mabi=ilp32f"],
+                     ["--features", "+m,+a,+c,+f", "--abi", "ilp32f"]),
+    "riscv-ilp32d": ("ojay-riscv", ["--target=riscv32-unknown-none-elf", "-march=rv32imafdc", "-mabi=ilp32d"],
+                     ["--features", "+m,+a,+c,+f,+d", "--abi", "ilp32d"]),
+    "aarch64": ("ojay-x86_64", ["--target=aarch64-unknown-linux-gnu"], ["--target", "aarch64-unknown-linux-gnu"]),
 }
 
 # (name, C members, Jai members). Each gets `T f_T(T x)` and a callback `g_T`.
@@ -49,6 +55,7 @@ TYPES = [
     ("HB", "int16_t a; int8_t b;", "a: s16; b: s8;"),
     ("A5", "uint8_t a[5];", "a: [5]u8;"),
     ("P", "void *p;", "p: *void;"),
+    ("PP", "void *p, *q;", "p, q: *void;"),
     ("PI", "void *p; int32_t i;", "p: *void; i: s32;"),
     ("BB", "bool a, b;", "a, b: bool;"),
     ("EN", "uint8_t e; int16_t f;", "e: En8; f: En16;"),
@@ -281,14 +288,15 @@ def main():
     with open(os.path.join(tmp, "abi.jai"), "w") as f:
         f.write(jai_src)
     failures = checked = 0
-    for target, (compiler, cflags) in TARGETS.items():
+    for target, (compiler, cflags, *ojay_flags) in TARGETS.items():
+        ojay_flags = ojay_flags[0] if ojay_flags else []
         r = subprocess.run([clang] + cflags + ["-O0", "-S", "-emit-llvm", "-o", "-", os.path.join(tmp, "abi.c")],
                            capture_output=True, text=True)
         if r.returncode:
             print(r.stderr)
             return 2
         want = signatures(r.stdout)
-        r = subprocess.run([os.path.join(args.build_dir, "bin", compiler), "--emit-llvm", "-o", "-",
+        r = subprocess.run([os.path.join(args.build_dir, "bin", compiler)] + ojay_flags + ["--emit-llvm", "-o", "-",
                             os.path.join(tmp, "abi.jai")], capture_output=True, text=True)
         if r.returncode:
             print(r.stderr)

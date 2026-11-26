@@ -178,6 +178,18 @@ __reset_temporary_storage :: (ts: *Temporary_Storage) {
     ts.last = null;
 }
 
+// Frees all of a Temporary_Storage's pages (a thread's, when it ends).
+__free_temporary_storage :: (ts: *Temporary_Storage) {
+    while ts.page {
+        next := ts.page.next;
+        __ojay_raw_free(ts.page);
+        ts.page = next;
+    }
+    ts.occupied = 0;
+    ts.total_occupied = 0;
+    ts.last = null;
+}
+
 __default_logger :: (message: string, data: *void, info: Log_Info) {
     if message.count == 0  return;
     to_stderr := (cast(u32) info.common_flags & cast(u32) Log_Flags.ERROR) != 0;

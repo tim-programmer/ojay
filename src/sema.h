@@ -75,6 +75,7 @@ struct Program {
   bool import_basic = false;
   bool import_math = false;
   bool import_hardware = false;  // ojay extension: volatile_load / volatile_store
+  bool uses_threads = false;     // imports Thread: the context pointer is thread-local
   // Filled in by Sema:
   std::vector<ProcLit*> procs;        // every procedure literal, in discovery order
   std::vector<Symbol*> global_vars;

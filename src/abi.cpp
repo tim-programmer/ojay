@@ -9,6 +9,9 @@
 //   return) (ARM.cpp, ARMABIInfo).
 // * RISC-V: RISC-V ELF psABI, "Integer Calling Convention" (RISCV.cpp,
 //   RISCVABIInfo).
+// * AArch64: Procedure Call Standard for the Arm 64-bit Architecture
+//   (AAPCS64), sections 5.9 (composite types), 6.8 / 6.9 (parameter passing,
+//   result return) (AArch64.cpp, AArch64ABIInfo, its AAPCS kind).
 // tools/check_c_abi.py compares the signatures produced here with clang's.
 #include "abi.h"
 
@@ -31,6 +34,7 @@ CAbi c_abi_for_triple(const std::string& triple) {
     return hf ? CAbi::AAPCS_VFP : CAbi::AAPCS;
   }
   if (t.isRISCV()) return CAbi::RISCV;
+  if (t.isAArch64() && !t.isOSDarwin() && !t.isOSWindows()) return CAbi::AAPCS64;
   return CAbi::None;
 }
 
@@ -85,8 +89,8 @@ std::string c_abi_unsupported(const Type* t) {
 }
 
 CAbiLowering::CAbiLowering(CAbi abi, llvm::LLVMContext& ctx, const llvm::DataLayout& dl, TypeTable& types,
-                           std::function<llvm::Type*(Type*)> lt)
-    : abi_(abi), ctx_(ctx), dl_(dl), T(types), lt_(std::move(lt)) {}
+                           std::function<llvm::Type*(Type*)> lt, int flen)
+    : abi_(abi), flen_(abi == CAbi::RISCV ? flen : 0), ctx_(ctx), dl_(dl), T(types), lt_(std::move(lt)) {}
 
 // ---------------------------------------------------------------- type structure
 
@@ -186,7 +190,7 @@ AbiArg CAbiLowering::scalar(Type* t, bool is_return) {
   // Integers narrower than 32 bits (and bool) are extended by the side that
   // produces them, as clang marks them. On RV64 32-bit integers are too,
   // always sign-extended (psABI: "32-bit values are sign-extended").
-  if (bits > 0 && bits < 32) {
+  if (bits > 0 && bits < 32 && abi_ != CAbi::AAPCS64) {  // (AAPCS64: the callee extends)
     a.kind = AbiArg::Extend;
     a.sign_ext = is_signed;
   } else if (bits == 32 && abi_ == CAbi::RISCV && dl_.getPointerSizeInBits() == 64) {
@@ -475,18 +479,131 @@ AbiArg CAbiLowering::arm_return(Type* t) {
   return a;
 }
 
+// ---------------------------------------------------------------- AArch64
+
+AbiArg CAbiLowering::aarch64_arg(Type* t, bool is_return) {
+  if (!is_aggregate(t)) return scalar(t, is_return);
+  if (t->size == 0) return AbiArg{AbiArg::Ignore};
+  AbiArg a;
+  const Type* base = nullptr;
+  uint64_t members = 0;
+  // 6.8 B.2 / C.2: a homogeneous floating-point aggregate goes in v0-v7 (all
+  // of it, or on the stack); clang passes it as an array, returns it as itself.
+  if (homogeneous(t, base, members)) {
+    llvm::Type* b = base->bits == 32 ? llvm::Type::getFloatTy(ctx_) : llvm::Type::getDoubleTy(ctx_);
+    a.type = is_return ? hfa_type(t, base, members) : llvm::ArrayType::get(b, members);
+    return a;
+  }
+  // B.4: over 16 bytes, by reference: a copy the caller makes; results through x8 (sret).
+  if (t->size > 16) {
+    a.kind = AbiArg::Indirect;
+    a.align = t->align;
+    return a;
+  }
+  // C.9-C.11: one or two general registers. Results of up to 8 bytes as an
+  // integer of their size; otherwise whole doublewords, as one i128 when the
+  // composite is 16-byte aligned.
+  if (is_return && t->size <= 8) {
+    a.type = llvm::IntegerType::get(ctx_, (unsigned)(t->size * 8));
+    return a;
+  }
+  int64_t bits = align_up(t->size * 8, 64);
+  // A parameter made only of pointers (one per doubleword): as pointers (as clang passes it).
+  int pointers = 0;
+  bool only_pointers = true;
+  for_each_leaf(t, 0, T, [&](int64_t off, const Type* leaf) {
+    bool p = (leaf->kind == TypeKind::Pointer || leaf->kind == TypeKind::Proc) && leaf->size == 8 && off == 8 * pointers;
+    if (p) ++pointers;
+    else only_pointers = false;
+  });
+  if (!is_return && only_pointers && pointers * 8 == t->size && pointers >= 1) {
+    llvm::Type* ptr = llvm::PointerType::get(ctx_, 0);
+    a.type = pointers == 1 ? ptr : llvm::ArrayType::get(ptr, (uint64_t)pointers);
+    return a;
+  }
+  if (t->align < 16 && bits == 128) a.type = llvm::ArrayType::get(llvm::IntegerType::get(ctx_, 64), 2);
+  else a.type = llvm::IntegerType::get(ctx_, (unsigned)bits);
+  return a;
+}
+
 // ---------------------------------------------------------------- RISC-V
 
 // psABI integer calling convention: aggregates up to XLEN bits in one
 // register, up to 2*XLEN in two (an aligned pair when 2*XLEN aligned) or a
 // register and the stack, larger ones by reference to a copy made by the
 // caller. Results the same, with "by reference" meaning sret.
-AbiArg CAbiLowering::riscv_arg(Type* t, bool is_return) {
-  if (!is_aggregate(t)) return scalar(t, is_return);
-  if (t->size == 0) return AbiArg{AbiArg::Ignore};
+// psABI "Hardware Floating-point Calling Convention": the scalars of a
+// struct (nested structs and arrays flattened), if they are one float, two
+// floats, or a float and an integer (floats of at most FLEN bits, integers of
+// at most XLEN; no unions or pointers). Returns false if t is not like that.
+bool CAbiLowering::riscv_fp_fields(const Type* t, int64_t off, const Type*& f1, int64_t& off1, const Type*& f2,
+                                   int64_t& off2) {
+  if (t->size == 0) return true;
   int64_t xlen = dl_.getPointerSizeInBits();
-  int64_t bits = t->size * 8;
+  switch (t->kind) {
+    case TypeKind::Float: case TypeKind::Int: case TypeKind::Enum: case TypeKind::Bool: {
+      bool is_float = t->kind == TypeKind::Float;
+      if (is_float && t->size * 8 > flen_) return false;
+      if (!is_float && t->size * 8 > xlen) return false;
+      if (!is_float && f1 && f1->kind != TypeKind::Float) return false;  // int + int: not eligible
+      if (!f1) { f1 = t; off1 = off; return true; }
+      if (!f2) { f2 = t; off2 = off; return true; }
+      return false;
+    }
+    case TypeKind::Array:
+      if (t->array_kind != ArrayKind::Fixed) return false;
+      for (int64_t i = 0; i < t->count; ++i)
+        if (!riscv_fp_fields(t->elem, off + i * t->elem->size, f1, off1, f2, off2)) return false;
+      return true;
+    case TypeKind::Struct:
+      if (t->is_union || t->has_place) return false;
+      for (auto& f : t->fields)
+        if (!riscv_fp_fields(f.type, off + f.offset, f1, off1, f2, off2)) return false;
+      return true;
+    default:
+      return false;
+  }
+}
+
+// `gprs` / `fprs`: the argument registers still free (a0-a7 / fa0-fa7), as
+// clang counts them, since a struct only goes in FP registers if they suffice.
+AbiArg CAbiLowering::riscv_arg(Type* t, bool is_return, int& gprs, int& fprs) {
+  int64_t xlen = dl_.getPointerSizeInBits();
+  auto take_gprs = [&](int64_t size_bits) {
+    int need = size_bits > xlen && size_bits <= 2 * xlen ? 2 : 1;
+    gprs -= std::min(need, gprs);
+  };
+  if (!is_aggregate(t)) {
+    if (t->kind == TypeKind::Float && t->size * 8 <= flen_ && fprs > 0) --fprs;
+    else take_gprs(t->size * 8);
+    return scalar(t, is_return);
+  }
+  if (t->size == 0) return AbiArg{AbiArg::Ignore};
   AbiArg a;
+  if (flen_) {
+    const Type *f1 = nullptr, *f2 = nullptr;
+    int64_t off1 = 0, off2 = 0;
+    if (riscv_fp_fields(t, 0, f1, off1, f2, off2) && f1 && (f2 || f1->kind == TypeKind::Float)) {
+      int need_f = (f1->kind == TypeKind::Float) + (f2 && f2->kind == TypeKind::Float);
+      int need_g = (f1->kind != TypeKind::Float) + (f2 && f2->kind != TypeKind::Float);
+      llvm::Type* t1 = lt_(const_cast<Type*>(f1));
+      llvm::Type* t2 = f2 ? lt_(const_cast<Type*>(f2)) : nullptr;
+      if (need_f <= fprs && need_g <= gprs) {
+        fprs -= need_f;
+        gprs -= need_g;
+        if (!t2) {
+          a.type = t1;
+          if (off1 != 0) a.offsets = {off1};
+        } else {
+          a.type = llvm::StructType::get(ctx_, {t1, t2});
+          a.flatten = !is_return;  // two arguments; a result comes back as the pair
+          if (off1 != 0 || off2 != align_up(f1->size, f2->align)) a.offsets = {off1, off2};  // padding between
+        }
+        return a;
+      }
+    }
+  }
+  int64_t bits = t->size * 8;
   if (bits <= xlen) {
     a.type = llvm::IntegerType::get(ctx_, bits);
   } else if (bits <= 2 * xlen) {
@@ -496,6 +613,7 @@ AbiArg CAbiLowering::riscv_arg(Type* t, bool is_return) {
     a.kind = AbiArg::Indirect;
     a.align = t->align;
   }
+  if (!is_return) take_gprs(a.kind == AbiArg::Indirect ? xlen : bits);
   return a;
 }
 
@@ -529,13 +647,19 @@ AbiSignature CAbiLowering::classify(const Type* proc) {
     switch (abi_) {
       case CAbi::X86_64_SysV: s.ret = x86_return(r); break;
       case CAbi::AAPCS: case CAbi::AAPCS_VFP: s.ret = arm_return(r); break;
-      case CAbi::RISCV: s.ret = riscv_arg(r, true); break;
+      case CAbi::RISCV: {  // a result has fa0/fa1 and a0/a1
+        int g = 2, f = flen_ ? 2 : 0;
+        s.ret = riscv_arg(r, true, g, f);
+        break;
+      }
+      case CAbi::AAPCS64: s.ret = aarch64_arg(r, true); break;
       case CAbi::None: s.ret = scalar(r, true); break;
     }
   }
 
   int free_int = 6, free_sse = 8;
   if (s.ret.kind == AbiArg::Indirect) --free_int;
+  int rv_gprs = s.ret.kind == AbiArg::Indirect ? 7 : 8, rv_fprs = flen_ ? 8 : 0;
   for (Type* p : fixed) {
     AbiArg a;
     switch (abi_) {
@@ -551,7 +675,8 @@ AbiSignature CAbiLowering::classify(const Type* proc) {
         break;
       }
       case CAbi::AAPCS: case CAbi::AAPCS_VFP: a = arm_arg(p); break;
-      case CAbi::RISCV: a = riscv_arg(p, false); break;
+      case CAbi::RISCV: a = riscv_arg(p, false, rv_gprs, rv_fprs); break;
+      case CAbi::AAPCS64: a = aarch64_arg(p, false); break;
       case CAbi::None: a = scalar(p, false); break;
     }
     s.params.push_back(a);

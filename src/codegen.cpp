@@ -62,8 +62,11 @@ class CodeGen {
     i32_ = llvm::Type::getInt32Ty(ctx);
     i64_ = llvm::Type::getInt64Ty(ctx);
     void_ = llvm::Type::getVoidTy(ctx);
+    if (!opts.abi.empty())
+      mod_->addModuleFlag(llvm::Module::Error, "target-abi", llvm::MDString::get(ctx, opts.abi));
+    int flen = opts.abi.ends_with("d") ? 64 : opts.abi.ends_with("f") ? 32 : 0;  // ilp32d, ilp32f, lp64d, ...
     cabi_ = std::make_unique<CAbiLowering>(c_abi_for_triple(triple), ctx, dl, types,
-                                           [this](Type* t) { return lt(t); });
+                                           [this](Type* t) { return lt(t); }, flen);
   }
 
   std::unique_ptr<llvm::Module> run() {
@@ -348,6 +351,35 @@ class CodeGen {
     return a;
   }
 
+  // The address of element i of coerced type `ct` in `slot` (AbiArg::offsets when given).
+  llvm::Value* coerced_elem(llvm::Type* ct, llvm::Value* slot, unsigned i, const std::vector<int64_t>& offsets) {
+    if (!offsets.empty()) return b_.CreateConstInBoundsGEP1_64(i8_, slot, (uint64_t)offsets[i]);
+    return b_.CreateStructGEP(ct, slot, i);
+  }
+  // Reads / writes a coerced value (`a.type`) in slot, part by part when a.offsets says where.
+  llvm::Value* load_coerced(const AbiArg& a, llvm::Value* slot) {
+    if (a.offsets.empty()) return b_.CreateLoad(a.type, slot);
+    auto* st = llvm::dyn_cast<llvm::StructType>(a.type);
+    if (!st) return b_.CreateLoad(a.type, coerced_elem(a.type, slot, 0, a.offsets));
+    llvm::Value* v = llvm::UndefValue::get(st);
+    for (unsigned i = 0; i < st->getNumElements(); ++i)
+      v = b_.CreateInsertValue(v, b_.CreateLoad(st->getElementType(i), coerced_elem(st, slot, i, a.offsets)), i);
+    return v;
+  }
+  void store_coerced(const AbiArg& a, llvm::Value* v, llvm::Value* slot) {
+    if (a.offsets.empty()) {
+      b_.CreateStore(v, slot);
+      return;
+    }
+    auto* st = llvm::dyn_cast<llvm::StructType>(a.type);
+    if (!st) {
+      b_.CreateStore(v, coerced_elem(a.type, slot, 0, a.offsets));
+      return;
+    }
+    for (unsigned i = 0; i < st->getNumElements(); ++i)
+      b_.CreateStore(b_.CreateExtractValue(v, i), coerced_elem(st, slot, i, a.offsets));
+  }
+
   // The IR arguments for one Jai argument value `v` of type t.
   void lower_c_arg(const AbiArg& a, Type* t, llvm::Value* v, std::vector<llvm::Value*>& out) {
     switch (a.kind) {
@@ -360,7 +392,7 @@ class CodeGen {
         return;
       }
       case AbiArg::Direct: {
-        if (a.type == lt(t)) {
+        if (a.type == lt(t) && a.offsets.empty()) {
           out.push_back(v);
           return;
         }
@@ -369,9 +401,9 @@ class CodeGen {
         if (a.flatten) {
           auto* st = llvm::cast<llvm::StructType>(a.type);
           for (unsigned i = 0; i < st->getNumElements(); ++i)
-            out.push_back(b_.CreateLoad(st->getElementType(i), b_.CreateStructGEP(st, slot, i)));
+            out.push_back(b_.CreateLoad(st->getElementType(i), coerced_elem(st, slot, i, a.offsets)));
         } else {
-          out.push_back(b_.CreateLoad(a.type, slot));
+          out.push_back(load_coerced(a, slot));
         }
         return;
       }
@@ -401,9 +433,9 @@ class CodeGen {
       case AbiArg::Indirect: return b_.CreateLoad(lt(rt), sret);
       case AbiArg::Extend: return call;
       case AbiArg::Direct: {
-        if (s.ret.type == lt(rt)) return call;
+        if (s.ret.type == lt(rt) && s.ret.offsets.empty()) return call;
         auto* slot = coerce_slot(rt, s.ret.type);
-        b_.CreateStore(call, slot);
+        store_coerced(s.ret, call, slot);
         return b_.CreateLoad(lt(rt), slot);
       }
     }
@@ -421,7 +453,7 @@ class CodeGen {
         sym->llvm_value = fn_->getArg(idx);
         continue;
       }
-      if (a.kind == AbiArg::Ignore || a.kind == AbiArg::Extend || a.type == lt(sym->type)) {
+      if (a.kind == AbiArg::Ignore || a.kind == AbiArg::Extend || (a.type == lt(sym->type) && a.offsets.empty())) {
         auto* slot = make_alloca(sym->type, sym->name);
         if (a.kind != AbiArg::Ignore) b_.CreateStore(fn_->getArg(idx), slot);
         sym->llvm_value = slot;
@@ -431,9 +463,9 @@ class CodeGen {
       if (a.flatten) {
         auto* st = llvm::cast<llvm::StructType>(a.type);
         for (unsigned j = 0; j < st->getNumElements(); ++j)
-          b_.CreateStore(fn_->getArg(idx + j), b_.CreateStructGEP(st, slot, j));
+          b_.CreateStore(fn_->getArg(idx + j), coerced_elem(st, slot, j, a.offsets));
       } else {
-        b_.CreateStore(fn_->getArg(idx), slot);
+        store_coerced(a, fn_->getArg(idx), slot);
       }
       sym->llvm_value = slot;
     }
@@ -451,13 +483,13 @@ class CodeGen {
         return;
       case AbiArg::Extend: b_.CreateRet(v); return;
       case AbiArg::Direct: {
-        if (s.ret.type == lt(rt)) {
+        if (s.ret.type == lt(rt) && s.ret.offsets.empty()) {
           b_.CreateRet(v);
           return;
         }
         auto* slot = coerce_slot(rt, s.ret.type);
         b_.CreateStore(v, slot);
-        b_.CreateRet(b_.CreateLoad(s.ret.type, slot));
+        b_.CreateRet(load_coerced(s.ret, slot));
         return;
       }
     }
@@ -1011,6 +1043,8 @@ class CodeGen {
     context_ptr_ = new llvm::GlobalVariable(*mod_, ptr_, false, llvm::GlobalValue::InternalLinkage,
                                             llvm::cast<llvm::Constant>(prog_.default_context->llvm_value),
                                             "__ojay_context");
+    // With threads each thread has its own current context (and starts with the default one).
+    if (prog_.uses_threads) context_ptr_->setThreadLocal(true);
   }
 
   // The address of the current Context (its allocator is its first member).

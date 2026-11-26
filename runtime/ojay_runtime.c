@@ -518,13 +518,16 @@ static void *plat_realloc(void *p, int64_t size) {
 /* (valid only while that one is free) and this block's size with two flag   */
 /* bits, INUSE and PREV_INUSE. Sizes include the header and are multiples of */
 /* HEAP_ALIGN (8 bytes on 32-bit targets, 16 on 64-bit), so payloads are     */
-/* HEAP_ALIGN-aligned. Free blocks are on one doubly linked list (links in   */
-/* the payload) and are merged with free neighbours as soon as they are      */
-/* freed, so no two free blocks are ever adjacent. Each arena ends with a    */
-/* zero-size INUSE fence header, so merging never runs off its end.          */
-/* Allocation takes the first free block that fits and splits off the rest  */
-/* when that is big enough to be a block. realloc grows in place into a     */
-/* free successor when it can, and shrinks in place.                        */
+/* HEAP_ALIGN-aligned. Free blocks are on doubly linked lists (links in the  */
+/* payload), one per size class (bin k: sizes 2^k to 2^(k+1)-1), and are     */
+/* merged with free neighbours as soon as they are freed, so no two free     */
+/* blocks are ever adjacent. Each arena ends with a zero-size INUSE fence    */
+/* header, so merging never runs off its end. Allocation searches the bin   */
+/* of the request's size first fit, then takes the first block of the next  */
+/* non-empty bin (all of which fit), so it does not walk past many small     */
+/* free blocks; it splits off the rest when that is big enough to be a      */
+/* block. realloc grows in place into a free successor when it can, and     */
+/* shrinks in place.                                                         */
 /*                                                                           */
 /* free() and realloc() check the block they are given (in a heap arena,     */
 /* aligned, in use, consistent with its neighbour) and stop the program on a */
@@ -545,7 +548,9 @@ typedef struct HeapBlock {
 #define HEAP_FLAGS (HEAP_INUSE | HEAP_PREV_INUSE)
 #define HEAP_MAX_ARENAS 64
 
-static HeapBlock *heap_free_list;
+#define HEAP_BINS (8 * sizeof(size_t))
+static HeapBlock *heap_bins[HEAP_BINS];
+static size_t heap_bin_mask; /* bit k set: heap_bins[k] is not empty */
 static struct {
   uint8_t *start, *end; /* end: the fence header */
 } heap_arenas[HEAP_MAX_ARENAS];
@@ -556,19 +561,41 @@ static size_t blk_size(const HeapBlock *b) { return b->head & ~HEAP_FLAGS; }
 static HeapBlock *blk_next(HeapBlock *b) { return (HeapBlock *)((uint8_t *)b + blk_size(b)); }
 static void *blk_payload(HeapBlock *b) { return (uint8_t *)b + HEAP_HDR; }
 
+/* The size class of a block of `size` bytes: floor(log2(size)). */
+static unsigned heap_bin(size_t size) {
+  return (unsigned)(8 * sizeof(size_t) - 1) - (unsigned)(sizeof(size_t) == 8 ? __builtin_clzll((unsigned long long)size)
+                                                                             : __builtin_clz((unsigned)size));
+}
+
 static void heap_link(HeapBlock *b) {
+  unsigned k = heap_bin(blk_size(b));
   b->prev = 0;
-  b->next = heap_free_list;
-  if (heap_free_list) heap_free_list->prev = b;
-  heap_free_list = b;
+  b->next = heap_bins[k];
+  if (b->next) b->next->prev = b;
+  heap_bins[k] = b;
+  heap_bin_mask |= (size_t)1 << k;
   heap_free_bytes += blk_size(b);
 }
 
 static void heap_unlink(HeapBlock *b) {
+  unsigned k = heap_bin(blk_size(b));
   if (b->prev) b->prev->next = b->next;
-  else heap_free_list = b->next;
+  else heap_bins[k] = b->next;
   if (b->next) b->next->prev = b->prev;
+  if (!heap_bins[k]) heap_bin_mask &= ~((size_t)1 << k);
   heap_free_bytes -= blk_size(b);
+}
+
+/* A free block of at least `need` bytes, or null. */
+static HeapBlock *heap_find(size_t need) {
+  unsigned k = heap_bin(need);
+  for (HeapBlock *b = heap_bins[k]; b; b = b->next)
+    if (blk_size(b) >= need) return b;
+  size_t higher = k + 1 < HEAP_BINS ? heap_bin_mask & ~(((size_t)2 << k) - 1) : 0;
+  if (!higher) return 0;
+  unsigned j = (unsigned)(sizeof(size_t) == 8 ? __builtin_ctzll((unsigned long long)higher)
+                                              : __builtin_ctz((unsigned)higher));
+  return heap_bins[j];
 }
 
 /* Makes `b` (not on the free list, flags of its own as given) free and puts
@@ -619,8 +646,9 @@ static int heap_add_arena(size_t min) {
 
 static size_t heap_largest_free(void) {
   size_t m = 0;
-  for (HeapBlock *b = heap_free_list; b; b = b->next)
-    if (blk_size(b) > m) m = blk_size(b);
+  for (unsigned k = 0; k < HEAP_BINS; ++k)
+    for (HeapBlock *b = heap_bins[k]; b; b = b->next)
+      if (blk_size(b) > m) m = blk_size(b);
   return m > HEAP_HDR ? m - HEAP_HDR : 0;
 }
 
@@ -638,8 +666,8 @@ static void *plat_alloc(int64_t n) {
   size_t need = heap_need(n);
   if (!need) heap_out_of_memory(n);
   for (;;) {
-    for (HeapBlock *b = heap_free_list; b; b = b->next) {
-      if (blk_size(b) < need) continue;
+    HeapBlock *b = heap_find(need);
+    if (b) {
       heap_unlink(b);
       b->head |= HEAP_INUSE;
       blk_next(b)->head |= HEAP_PREV_INUSE;
@@ -659,7 +687,8 @@ static void *plat_alloc_aligned(int64_t n, int64_t align) {
   if (!need || (uint64_t)align > (uint64_t)(SIZE_MAX / 4)) heap_out_of_memory(n);
   uintptr_t a = (uintptr_t)align;
   for (;;) {
-    for (HeapBlock *b = heap_free_list; b; b = b->next) {
+    for (unsigned k = heap_bin(need); k < HEAP_BINS; ++k)
+    for (HeapBlock *b = heap_bins[k]; b; b = b->next) {
       uintptr_t start = (uintptr_t)b, end = start + blk_size(b);
       uintptr_t p = (start + HEAP_HDR + a - 1) & ~(a - 1);
       while (p - HEAP_HDR != start && p - HEAP_HDR - start < HEAP_MIN_BLOCK) p += a;

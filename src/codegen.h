@@ -17,6 +17,7 @@ struct CodegenOptions {
   bool bounds_checks = true;
   bool short_enums = false;  // ARM EABI: objects declare variable-size enums
   std::string module_name = "jai";
+  std::string abi;  // the target ABI name (--abi), e.g. ilp32d
 };
 
 // Generates an LLVM module. The module's data layout and triple must be set by

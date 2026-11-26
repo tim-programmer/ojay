@@ -14,20 +14,19 @@ What is implemented is documented in `README.md`; this file lists only what is n
       the enums nested inside the structs as in Jai, `Type_Info_Overload_Set` and
       `Type_Info_Polymorphic_Variable`
 - [ ] The other `Allocator_Mode`s (`STARTUP`, `CAPS`, ...)
-- [ ] Threads and thread contexts (the context is a single global pointer, so this means
-      changing how the context is found)
+- [ ] Threads on bare metal (an RTOS), and atomics other than x86-64's `atomic_add` / `atomic_swap`
 
 ## C ABI
 
-- [ ] Other targets' C ABIs (only scalars cross the C boundary there)
-- [ ] The RISC-V hard-float ABIs ilp32f / ilp32d
+- [ ] Other targets' C ABIs (only scalars cross the C boundary there): Apple's AArch64 variant,
+      Windows x64; a runtime library for AArch64 Linux
+- [ ] Runtime libraries for RISC-V ilp32f / ilp32d (the compilers support those ABIs)
 
 ## Runtime and modules
 
-- [ ] More modules: `POSIX`, `Compiler`, `Thread`; `File` on bare metal (semihosting file calls)
+- [ ] More modules: `POSIX`, `Compiler`; `File` on bare metal (semihosting file calls)
 - [ ] Basic and Math: `Matrix2`, Jai's chained `String_Builder` buffers, moving
       `min` / `max` / `abs` from built-ins to Jai
-- [ ] Allocator: size-class bins for faster allocation with many free blocks
 - [ ] Command-line arguments: Jai's `__command_line_arguments` global (`get_command_line_arguments()` works)
 - [ ] Cortex-M console: input, a UART for the MPS2 / QEMU board, separate stdout and stderr
 

@@ -47,7 +47,7 @@ build/bin/ojay-riscv  -O2 hello.jai -o hello.riscv.o
 ```
 
 Options: `-o`, `-c` (object, the default), `-S` (assembly), `--emit-llvm`,
-`-O0..-O3`, `--target`, `--cpu`, `--features`, `--pic`/`--no-pic`, `-I`,
+`-O0..-O3`, `--target`, `--cpu`, `--features`, `--abi`, `--pic`/`--no-pic`, `-I`,
 `--no-bounds-check`. See `--help`. If the program defines `main`, the object
 also defines the C entry point `main`; otherwise it is a library object.
 `#system_library` dependencies are recorded in the object's `.deplibs`
@@ -128,12 +128,13 @@ Serial/JTAG port.
   `.data` copy, `.bss` clear, then `main`).
 * The heap is the RAM between `.bss` and the stack (`STACK_SIZE` in the
   board script); on the MCX N947 RAM image that is about 110 KB. `free` and
-  `realloc` give memory back: the allocator is a first-fit free list with
-  boundary tags. Freed blocks are merged with free neighbours immediately,
-  `realloc` grows into a free successor or shrinks in place, and blocks are
-  8-byte aligned with 8 bytes of overhead each (16 and 16 on 64-bit). There
-  is one free list, so allocation time grows with the number of free
-  blocks. The freestanding x86-64 runtime uses the same allocator over
+  `realloc` give memory back: the allocator keeps free blocks in
+  power-of-two size classes with boundary tags (a request searches its own
+  class first fit, then takes any block of a larger class, so it never
+  walks past many small free blocks). Freed blocks are merged with free
+  neighbours immediately, `realloc` grows into a free successor or shrinks
+  in place, and blocks are 8-byte aligned with 8 bytes of overhead each (16
+  and 16 on 64-bit). The freestanding x86-64 runtime uses the same allocator over
   `mmap`ed chunks; hosted Linux uses libc's `malloc`.
 * Running out of memory stops the program with exit status 1 and a message
   on stderr giving the request and the heap's state (size, free bytes,
@@ -492,6 +493,16 @@ Implemented:
     `file_seek` (`File_Seek_Type`), `file_tell`, `read_entire_file`
     (`zero_terminated`), `write_entire_file`, `file_exists`, `file_delete`,
     `make_directory_if_it_does_not_exist`.
+  * Thread (all Jai, `src/modules/Thread.jai`; Linux only, POSIX threads):
+    `Thread` (`proc`, `data`, `index`, `result`), `thread_init`,
+    `thread_start`, `thread_is_done` (waiting up to some milliseconds, -1:
+    until done), `thread_deinit`; `Mutex` (`init`, `lock`, `unlock`,
+    `destroy`), `Semaphore` (`init`, `signal`, `wait_for` with a timeout,
+    `destroy`); `atomic_add` and `atomic_swap` on an `s64` (x86-64). A
+    program that imports it has a current context per thread (a thread-local
+    variable): each thread runs in a copy of the context `thread_init` was
+    called in, with its own temporary storage and `context.thread_index` (the
+    main thread's is 0).
   Differences from Jai's modules: `array_reserve` and `String_Builder`
   memory come from the array's allocator (`context.allocator` when it first
   grows), `String_Builder` is one growing buffer rather than a chain of
@@ -715,8 +726,21 @@ on_event :: (e: Event) -> s32 #c_call #program_export "app_on_event" { ... }  //
     convention: structs of up to 8 bytes in one or two registers (or a
     register and the stack); larger ones by reference to a copy the caller
     makes; results up to 8 bytes in a0/a1, larger ones through `sret`.
+  * RISC-V ilp32f / ilp32d (`--features +m,+a,+c,+f[,+d] --abi ilp32f|ilp32d`,
+    for chips with an FPU): additionally floats (up to 32 / 64 bits) in
+    fa0-fa7, and structs of one float, two floats, or a float and an
+    integer (nested structs and arrays flattened) in FP and integer
+    registers while enough are free, as the psABI's hardware floating-point
+    convention says. ojay's RISC-V runtime library is built for ilp32 (the
+    ESP32-C6), so such programs need a runtime built for their ABI.
+  * AArch64 Linux (`--target aarch64-unknown-linux-gnu` with any ojay
+    compiler; AAPCS64): homogeneous aggregates of 1-4 floats or doubles in
+    v0-v7, other structs of up to 16 bytes in one or two x registers (as
+    pointers when they are only pointers), larger ones by reference to a
+    copy the caller makes and results through x8 (`sret`). The compilers
+    produce AArch64 objects, but ojay has no AArch64 runtime library yet.
   * Integers narrower than 32 bits and `bool` are sign- or zero-extended as
-    C expects (`signext` / `zeroext`).
+    C expects (`signext` / `zeroext`; on AArch64 the callee extends them).
 * `#c_call` procedures have no context and no hidden parameter, so the C
   prototype is exactly the Jai signature.
 * The classification is in `src/abi.cpp`. `tools/check_c_abi.py` compiles

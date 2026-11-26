@@ -42,6 +42,7 @@ extern const char* const kHashTableSource;
 extern const char* const kStringSource;
 extern const char* const kRandomSource;
 extern const char* const kFileSource;
+extern const char* const kThreadSource;
 
 namespace {
 
@@ -51,6 +52,7 @@ const char* embedded_module_source(const std::string& name) {
   if (name == "String") return kStringSource;
   if (name == "Random") return kRandomSource;
   if (name == "File") return kFileSource;
+  if (name == "Thread") return kThreadSource;
   return nullptr;
 }
 
@@ -62,6 +64,7 @@ struct Options {
   Emit emit = Emit::Object;
   int opt_level = 0;
   std::string triple, cpu, features;
+  std::string abi;  // --abi: the target ABI name (RISC-V: ilp32, ilp32f, ilp32d, ...)
   bool pic = false;
   std::vector<std::string> import_dirs;
   bool bounds_checks = true;
@@ -82,6 +85,7 @@ void usage(const TargetDesc& t, std::ostream& os) {
      << "  --target <triple>   override the target triple\n"
      << "  --cpu <name>        override the target CPU (default " << t.cpu << ")\n"
      << "  --features <list>   override target features\n"
+     << "  --abi <name>        target ABI (RISC-V: ilp32 (default), ilp32f, ilp32d with +f / +d)\n"
      << "  --pic / --no-pic    position-independent code (default " << (t.pic_by_default ? "--pic" : "--no-pic")
      << ")\n"
      << "  -I <dir>            add a module search directory\n"
@@ -212,6 +216,7 @@ class Loader {
     }
     // Modules written in Jai that come with the compiler.
     if (const char* src = embedded_module_source(name)) {
+      if (name == "Thread") prog_.uses_threads = true;
       prog_.modules.push_back({name, ModuleUnit::Kind::File, {}});
       modules_[name] = unit;
       uint32_t id = sm_.add("<" + name + ">", src);
@@ -221,9 +226,9 @@ class Loader {
       tl.insert(tl.end(), stmts.begin(), stmts.end());
       return unit;
     }
-    if (name == "Compiler" || name == "POSIX" || name == "Thread") {
+    if (name == "Compiler" || name == "POSIX") {
       fail(loc, "module \"", name, "\" is not available yet (built-in modules: Basic, Math, Hash_Table, String, "
-           "Random, File, Hardware)");
+           "Random, File, Thread, Hardware)");
     }
     fail(loc, "module \"", name, "\" not found (searched ", dirs.size(), " director",
          dirs.size() == 1 ? "y" : "ies", "; use -I to add more)");
@@ -281,6 +286,8 @@ int driver_main(int argc, char** argv, const TargetDesc& target) {
       o.cpu = need("--cpu");
     } else if (a == "--features") {
       o.features = need("--features");
+    } else if (a == "--abi") {
+      o.abi = need("--abi");
     } else if (a == "--pic") {
       o.pic = true;
     } else if (a == "--no-pic") {
@@ -345,6 +352,7 @@ int driver_main(int argc, char** argv, const TargetDesc& target) {
     return 1;
   }
   llvm::TargetOptions topts;
+  topts.MCOptions.ABIName = o.abi;
   if (triple.getEnvironment() == llvm::Triple::EABIHF || triple.getEnvironment() == llvm::Triple::GNUEABIHF)
     topts.FloatABIType = llvm::FloatABI::Hard;
   llvm::Reloc::Model reloc = o.pic ? llvm::Reloc::PIC_ : llvm::Reloc::Static;
@@ -398,6 +406,7 @@ int driver_main(int argc, char** argv, const TargetDesc& target) {
     CodegenOptions copts;
     copts.bounds_checks = o.bounds_checks;
     copts.module_name = o.input;
+    copts.abi = o.abi;
     // Match the AAPCS bare-metal ABI used by arm-none-eabi libraries.
     copts.short_enums = target.platform == Platform::BareMetal && (triple.isARM() || triple.isThumb());
     mod = generate_module(ctx, tm->createDataLayout(), o.triple, prog, types, sm, copts);

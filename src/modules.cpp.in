@@ -8,6 +8,7 @@ extern const char* const kHashTableSource;
 extern const char* const kStringSource;
 extern const char* const kRandomSource;
 extern const char* const kFileSource;
+extern const char* const kThreadSource;
 const char* const kBasicSource = R"OJAY_MODULE(@OJAY_BASIC@)OJAY_MODULE";
 const char* const kMathSource = R"OJAY_MODULE(@OJAY_MATH@)OJAY_MODULE";
 const char* const kCoreSource = R"OJAY_MODULE(@OJAY_CORE@)OJAY_MODULE";
@@ -16,4 +17,5 @@ const char* const kHashTableSource = R"OJAY_MODULE(@OJAY_HASH_TABLE@)OJAY_MODULE
 const char* const kStringSource = R"OJAY_MODULE(@OJAY_STRING@)OJAY_MODULE";
 const char* const kRandomSource = R"OJAY_MODULE(@OJAY_RANDOM@)OJAY_MODULE";
 const char* const kFileSource = R"OJAY_MODULE(@OJAY_FILE@)OJAY_MODULE";
+const char* const kThreadSource = R"OJAY_MODULE(@OJAY_THREAD@)OJAY_MODULE";
 }  // namespace ojay

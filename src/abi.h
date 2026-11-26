@@ -29,7 +29,8 @@ enum class CAbi {
   X86_64_SysV,  // System V AMD64 psABI
   AAPCS,        // Arm AAPCS, base standard (soft float)
   AAPCS_VFP,    // Arm AAPCS, VFP variant (hard float)
-  RISCV,        // RISC-V ilp32 / lp64 integer calling convention (no hardware FP ABI)
+  RISCV,        // RISC-V ilp32 / lp64, and with flen ilp32f / ilp32d / lp64d (hardware floating point)
+  AAPCS64,      // Arm 64-bit AAPCS (Linux and other non-Apple systems)
 };
 
 CAbi c_abi_for_triple(const std::string& triple);
@@ -53,6 +54,10 @@ struct AbiArg {
   bool sign_ext = false;  // Extend: signext (else zeroext)
   bool byval = false;     // Indirect parameter: `byval` (else a plain pointer to a copy the caller made)
   uint64_t align = 0;     // Indirect: alignment of the memory
+  // Direct: where the value's parts are in memory, when not where `type`'s
+  // layout puts them (padding between them): the byte offset of each element
+  // of `type` (a struct), or of `type` itself.
+  std::vector<int64_t> offsets;
 };
 
 struct AbiSignature {
@@ -65,14 +70,17 @@ struct AbiSignature {
 
 class CAbiLowering {
  public:
+  // flen: RISC-V's floating-point registers' width for the ABI (32: ilp32f,
+  // 64: ilp32d / lp64d), 0 for the integer ABIs.
   CAbiLowering(CAbi abi, llvm::LLVMContext& ctx, const llvm::DataLayout& dl, TypeTable& types,
-               std::function<llvm::Type*(Type*)> lt);
+               std::function<llvm::Type*(Type*)> lt, int flen = 0);
 
   // `proc` is a #c_call procedure type with at most one result.
   AbiSignature classify(const Type* proc);
 
  private:
   CAbi abi_;
+  int flen_ = 0;
   llvm::LLVMContext& ctx_;
   const llvm::DataLayout& dl_;
   TypeTable& T;
@@ -100,7 +108,11 @@ class CAbiLowering {
   AbiArg arm_return(Type* t);
 
   // RISC-V
-  AbiArg riscv_arg(Type* t, bool is_return);
+  AbiArg riscv_arg(Type* t, bool is_return, int& gprs, int& fprs);
+  bool riscv_fp_fields(const Type* t, int64_t off, const Type*& f1, int64_t& off1, const Type*& f2, int64_t& off2);
+
+  // AArch64
+  AbiArg aarch64_arg(Type* t, bool is_return);
 };
 
 }  // namespace ojay
