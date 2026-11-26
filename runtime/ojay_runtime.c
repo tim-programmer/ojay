@@ -48,29 +48,87 @@ typedef struct {
   OAllocator allocator; /* set when the array first grows (to context.allocator) */
 } ODynArray;
 
+/* Runtime type information: the layout of Type_Info and the Type_Info_*
+   structs in src/type_info.jai (the compiler emits them; keep in sync). */
 enum {
-  TI_VOID = 0, TI_BOOL, TI_INT, TI_FLOAT, TI_STRING, TI_POINTER, TI_ARRAY, TI_STRUCT, TI_ENUM, TI_PROC,
-  TI_ANY, TI_TYPE,
+  TI_INTEGER = 0, TI_FLOAT = 1, TI_BOOL = 2, TI_STRING = 3, TI_POINTER = 4, TI_PROCEDURE = 5, TI_VOID = 6,
+  TI_STRUCT = 7, TI_ARRAY = 8, TI_OVERLOAD_SET = 9, TI_ANY = 10, TI_ENUM = 11, TI_POLYMORPHIC_VARIABLE = 12,
+  TI_TYPE = 13, TI_CODE = 14,
 };
 
-struct OTypeInfo;
-typedef struct {
-  const uint8_t *name;
-  int64_t name_len;
-  const struct OTypeInfo *type;
-  int64_t value; /* struct: byte offset; enum: member value */
-} OMember;
-
 typedef struct OTypeInfo {
-  int64_t kind;
-  int64_t size;
-  int64_t flags; /* int: signed; enum: 1=signed 2=flags; array: 0 fixed 1 view 2 dynamic; struct: 1=union */
-  int64_t count; /* fixed array count, or number of members */
-  const struct OTypeInfo *elem;
-  const uint8_t *name;
-  int64_t name_len;
-  const OMember *members;
+  uint32_t type; /* TI_* */
+  int64_t runtime_size;
 } OTypeInfo;
+
+typedef struct {
+  OTypeInfo info;
+  uint8_t is_signed;
+} OTypeInfoInteger;
+
+typedef struct {
+  OTypeInfo info;
+  const OTypeInfo *pointer_to;
+} OTypeInfoPointer;
+
+enum { TI_ARRAY_FIXED = 0, TI_ARRAY_VIEW = 1, TI_ARRAY_RESIZABLE = 2 };
+
+typedef struct {
+  OTypeInfo info;
+  const OTypeInfo *element_type;
+  uint32_t array_type;
+  int64_t array_count;
+} OTypeInfoArray;
+
+typedef struct {
+  OString name;
+  const OTypeInfo *type;
+  int64_t offset_in_bytes;
+  uint32_t flags;
+} OTypeInfoMember;
+
+enum { TI_STRUCT_UNION = 0x2 };
+
+typedef struct {
+  OTypeInfo info;
+  OString name;
+  struct {
+    int64_t count;
+    const OTypeInfoMember *data;
+  } members;
+  uint32_t textual_flags;
+} OTypeInfoStruct;
+
+enum { TI_ENUM_FLAGS = 0x1 };
+
+typedef struct {
+  OTypeInfo info;
+  OString name;
+  const OTypeInfoInteger *internal_type;
+  uint32_t enum_type_flags;
+  struct {
+    int64_t count;
+    const OString *data;
+  } names;
+  struct {
+    int64_t count;
+    const int64_t *data;
+  } values;
+} OTypeInfoEnum;
+
+enum { TI_PROC_C_CALL = 0x1, TI_PROC_VARARGS = 0x2 };
+
+typedef struct {
+  int64_t count;
+  const OTypeInfo *const *data;
+} OTypeInfoList;
+
+typedef struct {
+  OTypeInfo info;
+  OTypeInfoList argument_types;
+  OTypeInfoList return_types;
+  uint32_t procedure_flags;
+} OTypeInfoProcedure;
 
 typedef struct {
   const OTypeInfo *type;
@@ -783,13 +841,15 @@ static int64_t read_int(const void *p, int64_t size, int is_signed) {
 
 static void print_value(Out *o, const OTypeInfo *t, const void *v, int depth);
 
-static void print_enum(Out *o, const OTypeInfo *t, const void *v) {
-  int is_signed = (int)(t->flags & 1);
-  int64_t val = read_int(v, t->size, is_signed);
-  if (!(t->flags & 2)) {
-    for (int64_t i = 0; i < t->count; ++i) {
-      if (t->members[i].value == val) {
-        out_bytes(o, t->members[i].name, t->members[i].name_len);
+static void print_enum(Out *o, const OTypeInfo *ti, const void *v) {
+  const OTypeInfoEnum *t = (const OTypeInfoEnum *)ti;
+  int is_signed = t->internal_type->is_signed;
+  int64_t val = read_int(v, ti->runtime_size, is_signed);
+  int64_t n = t->values.count;
+  if (!(t->enum_type_flags & TI_ENUM_FLAGS)) {
+    for (int64_t i = 0; i < n; ++i) {
+      if (t->values.data[i] == val) {
+        out_bytes(o, t->names.data[i].data, t->names.data[i].count);
         return;
       }
     }
@@ -798,9 +858,9 @@ static void print_enum(Out *o, const OTypeInfo *t, const void *v) {
   }
   /* enum_flags */
   if (val == 0) {
-    for (int64_t i = 0; i < t->count; ++i)
-      if (t->members[i].value == 0) {
-        out_bytes(o, t->members[i].name, t->members[i].name_len);
+    for (int64_t i = 0; i < n; ++i)
+      if (t->values.data[i] == 0) {
+        out_bytes(o, t->names.data[i].data, t->names.data[i].count);
         return;
       }
     out_cstr(o, "0");
@@ -808,11 +868,11 @@ static void print_enum(Out *o, const OTypeInfo *t, const void *v) {
   }
   uint64_t rest = (uint64_t)val;
   int first = 1;
-  for (int64_t i = 0; i < t->count; ++i) {
-    uint64_t m = (uint64_t)t->members[i].value;
+  for (int64_t i = 0; i < n; ++i) {
+    uint64_t m = (uint64_t)t->values.data[i];
     if (m && (rest & m) == m) {
       if (!first) out_cstr(o, " | ");
-      out_bytes(o, t->members[i].name, t->members[i].name_len);
+      out_bytes(o, t->names.data[i].data, t->names.data[i].count);
       rest &= ~m;
       first = 0;
     }
@@ -823,14 +883,88 @@ static void print_enum(Out *o, const OTypeInfo *t, const void *v) {
   }
 }
 
+/* A type's name, as the compiler writes it (s64, *Node, [..]u8, (s32) -> bool, ...). */
+static void print_type_name(Out *o, const OTypeInfo *t, int depth) {
+  if (!t) {
+    out_cstr(o, "(null type)");
+    return;
+  }
+  if (depth > 16) {
+    out_cstr(o, "...");
+    return;
+  }
+  switch (t->type) {
+    case TI_INTEGER:
+      out_cstr(o, ((const OTypeInfoInteger *)t)->is_signed ? "s" : "u");
+      out_u64(o, (uint64_t)t->runtime_size * 8);
+      return;
+    case TI_FLOAT: out_cstr(o, t->runtime_size == 4 ? "float32" : "float64"); return;
+    case TI_BOOL: out_cstr(o, "bool"); return;
+    case TI_STRING: out_cstr(o, "string"); return;
+    case TI_VOID: out_cstr(o, "void"); return;
+    case TI_ANY: out_cstr(o, "Any"); return;
+    case TI_TYPE: out_cstr(o, "Type"); return;
+    case TI_CODE: out_cstr(o, "Code"); return;
+    case TI_POINTER:
+      out_cstr(o, "*");
+      print_type_name(o, ((const OTypeInfoPointer *)t)->pointer_to, depth + 1);
+      return;
+    case TI_ARRAY: {
+      const OTypeInfoArray *a = (const OTypeInfoArray *)t;
+      if (a->array_type == TI_ARRAY_FIXED) {
+        out_cstr(o, "[");
+        out_s64(o, a->array_count);
+        out_cstr(o, "]");
+      } else {
+        out_cstr(o, a->array_type == TI_ARRAY_VIEW ? "[]" : "[..]");
+      }
+      print_type_name(o, a->element_type, depth + 1);
+      return;
+    }
+    case TI_STRUCT: {
+      const OTypeInfoStruct *st = (const OTypeInfoStruct *)t;
+      out_bytes(o, st->name.data, st->name.count);
+      return;
+    }
+    case TI_ENUM: {
+      const OTypeInfoEnum *e = (const OTypeInfoEnum *)t;
+      out_bytes(o, e->name.data, e->name.count);
+      return;
+    }
+    case TI_PROCEDURE: {
+      const OTypeInfoProcedure *p = (const OTypeInfoProcedure *)t;
+      out_cstr(o, "(");
+      for (int64_t i = 0; i < p->argument_types.count; ++i) {
+        const OTypeInfo *a = p->argument_types.data[i];
+        if (i) out_cstr(o, ", ");
+        if ((p->procedure_flags & TI_PROC_VARARGS) && i + 1 == p->argument_types.count && a->type == TI_ARRAY) {
+          out_cstr(o, "..");
+          a = ((const OTypeInfoArray *)a)->element_type;
+        }
+        print_type_name(o, a, depth + 1);
+      }
+      out_cstr(o, ")");
+      for (int64_t i = 0; i < p->return_types.count; ++i) {
+        out_cstr(o, i ? ", " : " -> ");
+        print_type_name(o, p->return_types.data[i], depth + 1);
+      }
+      if (p->procedure_flags & TI_PROC_C_CALL) out_cstr(o, " #c_call");
+      return;
+    }
+    default: out_cstr(o, "(unknown type)"); return;
+  }
+}
+
 /* The members of a struct, or the first of a union. Anonymous struct and
    union members (no name) are shown inline, as members of the enclosing one. */
-static void print_members(Out *o, const OTypeInfo *t, const void *v, int depth, int *first) {
-  int64_t n = (t->flags & 1) && t->count > 0 ? 1 : t->count; /* unions: first member */
+static void print_members(Out *o, const OTypeInfo *ti, const void *v, int depth, int *first) {
+  const OTypeInfoStruct *t = (const OTypeInfoStruct *)ti;
+  int64_t n = t->members.count;
+  if ((t->textual_flags & TI_STRUCT_UNION) && n > 0) n = 1; /* unions: first member */
   for (int64_t i = 0; i < n; ++i) {
-    const OMember *m = &t->members[i];
-    const uint8_t *p = (const uint8_t *)v + m->value;
-    if (m->name_len == 0 && m->type->kind == TI_STRUCT) {
+    const OTypeInfoMember *m = &t->members.data[i];
+    const uint8_t *p = (const uint8_t *)v + m->offset_in_bytes;
+    if (m->name.count == 0 && m->type->type == TI_STRUCT) {
       print_members(o, m->type, p, depth, first);
       continue;
     }
@@ -845,16 +979,16 @@ static void print_value(Out *o, const OTypeInfo *t, const void *v, int depth) {
     out_cstr(o, "...");
     return;
   }
-  switch (t->kind) {
+  switch (t->type) {
     case TI_VOID: out_cstr(o, "void"); return;
     case TI_BOOL: out_cstr(o, *(const uint8_t *)v ? "true" : "false"); return;
-    case TI_INT:
-      if (t->flags & 1) out_s64(o, read_int(v, t->size, 1));
-      else if (t->size == 8) out_u64(o, *(const uint64_t *)v);
-      else out_u64(o, (uint64_t)read_int(v, t->size, 0));
+    case TI_INTEGER:
+      if (((const OTypeInfoInteger *)t)->is_signed) out_s64(o, read_int(v, t->runtime_size, 1));
+      else if (t->runtime_size == 8) out_u64(o, *(const uint64_t *)v);
+      else out_u64(o, (uint64_t)read_int(v, t->runtime_size, 0));
       return;
     case TI_FLOAT:
-      out_f64(o, t->size == 4 ? (double)*(const float *)v : *(const double *)v);
+      out_f64(o, t->runtime_size == 4 ? (double)*(const float *)v : *(const double *)v);
       return;
     case TI_STRING: {
       const OString *s = (const OString *)v;
@@ -862,17 +996,18 @@ static void print_value(Out *o, const OTypeInfo *t, const void *v, int depth) {
       return;
     }
     case TI_POINTER:
-    case TI_PROC: {
+    case TI_PROCEDURE: {
       uintptr_t p = *(const uintptr_t *)v;
       if (!p) out_cstr(o, "null");
       else out_hex(o, (uint64_t)p);
       return;
     }
     case TI_ARRAY: {
+      const OTypeInfoArray *at = (const OTypeInfoArray *)t;
       int64_t count;
       const uint8_t *data;
-      if (t->flags == 0) {
-        count = t->count;
+      if (at->array_type == TI_ARRAY_FIXED) {
+        count = at->array_count;
         data = (const uint8_t *)v;
       } else {
         const OString *view = (const OString *)v; /* same layout as a view */
@@ -882,7 +1017,7 @@ static void print_value(Out *o, const OTypeInfo *t, const void *v, int depth) {
       out_bytes(o, "[", 1);
       for (int64_t i = 0; i < count; ++i) {
         if (i) out_cstr(o, ", ");
-        print_value(o, t->elem, data + i * t->elem->size, depth + 1);
+        print_value(o, at->element_type, data + i * at->element_type->runtime_size, depth + 1);
       }
       out_bytes(o, "]", 1);
       return;
@@ -900,12 +1035,7 @@ static void print_value(Out *o, const OTypeInfo *t, const void *v, int depth) {
       print_value(o, a->type, a->value, depth + 1);
       return;
     }
-    case TI_TYPE: {
-      const OTypeInfo *ti = *(const OTypeInfo *const *)v;
-      if (ti) out_bytes(o, ti->name, ti->name_len);
-      else out_cstr(o, "(null type)");
-      return;
-    }
+    case TI_TYPE: print_type_name(o, *(const OTypeInfo *const *)v, 0); return;
     default: out_cstr(o, "(unknown)"); return;
   }
 }

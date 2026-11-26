@@ -25,8 +25,35 @@
       procedures, other targets' C ABIs, the RISC-V hard-float ABIs ilp32f/ilp32d)
 - [x] `if x == { case ...; }` switches on strings
 
+- [x] Runtime type info: `type_info(T)` and the `Type_Info_*` structs (`Type_Info_Struct`
+      members, ...), for generic printing and serialization; `print` uses the same tables, and
+      `#run` code can read them (not yet: member `notes`, struct `initializer`,
+      `polymorph_source_struct` and parameters, the enums nested inside the structs as in Jai,
+      `Type_Info_Variant` / `_Overload_Set` / `_Polymorphic_Variable`)
+- [ ] `for_expansion` (custom iteration with `For_Flags`) and `remove it` in `for` loops
+- [ ] `#caller_location` / `#location`
+- [ ] Struct layout and members: constants inside structs (`S :: struct { N :: 3; }`), `#place`,
+      `#align`, `#this`
+- [ ] Distinct types (`#type,distinct`)
+- [ ] Short lambdas: `(x: int) => x * 2`
+- [ ] Smaller directives and intrinsics: `#procedure_name()`, `is_constant()`, `#bytes`,
+      `#exists`, `initializer_of(T)`, `enum_highest_value` and the other enum helpers,
+      `#no_abc`, `#bake_constants`, `#asm`
+- [ ] Remaining polymorphism: `$$` auto-baking, `#bake_arguments`, `$T/Interface` constraints,
+      `$R` introduced in a return type, polymorphic procedure values, `#modify` on structs
+- [ ] Procedures: parameters after a variadic one (named only, e.g. `join(..s, separator = ",")`),
+      variadic `#foreign` procedures (C varargs), `#expand` macros with several return values
+- [ ] `using` on pointer members and at top level, `#as`
+- [ ] Compiler integration: `#compiler` procedures, the message loop (`#run,stallable`),
+      `Code_Node` introspection (`compiler_get_nodes`), `#insert,scope(...)`, `#procedure_of_call`
+- [ ] Threads and thread contexts
+- [ ] Check what `#scope_file`, `inline`, `#must` and `#deprecated` actually do (they compile,
+      but may only be accepted and ignored)
+
 ## Runtime and modules
 
+- [ ] More modules: `Hash_Table` first, then `String`, `File`, `Random`, `POSIX`, `Compiler`,
+      `Thread`
 - [x] A real allocator for bare-metal targets: a first-fit free list with boundary tags and
       immediate merging (not yet: size-class bins for faster allocation with many free blocks)
 - [x] `get_command_line_arguments()` (not yet: `__command_line_arguments`, arguments for

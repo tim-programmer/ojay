@@ -1,0 +1,40 @@
+s8: INTEGER signed=true
+u16: INTEGER signed=false
+s64: INTEGER signed=true
+float32: FLOAT
+float64: FLOAT
+bool: BOOL
+string: STRING
+Any: ANY
+Type: TYPE
+void: VOID
+*Node: POINTER to Node
+**u8: POINTER to *u8
+[4]s32: ARRAY FIXED of s32, count 4
+[]string: ARRAY VIEW of string, count -1
+[..]Color: ARRAY RESIZABLE of Color, count -1
+Color: ENUM Color (0, base u8): RED=0 GREEN=5 BLUE=6
+Access: ENUM Access (FLAGS, base u32): READ=1 WRITE=2 EXEC=4
+(s64, ..string) -> bool, float32: PROCEDURE (s64, []string) -> bool float32, HAS_VARARGS
+(s32) -> s32 #c_call: PROCEDURE (s32) -> s32, IS_C_CALL
+Node: Node (6 members, union false)
+  value : s32 [0]
+  name : string [0]
+  next : *Node [0]
+  pos : struct [USING]
+  color : Color [0]
+  tags : [3]u16 [0]
+offsets and sizes match: true
+Shape: union true, members 2, size ok true
+sizes: true true true true
+a.type == Color: true, a.type.type: ENUM, type_info(Color) == a.type: true
+back: Node, same: true, int as *Type_Info: 8
+member type is *Node: true
+show: {value = -3, name = "root", next = null, x = 1.5, y = 2, color = BLUE, tags = [1, 2, 3]}
+show s64: 42
+show u8: 200
+show string: "str"
+show Access: 5
+show Shape: {radius = 0.5}
+show [2]s64: [7, 8]
+COMPILE_TIME: 6

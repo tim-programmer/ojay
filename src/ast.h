@@ -144,7 +144,7 @@ struct Arg {
 enum class Builtin {
   None,
   // core
-  SizeOf, TypeOf, TypeInfo,
+  SizeOf, TypeOf, TypeInfo,  // type_info(T)
   // Basic
   Print, Sprint, WriteString, Alloc, Free, Realloc, New, NewArray, ArrayAdd, ArrayReserve, ArrayFree, ArrayReset,
   Assert, Exit, Memcpy, Memset, Min, Max, Abs, ToCString, CommandLineArguments,

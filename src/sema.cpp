@@ -17,6 +17,7 @@ namespace ojay {
 extern const char* const kPreloadSource;  // preload.jai (generated preload.cpp)
 extern const char* const kBasicSource;    // modules/Basic.jai (generated modules.cpp)
 extern const char* const kMathSource;     // modules/Math.jai
+extern const char* const kTypeInfoSource; // type_info.jai
 
 namespace {
 
@@ -109,6 +110,7 @@ class Checker : public InterpHost {
   void run() {
     universe_ = new_scope(nullptr, nullptr);
     setup_universe();
+    setup_type_info();
     setup_preload();
     for (auto& m : prog_.modules) {
       m.scope = new_scope(universe_, nullptr);
@@ -126,6 +128,7 @@ class Checker : public InterpHost {
       collect(prog_.modules[i].top_level, false);
       // The Preload is visible in every module, after the module's own imports.
       scope_->imports.push_back(preload_);
+      scope_->imports.push_back(type_info_);
     }
     scope_ = global_;
 
@@ -178,6 +181,7 @@ class Checker : public InterpHost {
   std::vector<std::pair<Stmt*, Scope*>> top_directives_;
   // The Preload (preload.jai): its declarations are resolved only when used.
   Scope* preload_ = nullptr;
+  Scope* type_info_ = nullptr;      // Type_Info and the Type_Info_* structs (type_info.jai)
   Symbol* context_sym_ = nullptr;   // `context`
   bool lazy_collect_ = false;       // collecting the Preload: declarations are not resolved eagerly
   bool context_ready_ = false;
@@ -257,6 +261,7 @@ class Checker : public InterpHost {
   }
   Symbol* default_context() override { return prog_.default_context; }
   ProcLit* allocate_proc() override { return prog_.allocate_proc; }
+  const Program::TypeInfoTypes& type_info_types() override { return prog_.type_info; }
 
  private:
 
@@ -514,6 +519,7 @@ class Checker : public InterpHost {
     add_type(universe_, "Code", T.code_t);
     add_builtin(universe_, "size_of", Builtin::SizeOf);
     add_builtin(universe_, "type_of", Builtin::TypeOf);
+    add_builtin(universe_, "type_info", Builtin::TypeInfo);
   }
 
   // ------------------------------------------------------------------ the context (Preload)
@@ -531,6 +537,7 @@ class Checker : public InterpHost {
     preload_ = new_scope(universe_, nullptr);
     preload_->is_module = true;
     preload_->imports.push_back(internals);
+    preload_->imports.push_back(type_info_);
     std::vector<Stmt*> stmts = parse_source_stmts(ast_, sm_, sm_.add("<preload>", kPreloadSource), true);
     Scope* saved = scope_;
     scope_ = preload_;
@@ -558,9 +565,67 @@ class Checker : public InterpHost {
     lazy_collect_ = false;
     scope_ = saved;
     sc->imports.push_back(preload_);
+    sc->imports.push_back(type_info_);
   }
 
   Symbol* preload_sym(const char* name) { return preload_->syms.at(name); }
+
+  // ------------------------------------------------------------------ runtime type information
+
+  // Type_Info and the Type_Info_* structs, visible in every module. They are
+  // resolved up front (they are only types: they cost nothing until used),
+  // as codegen and the #run interpreter lay out every type's Type_Info with them.
+  void setup_type_info() {
+    type_info_ = new_scope(universe_, nullptr);
+    type_info_->is_module = true;
+    std::vector<Stmt*> stmts = parse_source_stmts(ast_, sm_, sm_.add("<type_info>", kTypeInfoSource), true);
+    Scope* saved = scope_;
+    scope_ = type_info_;
+    lazy_collect_ = true;
+    collect(stmts, true);
+    lazy_collect_ = false;
+    auto get = [&](const char* name) {
+      Symbol* sym = type_info_->syms.at(name);
+      resolve(sym);
+      Type* t = sym->cv.t;
+      complete_type(t, SourceLoc{});
+      return t;
+    };
+    auto& ti = prog_.type_info;
+    ti.info = get("Type_Info");
+    ti.integer = get("Type_Info_Integer");
+    ti.float_ = get("Type_Info_Float");
+    ti.pointer = get("Type_Info_Pointer");
+    ti.array = get("Type_Info_Array");
+    ti.struct_ = get("Type_Info_Struct");
+    ti.member = get("Type_Info_Struct_Member");
+    ti.enum_ = get("Type_Info_Enum");
+    ti.procedure = get("Type_Info_Procedure");
+    scope_ = saved;
+  }
+
+  // Whether t is Type_Info or one of the Type_Info_* structs that start with one.
+  bool is_type_info_struct(const Type* t) const {
+    const auto& ti = prog_.type_info;
+    return t == ti.info || t == ti.integer || t == ti.float_ || t == ti.pointer || t == ti.array ||
+           t == ti.struct_ || t == ti.enum_ || t == ti.procedure;
+  }
+  bool is_type_info_ptr(const Type* t) const { return t->is_pointer() && is_type_info_struct(t->elem); }
+
+  // The Type_Info_* struct type_info(t) returns for t.
+  Type* type_info_struct_for(Type* t) const {
+    const auto& ti = prog_.type_info;
+    switch (t->kind) {
+      case TypeKind::Int: return ti.integer;
+      case TypeKind::Float: return ti.float_;
+      case TypeKind::Pointer: case TypeKind::Null: return ti.pointer;
+      case TypeKind::Array: return ti.array;
+      case TypeKind::Struct: return ti.struct_;
+      case TypeKind::Enum: return ti.enum_;
+      case TypeKind::Proc: return ti.procedure;
+      default: return ti.info;
+    }
+  }
 
   // The program uses the context (or something else of the Preload): from now
   // on allocations go through context.allocator, and code generation needs
@@ -1787,8 +1852,12 @@ class Checker : public InterpHost {
     }
     if (from == T.f32 && to == T.f64) return true;
     if (from->is_pointer() && to->is_pointer()) {
+      if (to->elem == prog_.type_info.info && is_type_info_struct(from->elem)) return true;  // *Type_Info_Struct -> *Type_Info
       return to->elem->kind == TypeKind::Void || from->elem->kind == TypeKind::Void;
     }
+    // A Type is a pointer to its Type_Info.
+    if (from->kind == TypeKind::TypeT && to->is_pointer() && to->elem == prog_.type_info.info) return true;
+    if (is_type_info_ptr(from) && to->kind == TypeKind::TypeT) return true;
     if (from->kind == TypeKind::Array && to->is_view()) {
       return from->array_kind != ArrayKind::View && from->elem == to->elem;
     }
@@ -2569,6 +2638,10 @@ class Checker : public InterpHost {
       default_untyped(m->base);
       bt = m->base->type;
     }
+    if (bt->kind == TypeKind::TypeT) {  // a Type value: the members of its Type_Info (`a.type.runtime_size`)
+      coerce(m->base, T.pointer_to(prog_.type_info.info));
+      bt = m->base->type;
+    }
     if (bt->is_pointer() && bt->elem->kind != TypeKind::Void) {
       m->through_pointer = true;
       bt = bt->elem;
@@ -2709,6 +2782,8 @@ class Checker : public InterpHost {
     else if (from->kind == TypeKind::Bool && intlike(to)) ok = true;
     else if (intlike(from) && to->kind == TypeKind::Bool) ok = true;
     else if ((from->is_pointer() || from->is_proc()) && (to->is_pointer() || to->is_proc())) ok = true;
+    else if (from->kind == TypeKind::TypeT && is_type_info_ptr(to)) ok = true;  // cast(*Type_Info_Struct) T
+    else if (from->is_pointer() && to->kind == TypeKind::TypeT) ok = true;     // cast(Type) info
     else if ((from->is_pointer() || from->is_proc()) && to->kind == TypeKind::Int && to->bits == 64) ok = true;
     else if (from->kind == TypeKind::Int && (to->is_pointer() || to->is_proc())) ok = true;
     else if (implicit_ok(from, to)) ok = true;
@@ -4368,6 +4443,14 @@ class Checker : public InterpHost {
         c->type_arg = t;
         c->cv = ConstValue::of_int(t->size);
         return T.untyped_int;
+      }
+      case Builtin::TypeInfo: {  // type_info(T): T's Type_Info, as the Type_Info_* struct for its kind
+        auto& a = positional(c, 1, 1, "type_info");
+        Type* t = resolve_type(a[0]);
+        if (t->is_untyped()) fail(a[0]->loc, "type_info needs a type, not an untyped constant");
+        complete_type(t, c->loc);
+        c->type_arg = t;
+        return T.pointer_to(type_info_struct_for(t));
       }
       case Builtin::TypeOf: {
         auto& a = positional(c, 1, 1, "type_of");

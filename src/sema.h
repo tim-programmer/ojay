@@ -85,6 +85,19 @@ struct Program {
   Symbol* default_context = nullptr;  // the global Context `context` starts as
   ProcLit* allocate_proc = nullptr;   // __allocate: an allocation through an Allocator (or the context's)
   Type* allocator_type = nullptr;     // Allocator
+  // Runtime type information (type_info.jai): the structs codegen and the
+  // #run interpreter fill in for each type's Type_Info.
+  struct TypeInfoTypes {
+    Type* info = nullptr;       // Type_Info
+    Type* integer = nullptr;    // Type_Info_Integer
+    Type* float_ = nullptr;     // Type_Info_Float
+    Type* pointer = nullptr;    // Type_Info_Pointer
+    Type* array = nullptr;      // Type_Info_Array
+    Type* struct_ = nullptr;    // Type_Info_Struct
+    Type* member = nullptr;     // Type_Info_Struct_Member
+    Type* enum_ = nullptr;      // Type_Info_Enum
+    Type* procedure = nullptr;  // Type_Info_Procedure
+  } type_info;
   // Storage for symbols and scopes (they are referenced from the AST).
   std::vector<std::unique_ptr<Scope>> scopes;
   std::vector<std::unique_ptr<Symbol>> symbols;

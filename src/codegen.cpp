@@ -23,10 +23,10 @@
 namespace ojay {
 namespace {
 
-// Must match runtime/ojay_runtime.c
-enum TiKind : int64_t {
-  TI_VOID = 0, TI_BOOL, TI_INT, TI_FLOAT, TI_STRING, TI_POINTER, TI_ARRAY, TI_STRUCT, TI_ENUM, TI_PROC,
-  TI_ANY, TI_TYPE,
+// Type_Info_Tag (type_info.jai, runtime/ojay_runtime.c)
+enum TiTag : int64_t {
+  TI_INTEGER = 0, TI_FLOAT = 1, TI_BOOL = 2, TI_STRING = 3, TI_POINTER = 4, TI_PROCEDURE = 5, TI_VOID = 6,
+  TI_STRUCT = 7, TI_ARRAY = 8, TI_ANY = 10, TI_ENUM = 11, TI_TYPE = 13, TI_CODE = 14,
 };
 
 struct CgScope {
@@ -58,8 +58,6 @@ class CodeGen {
     i32_ = llvm::Type::getInt32Ty(ctx);
     i64_ = llvm::Type::getInt64Ty(ctx);
     void_ = llvm::Type::getVoidTy(ctx);
-    ti_ty_ = llvm::StructType::create(ctx, {i64_, i64_, i64_, i64_, ptr_, ptr_, i64_, ptr_}, "Type_Info");
-    ti_member_ty_ = llvm::StructType::create(ctx, {ptr_, i64_, ptr_, i64_}, "Type_Info_Member");
     cabi_ = std::make_unique<CAbiLowering>(c_abi_for_triple(triple), ctx, dl, types,
                                            [this](Type* t) { return lt(t); });
   }
@@ -105,8 +103,6 @@ class CodeGen {
   llvm::Type* i32_;
   llvm::Type* i64_;
   llvm::Type* void_;
-  llvm::StructType* ti_ty_;
-  llvm::StructType* ti_member_ty_;
 
   llvm::Function* fn_ = nullptr;
   ProcLit* proc_ = nullptr;
@@ -559,78 +555,141 @@ class CodeGen {
 
   // ------------------------------------------------------------------ type info
 
+  // ---- runtime type information
+  //
+  // Each type gets one constant global holding its Type_Info as the
+  // Type_Info_* struct for its kind (type_info.jai); a Type value points to it.
+
+  using TiFields = std::map<std::string, llvm::Constant*>;
+
+  // A constant of Type_Info_* struct `st` with the given members (by name;
+  // the others are zero). The `using info: Type_Info` member takes `type` and
+  // `runtime_size` from the same map.
+  llvm::Constant* ti_const(Type* st, const TiFields& vals) {
+    std::vector<llvm::Constant*> fields;
+    for (const StructField& f : st->fields) {
+      if (f.is_using && f.type == prog_.type_info.info) {
+        fields.push_back(ti_const(f.type, vals));
+        continue;
+      }
+      auto it = vals.find(f.name);
+      llvm::Constant* v = it != vals.end() ? it->second : llvm::Constant::getNullValue(lt(f.type));
+      llvm::Type* ft = lt(f.type);
+      if (f.type->kind == TypeKind::Int || f.type->kind == TypeKind::Enum) {
+        if (auto* ci = llvm::dyn_cast<llvm::ConstantInt>(v)) v = llvm::ConstantInt::get(ft, ci->getZExtValue());
+      } else if (v->getType() != ft && ft->isStructTy()) {  // a view or string built with a literal struct type
+        auto* fst = llvm::cast<llvm::StructType>(ft);
+        std::vector<llvm::Constant*> es;
+        for (unsigned k = 0; k < fst->getNumElements(); ++k) es.push_back(v->getAggregateElement(k));
+        v = llvm::ConstantStruct::get(fst, es);
+      }
+      fields.push_back(v);
+    }
+    return llvm::ConstantStruct::get(llvm::cast<llvm::StructType>(lt(st)), fields);
+  }
+
+  // A constant view ({count, data}) of `elems`, of element type `elem_t`.
+  llvm::Constant* ti_view(llvm::Type* elem_t, const std::vector<llvm::Constant*>& elems, const std::string& name) {
+    llvm::Constant* data = llvm::ConstantPointerNull::get(llvm::PointerType::get(ctx_, 0));
+    if (!elems.empty()) {
+      auto* at = llvm::ArrayType::get(elem_t, elems.size());
+      data = new llvm::GlobalVariable(*mod_, at, true, llvm::GlobalValue::PrivateLinkage,
+                                      llvm::ConstantArray::get(at, elems), name);
+    }
+    auto* view_t = llvm::StructType::get(ctx_, {i64_, ptr_});
+    return llvm::ConstantStruct::get(view_t, {llvm::ConstantInt::get(i64_, elems.size()), data});
+  }
+
   llvm::Constant* type_info(Type* t) {
     if (t->type_info) return t->type_info;
-    auto* gv = new llvm::GlobalVariable(*mod_, ti_ty_, true, llvm::GlobalValue::PrivateLinkage, nullptr,
-                                        "__type_info." + type_name(t));
-    t->type_info = gv;
-    int64_t kind = TI_VOID, flags = 0, count = 0;
-    llvm::Constant* elem = llvm::ConstantPointerNull::get(llvm::PointerType::get(ctx_, 0));
-    llvm::Constant* members = elem;
-    std::string name = type_name(t);
-    auto make_members = [&](const std::vector<llvm::Constant*>& ms) -> llvm::Constant* {
-      auto* at = llvm::ArrayType::get(ti_member_ty_, ms.size());
-      auto* mg = new llvm::GlobalVariable(*mod_, at, true, llvm::GlobalValue::PrivateLinkage,
-                                          llvm::ConstantArray::get(at, ms), "__type_info_members." + name);
-      return mg;
-    };
+    const auto& ti = prog_.type_info;
+    Type* st = ti.info;
+    int64_t tag = TI_VOID;
     switch (t->kind) {
-      case TypeKind::Void: kind = TI_VOID; break;
-      case TypeKind::Bool: kind = TI_BOOL; break;
-      case TypeKind::Int: kind = TI_INT; flags = t->is_signed ? 1 : 0; break;
-      case TypeKind::Float: kind = TI_FLOAT; break;
-      case TypeKind::String: kind = TI_STRING; break;
-      case TypeKind::Pointer: kind = TI_POINTER; elem = type_info(t->elem); break;
-      case TypeKind::Null: kind = TI_POINTER; elem = type_info(T.void_t); break;
-      case TypeKind::Proc: kind = TI_PROC; break;
-      case TypeKind::Any: kind = TI_ANY; break;
-      case TypeKind::TypeT: kind = TI_TYPE; break;
+      case TypeKind::Int: tag = TI_INTEGER; st = ti.integer; break;
+      case TypeKind::Float: tag = TI_FLOAT; st = ti.float_; break;
+      case TypeKind::Bool: tag = TI_BOOL; break;
+      case TypeKind::String: tag = TI_STRING; break;
+      case TypeKind::Pointer: case TypeKind::Null: tag = TI_POINTER; st = ti.pointer; break;
+      case TypeKind::Proc: tag = TI_PROCEDURE; st = ti.procedure; break;
+      case TypeKind::Struct: tag = TI_STRUCT; st = ti.struct_; break;
+      case TypeKind::Array: tag = TI_ARRAY; st = ti.array; break;
+      case TypeKind::Any: tag = TI_ANY; break;
+      case TypeKind::Enum: tag = TI_ENUM; st = ti.enum_; break;
+      case TypeKind::TypeT: tag = TI_TYPE; break;
+      case TypeKind::Code: tag = TI_CODE; break;
+      default: tag = TI_VOID; break;
+    }
+    std::string name = type_name(t);
+    // Created before its members, which may refer back to it.
+    auto* gv = new llvm::GlobalVariable(*mod_, lt(st), true, llvm::GlobalValue::PrivateLinkage, nullptr,
+                                        "__type_info." + name);
+    t->type_info = gv;
+    int64_t size = (t->kind == TypeKind::Void || t->kind == TypeKind::Tuple) ? 0 : (int64_t)size_of(t);
+    TiFields v;
+    v["type"] = llvm::ConstantInt::get(i64_, tag);
+    v["runtime_size"] = llvm::ConstantInt::get(i64_, size);
+    auto i32c = [&](uint64_t x) { return llvm::ConstantInt::get(i32_, x); };
+    switch (t->kind) {
+      case TypeKind::Int:
+        v["signed"] = llvm::ConstantInt::get(i1_, t->is_signed);
+        break;
+      case TypeKind::Pointer:
+        v["pointer_to"] = type_info(t->elem);
+        break;
+      case TypeKind::Null:
+        v["pointer_to"] = type_info(T.void_t);
+        break;
       case TypeKind::Array:
-        kind = TI_ARRAY;
-        flags = (int64_t)t->array_kind;
-        count = t->count;
-        elem = type_info(t->elem);
+        v["element_type"] = type_info(t->elem);
+        v["array_type"] = i32c(t->array_kind == ArrayKind::Fixed ? 0 : t->array_kind == ArrayKind::View ? 1 : 2);
+        v["array_count"] = llvm::ConstantInt::get(i64_, t->array_kind == ArrayKind::Fixed ? (uint64_t)t->count : (uint64_t)-1);
         break;
       case TypeKind::Enum: {
-        kind = TI_ENUM;
-        flags = (t->is_signed ? 1 : 0) | (t->is_flags ? 2 : 0);
-        elem = type_info(t->elem);
-        std::vector<llvm::Constant*> ms;
+        v["name"] = string_const(name);
+        v["internal_type"] = type_info(t->elem);
+        v["enum_type_flags"] = i32c(t->is_flags ? 1 : 0);
+        std::vector<llvm::Constant*> names, values;
         for (auto& m : t->members) {
-          ms.push_back(llvm::ConstantStruct::get(
-              ti_member_ty_, {cstring_global(m.name), llvm::ConstantInt::get(i64_, m.name.size()),
-                              llvm::ConstantPointerNull::get(llvm::PointerType::get(ctx_, 0)),
-                              llvm::ConstantInt::get(i64_, (uint64_t)m.value, true)}));
+          names.push_back(string_const(m.name));
+          values.push_back(llvm::ConstantInt::get(i64_, (uint64_t)m.value, true));
         }
-        count = (int64_t)ms.size();
-        if (!ms.empty()) members = make_members(ms);
+        v["names"] = ti_view(lt(T.string_t), names, "__type_info_names." + name);
+        v["values"] = ti_view(i64_, values, "__type_info_values." + name);
         break;
       }
       case TypeKind::Struct: {
-        kind = TI_STRUCT;
-        flags = t->is_union ? 1 : 0;
-        auto* st = llvm::cast<llvm::StructType>(lt(t));
-        const llvm::StructLayout* sl = t->is_union ? nullptr : dl_.getStructLayout(st);
+        v["name"] = string_const(name);
+        v["textual_flags"] = i32c(t->is_union ? 0x2 : 0);
+        auto* sty = llvm::cast<llvm::StructType>(lt(t));
+        const llvm::StructLayout* sl = t->is_union ? nullptr : dl_.getStructLayout(sty);
         std::vector<llvm::Constant*> ms;
         for (size_t i = 0; i < t->fields.size(); ++i) {
-          auto& f = t->fields[i];
-          int64_t off = sl ? (int64_t)sl->getElementOffset(i) : 0;
-          ms.push_back(llvm::ConstantStruct::get(
-              ti_member_ty_, {cstring_global(f.name), llvm::ConstantInt::get(i64_, f.name.size()),
-                              type_info(f.type), llvm::ConstantInt::get(i64_, off)}));
+          const StructField& f = t->fields[i];
+          TiFields mv;
+          mv["name"] = string_const(f.name);
+          mv["type"] = type_info(f.type);
+          mv["offset_in_bytes"] = llvm::ConstantInt::get(i64_, sl ? sl->getElementOffset(i) : 0);
+          uint32_t flags = (f.is_using ? 0x4 : 0) | (f.anonymous ? 0x100 : 0) | (f.type->is_proc() ? 0x8 : 0);
+          mv["flags"] = i32c(flags);
+          ms.push_back(ti_const(prog_.type_info.member, mv));
         }
-        count = (int64_t)ms.size();
-        if (!ms.empty()) members = make_members(ms);
+        v["members"] = ti_view(lt(prog_.type_info.member), ms, "__type_info_members." + name);
+        break;
+      }
+      case TypeKind::Proc: {
+        std::vector<llvm::Constant*> args, rets;
+        for (Type* p : t->params) args.push_back(type_info(p));
+        for (Type* r : t->returns) rets.push_back(type_info(r));
+        v["argument_types"] = ti_view(ptr_, args, "__type_info_args." + name);
+        v["return_types"] = ti_view(ptr_, rets, "__type_info_returns." + name);
+        v["procedure_flags"] = i32c((t->c_call ? 1 : 0) | (t->variadic ? 2 : 0));
         break;
       }
       default:
         break;
     }
-    int64_t size = (t->kind == TypeKind::Void || t->kind == TypeKind::Tuple) ? 0 : (int64_t)size_of(t);
-    gv->setInitializer(llvm::ConstantStruct::get(
-        ti_ty_, {llvm::ConstantInt::get(i64_, kind), llvm::ConstantInt::get(i64_, size),
-                 llvm::ConstantInt::get(i64_, flags), llvm::ConstantInt::get(i64_, count), elem,
-                 cstring_global(name), llvm::ConstantInt::get(i64_, name.size()), members}));
+    gv->setInitializer(ti_const(st, v));
     return gv;
   }
 
@@ -1629,8 +1688,8 @@ class CodeGen {
       return from->bits < to->bits ? b_.CreateFPExt(v, dst) : b_.CreateFPTrunc(v, dst);
     if (from->kind == TypeKind::Bool && intlike(to)) return b_.CreateZExt(v, dst);
     if (intlike(from) && to->kind == TypeKind::Bool) return b_.CreateICmpNE(v, llvm::ConstantInt::get(v->getType(), 0));
-    bool fp = from->is_pointer() || from->is_proc() || from->kind == TypeKind::Null;
-    bool tp = to->is_pointer() || to->is_proc();
+    bool fp = from->is_pointer() || from->is_proc() || from->kind == TypeKind::Null || from->kind == TypeKind::TypeT;
+    bool tp = to->is_pointer() || to->is_proc() || to->kind == TypeKind::TypeT;
     if (fp && tp) return v;
     if (fp && intlike(to)) return b_.CreatePtrToInt(v, dst);
     if (intlike(from) && tp) return b_.CreateIntToPtr(v, dst);
@@ -1750,6 +1809,7 @@ class CodeGen {
       case Builtin::SizeOf:
         return const_value(c->cv, c->type->is_untyped() ? T.s64 : c->type);
       case Builtin::TypeOf:
+      case Builtin::TypeInfo:
         return type_info(c->type_arg);
       case Builtin::Print: {
         llvm::Value* len;

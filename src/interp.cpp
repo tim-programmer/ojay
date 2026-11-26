@@ -28,7 +28,8 @@ using i64 = int64_t;
 // targets has memory-mapped registers, so a pointer to a fixed address (a
 // register block) is never mistaken for compile-time memory. Everything fits
 // in 32 bits, as pointers on ARM and RISC-V are 32-bit.
-constexpr u64 kTypeBase = 0x6E00'0000;    // Type values: kTypeBase + 8 * (index + 1)
+constexpr u64 kTypeBase = 0x6E00'0000;    // Type values: kTypeBase + kTypeStride * (index + 1), where its
+constexpr u64 kTypeStride = 128;          //   Type_Info is (filled in when first accessed)
 constexpr u64 kProcBase = 0x6F00'0000;    // procedure values: kProcBase + 8 * (index + 1)
 constexpr u64 kStaticBase = 0x7000'0000;  // string literals, global variables
 constexpr u64 kStaticSize = 16 << 20;
@@ -154,12 +155,14 @@ struct Interpreter::Impl {
   u64 type_id(Type* t) {
     auto it = type_ids.find(t);
     if (it != type_ids.end()) return it->second;
+    if (kTypeBase + kTypeStride * (types.size() + 2) > kProcBase)
+      throw CompileError(SourceLoc{}, "too many distinct types used as values during compile-time execution");
     types.push_back(t);
-    return type_ids[t] = kTypeBase + 8 * types.size();
+    return type_ids[t] = kTypeBase + kTypeStride * types.size();
   }
   Type* type_of_id(u64 v) {
-    if (v <= kTypeBase || (v - kTypeBase) % 8 || (v - kTypeBase) / 8 > types.size()) return nullptr;
-    return types[(v - kTypeBase) / 8 - 1];
+    if (v <= kTypeBase || (v - kTypeBase) % kTypeStride || (v - kTypeBase) / kTypeStride > types.size()) return nullptr;
+    return types[(v - kTypeBase) / kTypeStride - 1];
   }
   u64 proc_id(ProcLit* p) {
     auto it = proc_ids.find(p);
@@ -212,6 +215,8 @@ class Machine {
   int ps_;
   SourceLoc run_loc_;
   Region static_, stack_, heap_;
+  std::vector<uint8_t> typeinfo_;     // the Type_Info of Type values (at kTypeBase), as accessed
+  std::vector<bool> typeinfo_done_;   // per kTypeStride block: filled in
   std::map<u64, int64_t> heap_blocks_;  // live allocations: address -> size
   std::vector<Frame*> frames_;
   std::vector<Val> args_;  // arguments of the calls being made
@@ -353,6 +358,17 @@ class Machine {
     for (Region* r : {&heap_, &static_})
       if (a >= r->base && a - r->base <= r->bytes.size() && (u64)n <= r->bytes.size() - (a - r->base))
         return r->bytes.data() + (a - r->base);
+    if (a > kTypeBase && a < kProcBase) {  // a Type's Type_Info
+      u64 block = (a - kTypeBase) / kTypeStride * kTypeStride + kTypeBase;
+      if (Type* t = in_.type_of_id(block)) {
+        uint8_t* p = type_info_block(block, t, loc);
+        Type* st = type_info_struct(t);
+        if (a + (u64)n > block + (u64)sz(st))
+          err(loc, "invalid memory access at address ", hex(a), " (", n, " bytes, past the end of the ", type_name(st),
+              " of ", type_name(t), ": a Type_Info cast to the wrong Type_Info_* struct?)");
+        return p + (a - block);
+      }
+    }
     if (a == 0) err(loc, "null pointer dereference");
     if (a < 4096) err(loc, "invalid memory access at address ", hex(a), " (an offset from a null pointer?)");
     if (in_.proc_of_id(a) || in_.type_of_id(a))
@@ -378,6 +394,158 @@ class Machine {
   i64 load_i64(u64 a, SourceLoc loc) { return (i64)load_u(at(a, 8, loc), 8); }
   void store_ptr(u64 a, u64 v, SourceLoc loc) { store_u(at(a, ps_, loc), ps_, v); }
   void store_i64(u64 a, i64 v, SourceLoc loc) { store_u(at(a, 8, loc), 8, (u64)v); }
+
+  // ------------------------------------------------------------------ runtime type information
+
+  // The Type_Info of t (Type value `id`), laid out as codegen lays it out,
+  // filled in the first time it is accessed. Strings and arrays it points to
+  // go in static memory.
+  uint8_t* type_info_block(u64 id, Type* t, SourceLoc loc) {
+    size_t off = (size_t)(id - kTypeBase);
+    if (typeinfo_.size() < off + kTypeStride) {
+      typeinfo_.resize(off + kTypeStride, 0);
+      typeinfo_done_.resize(typeinfo_.size() / kTypeStride, false);
+    }
+    size_t idx = off / kTypeStride;
+    if (!typeinfo_done_[idx]) {
+      typeinfo_done_[idx] = true;
+      fill_type_info(off, t, loc);
+    }
+    return typeinfo_.data() + off;
+  }
+
+  // Byte offset of member `name` of Type_Info_* struct st (the members of its
+  // `using info: Type_Info` included).
+  int64_t ti_offset(Type* st, const char* name) {
+    for (const StructField& f : st->fields) {
+      if (f.name == name) return f.offset;
+      if (f.is_using && f.type->kind == TypeKind::Struct)
+        for (const StructField& g : f.type->fields)
+          if (g.name == name) return f.offset + g.offset;
+    }
+    throw CompileError(SourceLoc{}, cat("internal error: Type_Info has no member '", name, "'"));
+  }
+
+  // A view of `n` elements of `esz` bytes in static memory; returns its data address.
+  u64 ti_array(int64_t n, int64_t esz, int64_t align, SourceLoc loc) {
+    if (n == 0) return 0;
+    u64 a = alloc(static_, n * esz, align, loc);
+    std::memset(at(a, n * esz, loc), 0, (size_t)(n * esz));
+    return a;
+  }
+
+  // The Type_Info_* struct of t's Type_Info, and its Type_Info_Tag.
+  Type* type_info_struct(Type* t, int64_t* tag = nullptr) {
+    const Program::TypeInfoTypes& ti = in_.host.type_info_types();
+    t = conc(t);
+    Type* st = ti.info;
+    int64_t g = 6;  // VOID
+    switch (t->kind) {
+      case TypeKind::Int: g = 0; st = ti.integer; break;
+      case TypeKind::Float: g = 1; st = ti.float_; break;
+      case TypeKind::Bool: g = 2; break;
+      case TypeKind::String: g = 3; break;
+      case TypeKind::Pointer: case TypeKind::Null: g = 4; st = ti.pointer; break;
+      case TypeKind::Proc: g = 5; st = ti.procedure; break;
+      case TypeKind::Struct: g = 7; st = ti.struct_; break;
+      case TypeKind::Array: g = 8; st = ti.array; break;
+      case TypeKind::Any: g = 10; break;
+      case TypeKind::Enum: g = 11; st = ti.enum_; break;
+      case TypeKind::TypeT: g = 13; break;
+      case TypeKind::Code: g = 14; break;
+      default: break;
+    }
+    if (tag) *tag = g;
+    return st;
+  }
+
+  void fill_type_info(size_t off, Type* t, SourceLoc loc) {
+    const Program::TypeInfoTypes& ti = in_.host.type_info_types();
+    t = conc(t);
+    int64_t tag;
+    Type* st = type_info_struct(t, &tag);
+    if (sz(st) > (int64_t)kTypeStride)
+      throw CompileError(loc, cat("internal error: ", type_name(st), " is larger than kTypeStride"));
+    // `typeinfo_` may grow (and move) while this is filled in, so write through offsets.
+    auto put = [&](const char* name, int64_t n, u64 v) { store_u(typeinfo_.data() + off + ti_offset(st, name), n, v); };
+    auto put_view = [&](const char* name, int64_t n, u64 data) {
+      put(name, 8, (u64)n);
+      store_u(typeinfo_.data() + off + ti_offset(st, name) + 8, ps_, data);
+    };
+    put("type", 4, (u64)tag);
+    put("runtime_size", 8, (t->kind == TypeKind::Void || t->kind == TypeKind::Tuple) ? 0 : (u64)sz(t));
+    switch (t->kind) {
+      case TypeKind::Int: put("signed", 1, t->is_signed ? 1 : 0); break;
+      case TypeKind::Pointer: put("pointer_to", ps_, in_.type_id(t->elem)); break;
+      case TypeKind::Null: put("pointer_to", ps_, in_.type_id(T.void_t)); break;
+      case TypeKind::Array:
+        put("element_type", ps_, in_.type_id(t->elem));
+        put("array_type", 4, t->array_kind == ArrayKind::Fixed ? 0 : t->array_kind == ArrayKind::View ? 1 : 2);
+        put("array_count", 8, t->array_kind == ArrayKind::Fixed ? (u64)t->count : (u64)-1);
+        break;
+      case TypeKind::Enum: {
+        std::string name = type_name(t);
+        u64 name_str = name.empty() ? 0 : intern(name, loc);
+        put("name", 8, name.size());
+        store_u(typeinfo_.data() + off + ti_offset(st, "name") + 8, ps_, name_str);
+        put("internal_type", ps_, in_.type_id(t->elem));
+        put("enum_type_flags", 4, t->is_flags ? 1 : 0);
+        int64_t n = (int64_t)t->members.size();
+        int64_t ssz = sz(T.string_t);
+        u64 names = ti_array(n, ssz, 8, loc);
+        u64 values = ti_array(n, 8, 8, loc);
+        for (int64_t i = 0; i < n; ++i) {
+          const EnumMember& m = t->members[(size_t)i];
+          u64 s_addr = m.name.empty() ? 0 : intern(m.name, loc);
+          uint8_t* p = at(names + (u64)(i * ssz), ssz, loc);
+          store_u(p, 8, m.name.size());
+          store_u(p + 8, ps_, s_addr);
+          store_u(at(values + (u64)(i * 8), 8, loc), 8, (u64)(int64_t)m.value);
+        }
+        put_view("names", n, names);
+        put_view("values", n, values);
+        break;
+      }
+      case TypeKind::Struct: {
+        std::string name = type_name(t);
+        u64 name_str = name.empty() ? 0 : intern(name, loc);
+        put("name", 8, name.size());
+        store_u(typeinfo_.data() + off + ti_offset(st, "name") + 8, ps_, name_str);
+        put("textual_flags", 4, t->is_union ? 0x2 : 0);
+        Type* mt = ti.member;
+        int64_t n = (int64_t)t->fields.size();
+        int64_t msz = sz(mt);
+        u64 members = ti_array(n, msz, mt->align, loc);
+        for (int64_t i = 0; i < n; ++i) {
+          const StructField& f = t->fields[(size_t)i];
+          u64 s_addr = f.name.empty() ? 0 : intern(f.name, loc);
+          uint8_t* p = at(members + (u64)(i * msz), msz, loc);
+          int64_t no = ti_offset(mt, "name");
+          store_u(p + no, 8, f.name.size());
+          store_u(p + no + 8, ps_, s_addr);
+          store_u(p + ti_offset(mt, "type"), ps_, in_.type_id(f.type));
+          store_u(p + ti_offset(mt, "offset_in_bytes"), 8, (u64)f.offset);
+          uint32_t flags = (f.is_using ? 0x4 : 0) | (f.anonymous ? 0x100 : 0) | (conc(f.type)->is_proc() ? 0x8 : 0);
+          store_u(p + ti_offset(mt, "flags"), 4, flags);
+        }
+        put_view("members", n, members);
+        break;
+      }
+      case TypeKind::Proc: {
+        int64_t na = (int64_t)t->params.size(), nr = (int64_t)t->returns.size();
+        u64 args = ti_array(na, ps_, ps_, loc);
+        u64 rets = ti_array(nr, ps_, ps_, loc);
+        for (int64_t i = 0; i < na; ++i) store_u(at(args + (u64)(i * ps_), ps_, loc), ps_, in_.type_id(t->params[(size_t)i]));
+        for (int64_t i = 0; i < nr; ++i) store_u(at(rets + (u64)(i * ps_), ps_, loc), ps_, in_.type_id(t->returns[(size_t)i]));
+        put_view("argument_types", na, args);
+        put_view("return_types", nr, rets);
+        put("procedure_flags", 4, (t->c_call ? 1 : 0) | (t->variadic ? 2 : 0));
+        break;
+      }
+      default:
+        break;
+    }
+  }
 
   u64 intern(const std::string& s, SourceLoc loc) {
     auto it = strings_.find(s);
@@ -1970,6 +2138,7 @@ class Machine {
       case Builtin::SizeOf:
         return make_int(T.s64, (u64)sz(c->type_arg));
       case Builtin::TypeOf:
+      case Builtin::TypeInfo:
         return make_ptr(in_.type_id(c->type_arg));
       default:
         err(loc, "this built-in procedure is not available during compile-time execution");

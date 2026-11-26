@@ -313,6 +313,8 @@ Implemented:
 * Compile-time execution: `#run` (see *Compile-time execution* below)
 * Metaprogramming: `#code`, `#insert`, `#expand` macros and `#modify` (see
   *Metaprogramming* below)
+* Runtime type information: `type_info(T)`, `Type_Info` and the
+  `Type_Info_*` structs (see *Runtime type information* below)
 * Runtime checks: array bounds checks; `assert`
 * ojay extension for embedded targets: `#import "Hardware"` provides
   `volatile_load(p)` and `volatile_store(p, value)` for memory-mapped
@@ -569,11 +571,63 @@ reset_temporary_storage();
   allocating built-ins go through `__allocate`, which calls the runtime
   directly when the allocator is the default one and makes an indirect call
   otherwise.
-* Differences from Jai: `push_context` always pushes a copy; there is no
-  `log` procedure and no threads; `Allocator_Mode` has only the four modes
+* Differences from Jai: `push_context` always pushes a copy; `log` has no
+  optional parameters (see *Built-in modules*); there are no threads; `Allocator_Mode` has only the four modes
   above (no `STARTUP`, `CAPS`, ...), and allocators are not asked for
   alignment; `print` (which does not allocate) is allowed without a
   context.
+
+### Runtime type information
+
+```jai
+describe :: (value: Any) {
+    info := value.type;                       // a Type is a pointer to its Type_Info
+    if info.type == .STRUCT {
+        s := cast(*Type_Info_Struct) info;
+        for s.members  print("% : % at %\n", it.name, cast(Type) it.type, it.offset_in_bytes);
+    }
+}
+e := type_info(Color);                        // *Type_Info_Enum
+for e.names  print("% = %\n", it, e.values[it_index]);
+```
+
+* Every type has a `Type_Info` in the compiled program (only for the types
+  a program uses as values: `Any`, `type_of`, `type_info`, `Type`
+  constants). A `Type` value points to it: `Type` converts implicitly to
+  `*Type_Info`, a `*Type_Info_*` converts to `*Type_Info` and to `Type`, and
+  `cast(*Type_Info_Struct) T` / `cast(Type) info` convert explicitly.
+  Members of a `Type` value are those of its `Type_Info`
+  (`value.type.runtime_size`). `type_info(T)` returns the struct for T's
+  kind: `*Type_Info_Integer`, `_Float`, `_Pointer`, `_Array`, `_Struct`,
+  `_Enum`, `_Procedure`, or `*Type_Info` for the others.
+* `Type_Info` has `type` (a `Type_Info_Tag`: `INTEGER`, `FLOAT`, `BOOL`,
+  `STRING`, `POINTER`, `PROCEDURE`, `VOID`, `STRUCT`, `ARRAY`, `ANY`, `ENUM`,
+  `TYPE`, `CODE`) and `runtime_size`. The others start with
+  `using info: Type_Info` and add: `signed` (integers); `pointer_to`;
+  `element_type`, `array_type` (`FIXED`, `VIEW`, `RESIZABLE`) and
+  `array_count` (-1 unless fixed); `name`, `members`
+  (`Type_Info_Struct_Member`: `name`, `type`, `offset_in_bytes`, `flags`)
+  and `textual_flags` (`.UNION`) for structs and unions; `name`,
+  `internal_type`, `enum_type_flags` (`.FLAGS`), `names` and `values` for
+  enums; `argument_types`, `return_types` and `procedure_flags`
+  (`IS_C_CALL`, `HAS_VARARGS`) for procedure types. The declarations are in
+  `src/type_info.jai`.
+* `print` reads the same tables, so they are one copy per type in
+  read-only data. On 32-bit targets they are smaller than the tables used
+  before (e.g. 2657 -> 2162 bytes of text and read-only data for
+  `tests/run/printing.jai` at `-O2` on ARM).
+* Under `#run` the same structs are laid out in compile-time memory when
+  first accessed, for the target's pointer size. Reading past the end of
+  the actual `Type_Info_*` struct (a `Type_Info` cast to the wrong kind) is
+  an error.
+* Differences from Jai: the enums Jai nests inside the structs are
+  top-level (`Type_Info_Array_Type`, `Type_Info_Struct_Member_Flags`,
+  `Enum_Type_Flags`, `Type_Info_Procedure_Flags`); members have no `notes`,
+  structs no `initializer`, `polymorph_source_struct` or parameters; there
+  are no `Type_Info_Variant`, `_Overload_Set` or `_Polymorphic_Variable`
+  (ojay has no distinct types); `ANONYMOUS` (0x100) marks anonymous struct
+  and union members; and `Any.type` has type `Type`, which converts to
+  `*Type_Info` as needed.
 
 ### Metaprogramming
 
