@@ -1043,8 +1043,17 @@ class CodeGen {
     context_ptr_ = new llvm::GlobalVariable(*mod_, ptr_, false, llvm::GlobalValue::InternalLinkage,
                                             llvm::cast<llvm::Constant>(prog_.default_context->llvm_value),
                                             "__ojay_context");
-    // With threads each thread has its own current context (and starts with the default one).
-    if (prog_.uses_threads) context_ptr_->setThreadLocal(true);
+    // With threads each thread has its own current context (and starts with
+    // the default one): thread-local on an OS; on bare metal the runtime's
+    // task switch (__ojay_task_switch) saves and restores it per task.
+    if (prog_.uses_threads) {
+      if (llvm::Triple(mod_->getTargetTriple()).getOS() == llvm::Triple::UnknownOS) {
+        context_ptr_->setLinkage(llvm::GlobalValue::ExternalLinkage);
+        context_ptr_->setVisibility(llvm::GlobalValue::HiddenVisibility);
+      } else {
+        context_ptr_->setThreadLocal(true);
+      }
+    }
   }
 
   // The address of the current Context (its allocator is its first member).

@@ -1,0 +1,11 @@
+main user_index 3
+abcmabcabcm
+result 101
+result 102
+result 103
+main thread index 0 user_index 0
+done signaled true
+total 15 overlaps 0 consumed 4
+timed out wait false
+deep 5050
+5 15 1 true false 9

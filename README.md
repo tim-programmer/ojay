@@ -195,7 +195,10 @@ These are development tools, separate from the compiler:
   (`--vcom` to choose the device) and its exit status from r0/r1, i.e. runs
   it as it runs without a debugger. `tests/run_tests.py --arm=board-uart`
   runs the tests that way (the ones that write to stderr then differ, as the
-  UART carries both streams).
+  UART carries both streams, and those that need semihosting skip that
+  configuration with `// SKIP: uart`).
+* OpenOCD runs in a new temporary directory (or `--dir`): a program's
+  semihosting file calls (the File module) work there.
 * The core's debug port only appears after a session is opened through NXP's
   Debug Mailbox; `tools/mcxn947.cfg` does this (it resets the chip).
 * Flashing and a real cold boot can also be done directly with
@@ -487,22 +490,48 @@ Implemented:
     in the context (`#add_context random_state`): `random_seed`,
     `random_get` (64 bits), `random_get_zero_to_one`, `_open`, `_float64`,
     and `random_get_within_range` (floats, or integers inclusive).
-  * File (all Jai, `src/modules/File.jai`; Linux only, through the C
-    library): `File`, `file_open` (`for_writing`, `keep_existing_content`,
-    `log_errors`), `file_close`, `file_write`, `file_read`, `file_length`,
-    `file_seek` (`File_Seek_Type`), `file_tell`, `read_entire_file`
-    (`zero_terminated`), `write_entire_file`, `file_exists`, `file_delete`,
-    `make_directory_if_it_does_not_exist`.
-  * Thread (all Jai, `src/modules/Thread.jai`; Linux only, POSIX threads):
-    `Thread` (`proc`, `data`, `index`, `result`), `thread_init`,
+  * File (all Jai, `src/modules/File.jai`): `File`, `file_open`
+    (`for_writing`, `keep_existing_content`, `log_errors`), `file_close`,
+    `file_write`, `file_read`, `file_length`, `file_seek`
+    (`File_Seek_Type`), `file_tell`, `read_entire_file` (`zero_terminated`),
+    `write_entire_file`, `file_exists`, `file_delete`, `file_move`,
+    `make_directory_if_it_does_not_exist`. On Linux it calls the C library.
+    On bare metal the files are the debugger's, through semihosting file
+    calls (`SYS_OPEN`, `SYS_READ`, `SYS_WRITE`, `SYS_SEEK`, `SYS_FLEN`,
+    `SYS_REMOVE`, `SYS_RENAME`) relative to the directory the debugger runs
+    in (`tools/run_mcxn947.py --dir`; by default both board runners use a
+    temporary directory). Each call stops the core while the debugger does
+    it. Without a debugger that handles semihosting every call fails
+    (`file_open` returns false), and semihosting cannot make directories
+    (`make_directory_if_it_does_not_exist` is false). The module tracks file
+    positions for `file_tell` itself (at most 16 files open at once).
+  * Thread (all Jai, `src/modules/Thread.jai`): `Thread` (`proc`, `data`,
+    `index`, `result`, `stack_size`), `thread_init` (also `stack_size`),
     `thread_start`, `thread_is_done` (waiting up to some milliseconds, -1:
-    until done), `thread_deinit`; `Mutex` (`init`, `lock`, `unlock`,
-    `destroy`), `Semaphore` (`init`, `signal`, `wait_for` with a timeout,
-    `destroy`); `atomic_add` and `atomic_swap` on an `s64` (x86-64). A
-    program that imports it has a current context per thread (a thread-local
-    variable): each thread runs in a copy of the context `thread_init` was
-    called in, with its own temporary storage and `context.thread_index` (the
-    main thread's is 0).
+    until done), `thread_deinit`, `thread_yield`; `Mutex` (`init`, `lock`,
+    `unlock`, `destroy`), `Semaphore` (`init`, `signal`, `wait_for` with a
+    timeout, `destroy`); `atomic_add`, `atomic_swap` and `compare_and_swap`
+    on an `s64`. A program that imports it has a current context per thread:
+    each thread runs in a copy of the context `thread_init` was called in,
+    with its own temporary storage and `context.thread_index` (the main
+    thread's is 0).
+    * Linux: POSIX threads; the current context is a thread-local variable.
+    * Bare metal: cooperative threads on the one core. A thread runs until
+      it yields: `thread_yield`, or a wait in `thread_is_done`, `lock` or
+      `wait_for` (which yield until the thing happens). The threads take
+      turns in the order they were started, after the main thread. Each has
+      its own stack (`stack_size` bytes, default 4096, allocated by
+      `thread_start` with the allocator `thread_init` was called with); a
+      thread that overflowed it (its lowest word, a canary, changed) stops
+      the program at its next yield. The runtime switches the stacks
+      (`__ojay_task_switch`: the callee-saved integer and FPU registers) and
+      the current context pointer with them, so a `push_context` stays in
+      effect across yields. There is no clock, so waits do not measure time:
+      a wait with a timeout gives up (false) as soon as a whole round of the
+      other threads changed nothing and they are all waiting too, and
+      without one that is a deadlock, which stops the program. 64-bit
+      atomics mask interrupts (these cores have no 64-bit exclusive access);
+      `signal` may be called from an interrupt handler.
   Differences from Jai's modules: `array_reserve` and `String_Builder`
   memory come from the array's allocator (`context.allocator` when it first
   grows), `String_Builder` is one growing buffer rather than a chain of
@@ -879,7 +908,9 @@ reset_temporary_storage();
   (on the same paths as `defer`). Procedures get no hidden parameter. Calls
   cost the same, and Jai procedures, `#c_call` procedures and C functions
   keep the same calling convention. The price is that the context is shared
-  by everything that runs, which is fine without threads. An interrupt
+  by everything that runs, which is fine without threads (with the Thread
+  module it is per thread: thread-local on Linux, switched with each task on
+  bare metal). An interrupt
   handler runs with the context of the code it interrupted; if it pushes one,
   it restores the pointer before returning.
 * The Preload (`src/preload.jai`, compiled into the compiler) declares all

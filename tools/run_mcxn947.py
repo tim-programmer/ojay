@@ -12,6 +12,8 @@ In both cases the program's semihosting console output goes to stdout. The
 program is started with r0/r1 set to the runtime's "debugger present" values,
 which enable semihosting (without them the runtime never makes semihosting
 calls on this board, so a leftover DHCSR.C_DEBUGEN cannot halt it).
+OpenOCD runs in a temporary directory (or --dir), which is where the
+program's semihosting file calls (the File module) create and read files.
 
 With --uart the program is started without them, as if no debugger were
 attached: its output is read from the board's UART (LPUART4, the MCU-Link's
@@ -35,6 +37,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RAM_START, RAM_END = 0x20000000, 0x20080000
@@ -142,7 +145,12 @@ def main():
     ap.add_argument("-v", "--verbose", action="store_true", help="show OpenOCD's log")
     ap.add_argument("--arg", action="append", default=[],
                     help="an argument for the program (repeatable; semihosting SYS_GET_CMDLINE)")
+    ap.add_argument("--dir", help="the directory the program's semihosting file calls (the File module) "
+                    "work in (default: a new temporary directory, removed afterwards)")
     args = ap.parse_args()
+    args.cfg = os.path.abspath(args.cfg)
+    if args.elf:
+        args.elf = os.path.abspath(args.elf)
 
     if args.probe:
         r = subprocess.run([args.openocd, "-f", args.cfg, "-c",
@@ -219,8 +227,10 @@ def main():
             "echo OJAY-RUN-HALTED; shutdown error"
         )
     try:
-        proc = subprocess.run([args.openocd, "-f", args.cfg, "-c", script], stderr=subprocess.PIPE,
-                              timeout=args.timeout + 30)
+        # OpenOCD resolves semihosted file names against its working directory.
+        with tempfile.TemporaryDirectory(prefix="ojay-mcx-") as tmp:
+            proc = subprocess.run([args.openocd, "-f", args.cfg, "-c", script], stderr=subprocess.PIPE,
+                                  cwd=args.dir or tmp, timeout=args.timeout + 30)
     finally:
         if reader:
             reader.finish()

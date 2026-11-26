@@ -14,7 +14,8 @@ What is implemented is documented in `README.md`; this file lists only what is n
       the enums nested inside the structs as in Jai, `Type_Info_Overload_Set` and
       `Type_Info_Polymorphic_Variable`
 - [ ] The other `Allocator_Mode`s (`STARTUP`, `CAPS`, ...)
-- [ ] Threads on bare metal (an RTOS), and atomics other than x86-64's `atomic_add` / `atomic_swap`
+- [ ] Threads: preemptive scheduling on bare metal (an RTOS; the scheduler is cooperative), wait
+      timeouts measured against a clock there, atomics on other integer types than `s64`
 
 ## C ABI
 
@@ -24,7 +25,7 @@ What is implemented is documented in `README.md`; this file lists only what is n
 
 ## Runtime and modules
 
-- [ ] More modules: `POSIX`, `Compiler`; `File` on bare metal (semihosting file calls)
+- [ ] More modules: `POSIX`, `Compiler`; `File` on bare metal without a debugger (flash storage)
 - [ ] Basic and Math: `Matrix2`, Jai's chained `String_Builder` buffers, moving
       `min` / `max` / `abs` from built-ins to Jai
 - [ ] Command-line arguments: Jai's `__command_line_arguments` global (`get_command_line_arguments()` works)
@@ -32,5 +33,13 @@ What is implemented is documented in `README.md`; this file lists only what is n
 
 ## Targets and boards
 
+- [ ] Running under an RTOS (FreeRTOS, Zephyr), verified on the MCX N947:
+      * a runtime library build without the startup code (vector table, `Reset_Handler`,
+        `memcpy` / `memset`) whose heap is the RTOS's (`pvPortMalloc` / `k_malloc`: locked)
+      * the context pointer per task: thread-local on Zephyr (`CONFIG_THREAD_LOCAL_STORAGE`,
+        `__aeabi_read_tp`), switched in the task-switch hooks on FreeRTOS
+      * a compiler option or `OS` value (`.FREERTOS`, `.ZEPHYR`) for the above
+      * the Thread module over RTOS tasks, mutexes and semaphores (wait timeouts from the RTOS clock)
+      * an example project for each
 - [ ] More RISC-V chips beyond the ESP32-C6
 - [ ] Flash programming for the MCX N947 from OpenOCD (currently LinkServer only)

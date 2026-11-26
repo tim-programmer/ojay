@@ -61,4 +61,8 @@ main :: () {
     thread_is_done(*t, -1);
     print("result %\n", t.result);
     thread_deinit(*t);
+
+    thread_yield();
+    v: s64 = 1;
+    print("% % %\n", compare_and_swap(*v, 1, 9), compare_and_swap(*v, 1, 2), v);
 }

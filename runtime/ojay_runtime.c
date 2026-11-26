@@ -1679,3 +1679,209 @@ __asm__(
     "  j __ojay_fault\n");
 
 #endif
+
+/* ------------------------------------------------------------------------ */
+/* Semihosting for the modules (the File module on bare metal): op and its    */
+/* argument block as the semihosting spec gives them. Returns -1 (what the    */
+/* calls return on failure) when no debugger handles semihosting.             */
+
+#if defined(OJAY_PLATFORM_CORTEXM)
+int32_t __ojay_semihost_call(int32_t op, void *args) {
+  if (!semihost_available()) return -1;
+  return semihost(op, args);
+}
+#elif defined(OJAY_PLATFORM_ESP32C6)
+int32_t __ojay_semihost_call(int32_t op, void *args) {
+  if (__ojay_semihost_dead) return -1;
+  int r = semihost(op, args);
+  return __ojay_semihost_dead ? -1 : r;
+}
+#endif
+
+/* ------------------------------------------------------------------------ */
+/* Atomics and cooperative tasks (the Thread module)                         */
+/*                                                                           */
+/* 64-bit atomics for the Thread module. x86-64 has the instructions; the    */
+/* 32-bit microcontrollers have no 64-bit exclusive access, so the update is */
+/* done with interrupts masked (they are single core).                       */
+
+#if defined(OJAY_PLATFORM_CORTEXM)
+static inline uint32_t irq_save(void) {
+  uint32_t m;
+  __asm__ volatile("mrs %0, primask\n cpsid i" : "=r"(m) : : "memory");
+  return m;
+}
+static inline void irq_restore(uint32_t m) { __asm__ volatile("msr primask, %0" : : "r"(m) : "memory"); }
+#elif defined(OJAY_PLATFORM_ESP32C6)
+static inline uint32_t irq_save(void) {
+  uint32_t m;
+  __asm__ volatile("csrrci %0, mstatus, 8" : "=r"(m) : : "memory");
+  return m;
+}
+static inline void irq_restore(uint32_t m) { __asm__ volatile("csrs mstatus, %0" : : "r"(m & 8) : "memory"); }
+#endif
+
+#if defined(OJAY_PLATFORM_CORTEXM) || defined(OJAY_PLATFORM_ESP32C6)
+int64_t __ojay_atomic_add64(int64_t *p, int64_t delta) {
+  uint32_t m = irq_save();
+  int64_t old = *(volatile int64_t *)p;
+  *(volatile int64_t *)p = old + delta;
+  irq_restore(m);
+  return old;
+}
+int64_t __ojay_atomic_swap64(int64_t *p, int64_t value) {
+  uint32_t m = irq_save();
+  int64_t old = *(volatile int64_t *)p;
+  *(volatile int64_t *)p = value;
+  irq_restore(m);
+  return old;
+}
+int64_t __ojay_atomic_cas64(int64_t *p, int64_t expected, int64_t desired) {
+  uint32_t m = irq_save();
+  int64_t old = *(volatile int64_t *)p;
+  if (old == expected) *(volatile int64_t *)p = desired;
+  irq_restore(m);
+  return old;
+}
+#else
+int64_t __ojay_atomic_cas64(int64_t *p, int64_t expected, int64_t desired) {
+  __atomic_compare_exchange_n(p, &expected, desired, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+  return expected; /* the old value */
+}
+#endif
+
+/* Cooperative tasks (bare metal). The Thread module keeps the run queue (in
+ * Jai); this only switches stacks. A task's saved state is its stack pointer:
+ * the callee-saved registers are pushed on its own stack. The current
+ * context pointer (the compiler's __ojay_context, external in a program that
+ * imports Thread) is saved per task too, in __ojay_task_switch's frame. */
+#if defined(OJAY_PLATFORM_CORTEXM) || defined(OJAY_PLATFORM_ESP32C6)
+
+extern void *__ojay_context __attribute__((weak));
+void __ojay_stack_switch(void **save_sp, void *new_sp);
+void __ojay_task_trampoline(void);
+
+/* Switches from the running task (its stack pointer goes to *save_sp) to the
+ * one whose saved stack pointer is new_sp. Returns when something switches
+ * back to this task. */
+void __ojay_task_switch(void **save_sp, void *new_sp) {
+  void *ctx = &__ojay_context ? __ojay_context : 0;
+  __ojay_stack_switch(save_sp, new_sp);
+  if (&__ojay_context) __ojay_context = ctx;
+}
+
+__attribute__((noreturn)) void __ojay_task_returned(void) {
+  static const char msg[] = "\n*** a task's entry procedure returned\n";
+  plat_write(2, msg, sizeof msg - 1);
+  plat_exit(134);
+}
+
+#if defined(OJAY_PLATFORM_CORTEXM)
+#if defined(__ARM_FP)
+#define TASK_FP_SAVE "  vpush {s16-s31}\n"
+#define TASK_FP_RESTORE "  vpop {s16-s31}\n"
+#define TASK_FP_WORDS 16
+#else
+#define TASK_FP_SAVE ""
+#define TASK_FP_RESTORE ""
+#define TASK_FP_WORDS 0
+#endif
+/* Frame (from the saved sp up): [s16-s31], r4-r11, lr. */
+__asm__(
+    ".section .text.__ojay_stack_switch, \"ax\", %progbits\n"
+    ".global __ojay_stack_switch\n"
+    ".type __ojay_stack_switch, %function\n"
+    ".thumb_func\n"
+    "__ojay_stack_switch:\n"
+    "  push {r4-r11, lr}\n"
+    TASK_FP_SAVE
+    "  mov r2, sp\n"
+    "  str r2, [r0]\n"
+    "  mov sp, r1\n"
+    TASK_FP_RESTORE
+    "  pop {r4-r11, pc}\n"
+    "\n"
+    ".section .text.__ojay_task_trampoline, \"ax\", %progbits\n"
+    ".global __ojay_task_trampoline\n"
+    ".type __ojay_task_trampoline, %function\n"
+    ".thumb_func\n"
+    "__ojay_task_trampoline:\n"
+    "  mov r0, r5\n"
+    "  blx r4\n"
+    "  bl __ojay_task_returned\n");
+
+/* Builds a new task's first frame below stack_top, so that switching to the
+ * returned stack pointer calls entry(arg) (which must never return). */
+void *__ojay_task_stack_init(void *stack_top, void (*entry)(void *), void *arg) {
+  uint32_t *sp = (uint32_t *)((uintptr_t)stack_top & ~(uintptr_t)7);
+  sp -= 9 + TASK_FP_WORDS;
+  for (int i = 0; i < 9 + TASK_FP_WORDS; ++i) sp[i] = 0;
+  uint32_t *core = sp + TASK_FP_WORDS; /* r4..r11, lr */
+  core[0] = (uint32_t)(uintptr_t)entry;  /* r4 */
+  core[1] = (uint32_t)(uintptr_t)arg;    /* r5 */
+  core[8] = (uint32_t)(uintptr_t)__ojay_task_trampoline | 1;
+  return sp;
+}
+
+#else /* ESP32-C6 (RV32) */
+#if defined(__riscv_flen) && __riscv_flen == 64
+#define TASK_FS(op) "  " #op " fs0, 64(sp)\n  " #op " fs1, 72(sp)\n  " #op " fs2, 80(sp)\n  " #op " fs3, 88(sp)\n" \
+  "  " #op " fs4, 96(sp)\n  " #op " fs5, 104(sp)\n  " #op " fs6, 112(sp)\n  " #op " fs7, 120(sp)\n" \
+  "  " #op " fs8, 128(sp)\n  " #op " fs9, 136(sp)\n  " #op " fs10, 144(sp)\n  " #op " fs11, 152(sp)\n"
+#define TASK_FRAME_BYTES 160
+#define TASK_FSAVE TASK_FS(fsd)
+#define TASK_FLOAD TASK_FS(fld)
+#elif defined(__riscv_flen) && __riscv_flen == 32
+#define TASK_FS(op) "  " #op " fs0, 64(sp)\n  " #op " fs1, 68(sp)\n  " #op " fs2, 72(sp)\n  " #op " fs3, 76(sp)\n" \
+  "  " #op " fs4, 80(sp)\n  " #op " fs5, 84(sp)\n  " #op " fs6, 88(sp)\n  " #op " fs7, 92(sp)\n" \
+  "  " #op " fs8, 96(sp)\n  " #op " fs9, 100(sp)\n  " #op " fs10, 104(sp)\n  " #op " fs11, 108(sp)\n"
+#define TASK_FRAME_BYTES 112
+#define TASK_FSAVE TASK_FS(fsw)
+#define TASK_FLOAD TASK_FS(flw)
+#else
+#define TASK_FRAME_BYTES 64
+#define TASK_FSAVE ""
+#define TASK_FLOAD ""
+#endif
+#define TASK_STR2(x) #x
+#define TASK_STR(x) TASK_STR2(x)
+#define TASK_FRAME TASK_STR(TASK_FRAME_BYTES)
+#define TASK_XS(op) "  " #op " ra, 0(sp)\n  " #op " s0, 4(sp)\n  " #op " s1, 8(sp)\n  " #op " s2, 12(sp)\n" \
+  "  " #op " s3, 16(sp)\n  " #op " s4, 20(sp)\n  " #op " s5, 24(sp)\n  " #op " s6, 28(sp)\n" \
+  "  " #op " s7, 32(sp)\n  " #op " s8, 36(sp)\n  " #op " s9, 40(sp)\n  " #op " s10, 44(sp)\n  " #op " s11, 48(sp)\n"
+/* Frame (from the saved sp up): ra, s0-s11, [fs0-fs11 from offset 64]. */
+__asm__(
+    ".section .text.__ojay_stack_switch, \"ax\", @progbits\n"
+    ".global __ojay_stack_switch\n"
+    ".type __ojay_stack_switch, @function\n"
+    "__ojay_stack_switch:\n"
+    "  addi sp, sp, -" TASK_FRAME "\n"
+    TASK_XS(sw)
+    TASK_FSAVE
+    "  sw sp, 0(a0)\n"
+    "  mv sp, a1\n"
+    TASK_XS(lw)
+    TASK_FLOAD
+    "  addi sp, sp, " TASK_FRAME "\n"
+    "  ret\n"
+    "\n"
+    ".section .text.__ojay_task_trampoline, \"ax\", @progbits\n"
+    ".global __ojay_task_trampoline\n"
+    ".type __ojay_task_trampoline, @function\n"
+    "__ojay_task_trampoline:\n"
+    "  mv a0, s1\n"
+    "  jalr s0\n"
+    "  call __ojay_task_returned\n");
+
+void *__ojay_task_stack_init(void *stack_top, void (*entry)(void *), void *arg) {
+  enum { WORDS = TASK_FRAME_BYTES / 4 };
+  uint32_t *sp = (uint32_t *)((uintptr_t)stack_top & ~(uintptr_t)15);
+  sp -= WORDS;
+  for (int i = 0; i < WORDS; ++i) sp[i] = 0;
+  sp[0] = (uint32_t)(uintptr_t)__ojay_task_trampoline; /* ra */
+  sp[1] = (uint32_t)(uintptr_t)entry;                  /* s0 */
+  sp[2] = (uint32_t)(uintptr_t)arg;                    /* s1 */
+  return sp;
+}
+#endif
+#endif

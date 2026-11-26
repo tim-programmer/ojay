@@ -6,6 +6,8 @@ tests/run/*.jai     compiled, linked and executed; stdout must equal the .out
                     `// SKIP: text` lines skip the configurations whose label
                     contains text (e.g. `// SKIP: static` for a test that
                     needs libc, which the static x86-64 runtime does not have).
+                    The ARM labels end in "uart" in --arm=board-uart runs,
+                    which have no semihosting (`// SKIP: uart`).
                     `// ARGS: words` gives command-line arguments (shell
                     quoting); embedded programs get them through semihosting
                     (SYS_GET_CMDLINE), and none when run without it.
@@ -157,6 +159,9 @@ def make_configs(build_dir, arm_mode, riscv_mode):
     else:
         arm_link, arm_run, where = link_arm("mcxn947-flash.ld"), False, "linked only, not executed"
 
+    # Without semihosting (no arguments, no files): `// SKIP: uart` skips these.
+    arm_suffix = " uart" if arm_mode == "board-uart" else ""
+
     configs_rv = []
     rv_where = "toolchain (riscv32-esp-elf-gcc) not found; skipped"
     rv_gcc = find_riscv_gcc()
@@ -188,8 +193,10 @@ def make_configs(build_dir, arm_mode, riscv_mode):
         Config("x86_64 -O2", [x64, "-O2"], link_hosted, None, ["cc", "-c", "-O2"]),
         Config("x86_64 static", [x64, "-O1", "--no-pic"], link_static, None,
                ["cc", "-c", "-O2", "-fno-pic", "-ffreestanding", "-fno-stack-protector"]),
-        Config("arm32 -O0", [arm], arm_link, arm_run, ["arm-none-eabi-gcc"] + ARM_GCC_FLAGS + ["-c", "-O0"]),
-        Config("arm32 -O2", [arm, "-O2"], arm_link, arm_run, ["arm-none-eabi-gcc"] + ARM_GCC_FLAGS + ["-c", "-O2"]),
+        Config("arm32 -O0" + arm_suffix, [arm], arm_link, arm_run,
+               ["arm-none-eabi-gcc"] + ARM_GCC_FLAGS + ["-c", "-O0"]),
+        Config("arm32 -O2" + arm_suffix, [arm, "-O2"], arm_link, arm_run,
+               ["arm-none-eabi-gcc"] + ARM_GCC_FLAGS + ["-c", "-O2"]),
     ] + configs_rv, where, rv_where
 
 

@@ -27,6 +27,9 @@ main :: () {
 
     _, missing := read_entire_file("no/such/file", log_errors = false);
     print("%\n", missing);
+    moved := tprint("%/ojay_file_module_moved.txt", dir);
+    print("% % %\n", file_move(name, moved), file_exists(name), file_exists(moved));
+    name = moved;
     print("% %\n", file_delete(name), file_exists(name));
     print("%\n", file_delete(name));
 }
