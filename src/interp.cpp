@@ -2204,8 +2204,11 @@ class Machine {
       }
       case Builtin::Assert: {
         if (truth(eval(a[0]), a[0]->type)) return Val();
-        std::string msg = a.size() == 2 ? read_string(eval(a[1]), a[1]->loc) : "";
-        err(loc, "assertion failed", msg.empty() ? "" : ": ", msg);
+        std::string msg = a[1] ? read_string(eval(a[1]), a[1]->loc) : "";
+        std::string where;
+        if (a[2]) where = " at " + read_string(eval(a[2]), a[2]->loc) + ":" +
+                          std::to_string((i64)get_int(eval(a[3]), a[3]->type));
+        err(loc, "assertion failed", where, msg.empty() ? "" : ": ", msg);
       }
       case Builtin::CommandLineArguments:
         return make_string(0, 0);  // compile time: no program arguments (a view has a string's layout)

@@ -162,7 +162,7 @@ Serial/JTAG port.
   show the output on the console instead, and a program started by a reset
   never halts in a semihosting call. On a board script without a console
   (and on QEMU, `mps2-an505.ld`) semihosting is used whenever C_DEBUGEN is
-  set, as before; with no debugger output is dropped.
+  set; with no debugger output is dropped.
 * Faults print the fault type and CFSR/HFSR (ARM) or mcause/mepc/mtval
   (RISC-V), then exit with status 134.
 * ESP32-C6: startup turns off the watchdogs (timer groups, RTC and super
@@ -262,7 +262,9 @@ Implemented:
   below)
 * Procedures: default and named arguments, multiple return values,
   variadic `..T` parameters (an array is passed to one as `f(..array)`, also
-  to `print` / `sprint`: `print(format, ..args)`), procedure values, nested (non-capturing)
+  to `print` / `sprint`: `print(format, ..args)`; parameters after the
+  variadic one are passed by name, as in `join("a", "b", separator = ", ")`,
+  and those without a default must be), procedure values, nested (non-capturing)
   procedures, order-independent top-level declarations, `#foreign` /
   `#c_call` with `#system_library`, structs and unions by value across the
   C boundary, `#program_export` (see *C interop* below)
@@ -319,7 +321,9 @@ Implemented:
   *Metaprogramming* below)
 * Runtime type information: `type_info(T)`, `Type_Info` and the
   `Type_Info_*` structs (see *Runtime type information* below)
-* Runtime checks: array bounds checks; `assert`
+* Runtime checks: array bounds checks; `assert(cond)`, `assert(cond,
+  "message")`, and `loc = ...` to report another location than the call
+  (`check :: (x: int, loc := #caller_location) { assert(x > 0, loc = loc); }`)
 * ojay extension for embedded targets: `#import "Hardware"` provides
   `volatile_load(p)` and `volatile_store(p, value)` for memory-mapped
   registers (integers, floats, enums, bools and pointers). Jai has no
@@ -348,12 +352,15 @@ Implemented:
     `array_unordered_remove_by_index` / `_by_value`, `array_view`, `peek`,
     `peek_pointer`, `pop`), `swap`, strings (`to_string` of a C string or of
     data and count, `c_style_strlen`, `alloc_string`, `copy_string`,
-    `compare`, `is_digit`, `is_alpha`, `is_alnum`, `is_space`),
+    `compare`, `join` (`separator`, `before_first`, `after_last`),
+    `is_digit`, `is_alpha`, `is_alnum`, `is_space`),
     `String_Builder` (`init_string_builder`, `append` of a string or byte,
     `print_to_builder`, `builder_string_length`, `builder_to_string`,
     `reset`, `free_buffers`), and `log` / `log_error`, which format like
-    `sprint` and call `context.logger` (`log_error` sets `Log_Flags.ERROR`,
-    which the default logger writes to stderr).
+    `sprint` and call `context.logger` with a `Log_Info` (`location`, the
+    caller's unless `loc` is given, `common_flags` from `flags`, and
+    `user_flags`; `log_error` sets `Log_Flags.ERROR`, which the default logger
+    writes to stderr).
   * Math: `clamp` (polymorphic), `lerp`, `PI64`, `TAU64`, `Vector2`,
     `Vector3`, `Vector4` (`x`, `y`, ... and `component[i]`), `make_vector2/3/4`,
     the operators `+ - * /` (per component, and `*` / `/` by a scalar),
@@ -363,8 +370,8 @@ Implemented:
   Differences from Jai's modules: `array_reserve` and `String_Builder`
   memory come from the array's allocator (`context.allocator` when it first
   grows), `String_Builder` is one growing buffer rather than a chain of
-  buffers, and `builder_to_string`, `log` and `log_error` take no optional
-  parameters (no allocator, `#caller_location`, flags or log sections).
+  buffers, `builder_to_string` takes no allocator, and there are no log
+  sections (`Log_Info` has no `section`, `log` no `section` parameter).
   `print` shows anonymous struct and union members inline, so a `Vector3`
   prints as `{1, 2, 3}`.
   The allocating ones use `context.allocator`; `alloc`, `free`, `realloc`,
@@ -375,14 +382,10 @@ Implemented:
   runtime (do not free them). Bare-metal programs, and `#run` code, get an
   empty array.
 
-Not yet implemented: `#compiler` procedures and the compiler message loop
-(`#run,stallable`), `Code_Node` introspection (`compiler_get_nodes`),
-`#insert,scope(...)`, `#procedure_of_call`, `#procedure_name()`, variadic `#foreign` procedures (C varargs), parameters after a
-variadic one (Jai's `join(..strings, separator = ", ")`; Basic has no `join`), `using` on pointer members
-and at top level, `#as`, threads and thread contexts. Polymorphism does not yet cover `$$` auto-baking,
-`#bake_arguments`, `$T/Interface` constraints, `$R` introduced in a return
-type, `#modify` on structs, or polymorphic procedure values (using a template
-without calling it).
+What is not implemented yet is listed in [`TODO.md`](TODO.md). Some
+directives are accepted and have no effect: `#scope_file`, `#scope_export`
+and `#scope_module` (every declaration is visible to importers), `#no_abc`,
+`#must`, `#deprecated` and call-site `inline`.
 
 ### Struct layout, constants and distinct types
 
@@ -596,12 +599,9 @@ buffer: [#run compute_size()]u8;        // anywhere a constant is needed
   context, can `push_context`, and can use allocators written in Jai, also
   ones that hand out memory from a buffer of the `#run` code (every access
   is still checked).
-* Differences from Jai: there is no compiler message loop or
-  `#run,stallable`; results cannot contain pointers or procedure values
-  (so not a `Context` or `Allocator` either; Jai can bake some of them into
-  the program); `sin`, `pow` and other transcendental
-  functions use the host's math library, whose last-bit rounding can differ
-  from the target's libm.
+* Differences from Jai: `sin`, `pow` and other transcendental functions use
+  the host's math library, whose last-bit rounding can differ from the
+  target's libm.
 
 ### The context and allocators
 
@@ -644,7 +644,7 @@ reset_temporary_storage();
   bytes; `old_memory` may be null), `FREE`, `FREE_ALL` and (an ojay
   extension) `ALLOCATE_ALIGNED` (see *Struct layout*). An allocator returns
   null for a mode it does not handle; one that switches on the mode with
-  `#complete` must now list `ALLOCATE_ALIGNED` too.
+  `#complete` must list `ALLOCATE_ALIGNED` too.
   `default_allocator_proc` is the runtime's heap. An allocator whose `proc`
   is null means `context.allocator`.
 * A dynamic array (`[..]T`) has an `allocator` member, as in Jai: it takes
@@ -676,14 +676,13 @@ reset_temporary_storage();
 * The Preload (`src/preload.jai`, compiled into the compiler) declares all
   of this in Jai. A program gets only the parts it uses. A program that uses
   none of it (no `context`, `push_context`, `Allocator`, `tprint`, ...)
-  calls the runtime's heap directly, exactly as before. Otherwise the
+  calls the runtime's heap directly. Otherwise the
   allocating built-ins go through `__allocate`, which calls the runtime
   directly when the allocator is the default one and makes an indirect call
   otherwise.
-* Differences from Jai: `push_context` always pushes a copy; `log` has no
-  optional parameters (see *Built-in modules*); there are no threads; `Allocator_Mode` has only the modes
-  above (no `STARTUP`, `CAPS`, ...), and `ALLOCATE_ALIGNED` is ojay's own; `print` (which does not allocate) is allowed without a
-  context.
+* Differences from Jai: `push_context` always pushes a copy;
+  `ALLOCATE_ALIGNED` is ojay's own mode; `print` (which does not allocate)
+  is allowed without a context.
 
 ### Runtime type information
 
@@ -731,23 +730,19 @@ for e.names  print("% = %\n", it, e.values[it_index]);
   `variant_of` to reach the base's kind; `print` does, and prints the name as
   the type. The declarations are in `src/core.jai`.
 * `print` reads the same tables, so they are one copy per type in
-  read-only data. On 32-bit targets they are smaller than the tables used
-  before (e.g. 2657 -> 2162 bytes of text and read-only data for
-  `tests/run/printing.jai` at `-O2` on ARM).
+  read-only data.
 * Under `#run` the same structs are laid out in compile-time memory when
   first accessed, for the target's pointer size. Reading past the end of
   the actual `Type_Info_*` struct (a `Type_Info` cast to the wrong kind) is
   an error.
 * Differences from Jai: the enums Jai nests inside the structs are
   top-level (`Type_Info_Array_Type`, `Type_Info_Struct_Member_Flags`,
-  `Enum_Type_Flags`, `Type_Info_Procedure_Flags`); members have no `notes`,
-  structs no `initializer`, `polymorph_source_struct` or parameters; there
-  are no `Type_Info_Overload_Set` or `_Polymorphic_Variable`; a distinct
-  type is a `Type_Info_Variant` with `name` and `variant_of` (as Jai code
-  uses them) and ojay's own `variant_flags`: Jai's full declaration is not
-  public, so any further members it has are not reproduced; `ANONYMOUS` (0x100) marks anonymous struct
-  and union members; and `Any.type` has type `Type`, which converts to
-  `*Type_Info` as needed.
+  `Enum_Type_Flags`, `Type_Info_Procedure_Flags`); a distinct type is a
+  `Type_Info_Variant` with `name` and `variant_of` (as Jai code uses them)
+  and ojay's own `variant_flags`: Jai's full declaration is not public, so
+  any further members it has are not reproduced; `ANONYMOUS` (0x100) marks
+  anonymous struct and union members; and `Any.type` has type `Type`, which
+  converts to `*Type_Info` as needed.
 
 ### Metaprogramming
 
@@ -862,17 +857,11 @@ add :: (a: $T, b: T) -> T #modify { if T == s16  T = s64; return true; } { retur
   moved element is visited next. Such a loop reads the array's count and
   data again on every iteration.
 * `#if` takes a constant bool, number or enum (`#if flags & .REVERSE`).
-* Differences from Jai: `#insert,scope()`, `#insert -> string { ... }`,
-  `Code_Node` introspection, `#procedure_of_call`, `` `break`` / `` `continue``,
-  `continue x` of a `for_expansion` loop and `#modify` on structs are not
-  supported. `#insert (...)` only takes `remove = { ... }`. `assert` (a
-  built-in) reports its call site but takes no `loc` argument, and `log`
-  cannot take `loc := #caller_location` until parameters after a variadic one
-  exist, so `Log_Info` has no `location`; the embedded modules report names
-  rather than paths. `#code` takes an expression or
-  a `{ }` block, not a bare statement. Macros return at most one value. A
-  string inserted inside a macro resolves names in the macro's scope (the
-  insertion point), while inserted `Code` follows the rules above.
+* Differences from Jai: `assert` is a built-in rather than a macro, and
+  takes no format arguments; the embedded modules report names rather than
+  paths. A string inserted inside a macro
+  resolves names in the macro's scope (the insertion point), while inserted
+  `Code` follows the rules above.
 
 ## Layout
 

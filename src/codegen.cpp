@@ -2234,12 +2234,20 @@ class CodeGen {
         auto* ok_bb = llvm::BasicBlock::Create(ctx_, "assert.ok", fn_);
         b_.CreateCondBr(ok, ok_bb, fail_bb);
         b_.SetInsertPoint(fail_bb);
-        const std::string& path = sm_.get(c->loc.file).path;
         llvm::Value* mlen = llvm::ConstantInt::get(i64_, 0);
         llvm::Value* mdata = llvm::ConstantPointerNull::get(llvm::PointerType::get(ctx_, 0));
-        if (a.size() == 2) mdata = string_parts(a[1], &mlen);
-        b_.CreateCall(rt_assert_, {cstring_global(path), llvm::ConstantInt::get(i64_, path.size()),
-                                   llvm::ConstantInt::get(i32_, c->loc.line), mdata, mlen});
+        if (a[1]) mdata = string_parts(a[1], &mlen);
+        llvm::Value *file, *flen, *line;
+        if (a[2]) {  // loc = ...
+          file = string_parts(a[2], &flen);
+          line = b_.CreateTrunc(rvalue(a[3]), i32_);
+        } else {
+          const std::string& path = sm_.get(c->loc.file).path;
+          file = cstring_global(path);
+          flen = llvm::ConstantInt::get(i64_, path.size());
+          line = llvm::ConstantInt::get(i32_, c->loc.line);
+        }
+        b_.CreateCall(rt_assert_, {file, flen, line, mdata, mlen});
         b_.CreateUnreachable();
         b_.SetInsertPoint(ok_bb);
         return nullptr;

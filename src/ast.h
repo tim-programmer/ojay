@@ -236,7 +236,7 @@ struct ProcLit : Expr {
   Expr* foreign_lib = nullptr;
   std::string foreign_name;
   bool c_call = false;
-  bool variadic = false;  // last param is `..T`
+  bool variadic = false;  // has a `..T` parameter (parameters after it are passed by name)
   bool symmetric = false; // #symmetric: a two-parameter operator also applies with its operands swapped
   bool is_poly = false;   // has `$T` in a parameter type or a compile-time parameter (`$N: int`)
   bool poly_returns = false;  // has `$T` in a return type
@@ -294,7 +294,7 @@ struct ProcTypeExpr : Expr {
   std::vector<Expr*> params;
   std::vector<Expr*> returns;
   bool c_call = false;
-  bool variadic = false;
+  int vararg = -1;  // index of the `..T` parameter, or -1
   explicit ProcTypeExpr(SourceLoc l) : Expr(NK::ProcType, l) {}
 };
 

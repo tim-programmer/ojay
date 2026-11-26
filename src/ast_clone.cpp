@@ -104,7 +104,7 @@ class Cloner {
         for (Expr* x : p->params) n->params.push_back(expr(x));
         for (Expr* x : p->returns) n->returns.push_back(expr(x));
         n->c_call = p->c_call;
-        n->variadic = p->variadic;
+        n->vararg = p->vararg;
         return n;
       }
       case NK::Ifx: {

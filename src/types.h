@@ -105,7 +105,8 @@ struct Type {
   std::vector<Type*> params;
   std::vector<Type*> returns;
   bool c_call = false;
-  bool variadic = false;  // last param is `..T` (a []T)
+  bool variadic = false;  // has a `..T` parameter (a []T), params[vararg]
+  int vararg = -1;        // index of the `..T` parameter; later ones are passed by name
 
   // Tuple
   std::vector<Type*> elems;
@@ -174,7 +175,7 @@ class TypeTable {
   Type* int_type(int bits, bool is_signed);
   Type* pointer_to(Type* elem);
   Type* array_of(Type* elem, ArrayKind kind, int64_t count = 0);
-  Type* proc(const std::vector<Type*>& params, const std::vector<Type*>& returns, bool c_call, bool variadic);
+  Type* proc(const std::vector<Type*>& params, const std::vector<Type*>& returns, bool c_call, int vararg);
   Type* tuple(const std::vector<Type*>& elems);
   Type* new_struct(const std::string& name);
   Type* new_enum(const std::string& name, Type* base, bool flags);
@@ -195,7 +196,7 @@ class TypeTable {
   std::vector<std::unique_ptr<Type>> owned_;
   std::map<Type*, Type*> pointers_;
   std::map<std::tuple<Type*, int, int64_t>, Type*> arrays_;
-  std::map<std::tuple<std::vector<Type*>, std::vector<Type*>, bool, bool>, Type*> procs_;
+  std::map<std::tuple<std::vector<Type*>, std::vector<Type*>, bool, int>, Type*> procs_;
   std::map<std::vector<Type*>, Type*> tuples_;
 
   Type* make(TypeKind k, const std::string& name, int64_t size, int64_t align);

@@ -1040,8 +1040,10 @@ class Parser {
         advance();
         advance();
       }
-      if (accept(Tok::DotDot)) {
-        pt->variadic = true;
+      if (at(Tok::DotDot)) {
+        if (pt->vararg >= 0) fail(cur().loc, "a procedure type can have only one variadic parameter");
+        advance();
+        pt->vararg = (int)pt->params.size();
         pt->params.push_back(ast_.make<ArrType>(cur().loc, ArrayKind::View, nullptr, parse_type()));
       } else {
         pt->params.push_back(parse_type());

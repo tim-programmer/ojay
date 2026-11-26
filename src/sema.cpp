@@ -1331,7 +1331,7 @@ class Checker : public InterpHost {
     for (size_t i = 0; i < p->params.size(); ++i) {
       Decl* d = p->params[i];
       if (!names.insert(d->names[0].name).second) fail(d->loc, "duplicate parameter '", d->names[0].name, "'");
-      if (d->is_vararg && i + 1 != p->params.size()) fail(d->loc, "a variadic parameter must be the last parameter");
+      if (d->is_vararg && vararg_index(p) != (int)i) fail(d->loc, "a procedure can have only one variadic parameter");
       Type* t = nullptr;
       if (d->type_expr) {
         t = resolve_type(d->type_expr);
@@ -1365,7 +1365,7 @@ class Checker : public InterpHost {
     if (p->is_macro && rets.size() > 1)
       fail(p->returns[1].loc, "#expand macros with more than one return value are not supported yet");
     if (p->is_macro && p->c_call) fail(p->loc, "an #expand macro cannot be #c_call");
-    p->type = T.proc(params, rets, p->c_call, p->variadic);
+    p->type = T.proc(params, rets, p->c_call, vararg_index(p));
     if (p->is_foreign && p->variadic) fail(p->loc, "variadic #foreign procedures are not supported yet");
     if (p->program_export) {
       if (!p->c_call) fail(p->loc, "#program_export procedures must be #c_call (C calls them with the C calling convention)");
@@ -2607,12 +2607,12 @@ class Checker : public InterpHost {
           if (r->kind != TypeKind::Void) rs.push_back(r);
         }
         if (p->c_call) {
-          if (p->variadic) fail(e->loc, "variadic #c_call procedure types are not supported");
+          if (p->vararg >= 0) fail(e->loc, "variadic #c_call procedure types are not supported");
           if (rs.size() > 1) fail(e->loc, "#c_call/#foreign procedures cannot return multiple values");
           for (size_t i = 0; i < ps.size(); ++i) check_c_type(ps[i], p->params[i]->loc, false);
           if (rs.size() == 1) check_c_type(rs[0], e->loc, true);
         }
-        e->cv = ConstValue::of_type(T.proc(ps, rs, p->c_call, p->variadic));
+        e->cv = ConstValue::of_type(T.proc(ps, rs, p->c_call, p->vararg));
         return T.type_t;
       }
       case NK::Ifx: return check_ifx(static_cast<Ifx*>(e), hint);
@@ -3451,6 +3451,15 @@ class Checker : public InterpHost {
     std::vector<int> param_of;  // per call argument: its parameter
   };
 
+  // The index of p's `..T` parameter, or -1. Parameters before it take the
+  // positional arguments, the variadic one the rest; those after it are
+  // passed by name.
+  static int vararg_index(const ProcLit* p) {
+    for (size_t i = 0; i < p->params.size(); ++i)
+      if (p->params[i]->is_vararg) return (int)i;
+    return -1;
+  }
+
   static bool is_poly_proc_decl(const Symbol* s) {
     return is_proc_decl(s->decl, s->decl_index) && static_cast<ProcLit*>(s->decl->values[s->decl_index])->is_poly;
   }
@@ -3717,7 +3726,8 @@ class Checker : public InterpHost {
 
   ArgMap map_args(const std::vector<Arg>& args, ProcLit* p, SourceLoc loc) {
     size_t n = p->params.size();
-    size_t fixed = p->variadic ? n - 1 : n;
+    int va = vararg_index(p);
+    size_t fixed = va >= 0 ? (size_t)va : n;
     ArgMap m;
     m.params.assign(n, nullptr);
     size_t pos = 0;
@@ -3730,24 +3740,25 @@ class Checker : public InterpHost {
           if (p->params[i]->names[0].name == a.name) idx = i;
         if (idx == n) fail(a.name_loc, "procedure '", p->name, "' has no parameter named '", a.name, "'");
         if (m.params[idx]) fail(a.name_loc, "parameter '", a.name, "' is given twice");
-        if (p->variadic && idx == n - 1) fail(a.name_loc, "cannot pass a variadic parameter by name");
+        if ((int)idx == va) fail(a.name_loc, "cannot pass a variadic parameter by name");
         m.params[idx] = a.value;
         m.param_of.push_back((int)idx);
         continue;
       }
       if (named_seen) fail(a.value->loc, "positional arguments must come before named ones");
       if (a.spread) {
-        check_spread(a, pos, fixed, p->variadic, args.size(), m.extra.size());
+        check_spread(a, pos, fixed, va >= 0, m.extra.size());
         m.spread = a.value;
-        m.param_of.push_back((int)n - 1);
+        m.param_of.push_back(va);
         continue;
       }
       if (pos < fixed) {
         m.param_of.push_back((int)pos);
         m.params[pos++] = a.value;
-      } else if (p->variadic) {
+      } else if (va >= 0) {
+        if (m.spread) fail_after_spread(a.value);
         m.extra.push_back(a.value);
-        m.param_of.push_back((int)n - 1);
+        m.param_of.push_back(va);
       } else {
         fail(a.value->loc, "too many arguments for '", p->name, "': expected ", n);
       }
@@ -4581,33 +4592,38 @@ class Checker : public InterpHost {
   // Total cost of calling procedure `lit` (type pt) with c's arguments, or -1.
   int call_cost(Call* c, Type* pt, ProcLit* lit) {
     size_t n = pt->params.size();
-    size_t fixed = pt->variadic ? n - 1 : n;
+    int va = pt->vararg;
+    size_t fixed = va >= 0 ? (size_t)va : n;
     std::vector<Expr*> out(n, nullptr);
     int cost = 0;
+    bool spread = false;
     size_t pos = 0;
     for (auto& a : c->args) {
       if (!a.name.empty()) {
         size_t idx = n;
         for (size_t i = 0; i < n; ++i)
           if (lit->params[i]->names[0].name == a.name) idx = i;
-        if (idx == n || out[idx] || (pt->variadic && idx == n - 1)) return -1;
+        if (idx == n || out[idx] || (int)idx == va) return -1;
         out[idx] = a.value;
       } else if (a.spread) {
-        if (!pt->variadic || pos < fixed) return -1;
-        int k = arg_cost(a.value, pt->params[n - 1]);
+        if (va < 0 || pos < fixed || spread) return -1;
+        spread = true;
+        int k = arg_cost(a.value, pt->params[va]);
         if (k < 0) return -1;
         cost += k + 1;
       } else if (pos < fixed) {
         out[pos++] = a.value;
-      } else if (pt->variadic) {
-        int k = arg_cost(a.value, pt->params[n - 1]->elem);
+      } else if (va >= 0) {
+        if (spread) return -1;
+        int k = arg_cost(a.value, pt->params[va]->elem);
         if (k < 0) return -1;
         cost += k + 1;  // prefer a fixed-arity overload
       } else {
         return -1;
       }
     }
-    for (size_t i = 0; i < fixed; ++i) {
+    for (size_t i = 0; i < n; ++i) {
+      if ((int)i == va) continue;
       if (!out[i]) {
         if (lit->params[i]->values.empty()) return -1;
         continue;
@@ -4821,12 +4837,15 @@ class Checker : public InterpHost {
   }
 
   // `..array` as argument `a`: only for the variadic parameter, and as its only argument.
-  void check_spread(const Arg& a, size_t pos, size_t fixed, bool variadic, size_t n_args, size_t n_extra) {
+  void check_spread(const Arg& a, size_t pos, size_t fixed, bool variadic, size_t n_extra) {
     if (!variadic) fail(a.value->loc, "'..' passes an array to a variadic parameter, but this procedure has none");
     if (pos < fixed) fail(a.value->loc, "'..' passes an array to the variadic parameter; arguments for the ",
                           fixed - pos, " parameter", fixed - pos == 1 ? "" : "s", " before it are missing");
-    if (n_extra > 0 || pos + 1 != n_args)
-      fail(a.value->loc, "an array passed with '..' must be the only argument of the variadic parameter");
+    if (n_extra > 0) fail_after_spread(a.value);
+  }
+  // Another argument for the variadic parameter next to a `..array`.
+  [[noreturn]] void fail_after_spread(Expr* e) {
+    fail(e->loc, "an array passed with '..' must be the only argument of the variadic parameter");
   }
 
   void check_spread_value(Expr*& e, Type* view) {
@@ -4846,7 +4865,8 @@ class Checker : public InterpHost {
 
   void bind_args(Call* c, Type* pt, ProcLit* lit) {
     size_t n = pt->params.size();
-    size_t fixed = pt->variadic ? n - 1 : n;
+    int va = pt->vararg;
+    size_t fixed = va >= 0 ? (size_t)va : n;
     std::vector<Expr*> out(n, nullptr);
     std::vector<Expr*> var_args;
     Expr* spread = nullptr;
@@ -4861,25 +4881,27 @@ class Checker : public InterpHost {
           if (lit->params[i]->names[0].name == a.name) idx = i;
         if (idx == n) fail(a.name_loc, "procedure '", lit->name, "' has no parameter named '", a.name, "'");
         if (out[idx]) fail(a.name_loc, "parameter '", a.name, "' is given twice");
-        if (pt->variadic && idx == n - 1) fail(a.name_loc, "cannot pass a variadic parameter by name");
+        if ((int)idx == va) fail(a.name_loc, "cannot pass a variadic parameter by name");
         out[idx] = a.value;
         continue;
       }
       if (named_seen) fail(a.value->loc, "positional arguments must come before named ones");
       if (a.spread) {
-        check_spread(a, pos, fixed, pt->variadic, c->args.size(), var_args.size());
+        check_spread(a, pos, fixed, va >= 0, var_args.size());
         spread = a.value;
         continue;
       }
       if (pos < fixed) {
         out[pos++] = a.value;
-      } else if (pt->variadic) {
+      } else if (va >= 0) {
+        if (spread) fail_after_spread(a.value);
         var_args.push_back(a.value);
       } else {
         fail(a.value->loc, "too many arguments: expected ", n);
       }
     }
-    for (size_t i = 0; i < fixed; ++i) {
+    for (size_t i = 0; i < n; ++i) {
+      if ((int)i == va) continue;
       if (out[i]) {
         check_value(out[i], pt->params[i]);
         continue;
@@ -4890,13 +4912,16 @@ class Checker : public InterpHost {
         continue;
       }
       std::string pname = lit ? "'" + lit->params[i]->names[0].name + "'" : std::to_string(i + 1);
+      if (!lit && va >= 0 && (int)i > va)
+        fail(c->loc, "missing argument for parameter ", pname, ": it follows the variadic parameter, so it can only "
+             "be passed by name, which a call through a procedure value cannot do");
       fail(c->loc, "missing argument for parameter ", pname);
     }
     if (spread) {
-      check_spread_value(spread, pt->params[n - 1]);
-      out[n - 1] = spread;
-    } else if (pt->variadic) {
-      Type* elem = pt->params[n - 1]->elem;
+      check_spread_value(spread, pt->params[va]);
+      out[va] = spread;
+    } else if (va >= 0) {
+      Type* elem = pt->params[va]->elem;
       auto* pack = ast_.make<ArrayLit>(c->loc, nullptr);
       for (Expr* v : var_args) {
         check_value(v, elem);
@@ -4904,7 +4929,7 @@ class Checker : public InterpHost {
       }
       pack->type = T.array_of(elem, ArrayKind::Fixed, (int64_t)var_args.size());
       complete_type(pack->type, c->loc);
-      out[n - 1] = ast_.make<ImplicitConv>(c->loc, pack, pt->params[n - 1]);
+      out[va] = ast_.make<ImplicitConv>(c->loc, pack, pt->params[va]);
     }
     c->resolved_args = std::move(out);
   }
@@ -5220,9 +5245,24 @@ class Checker : public InterpHost {
         return T.void_t;
       }
       case Builtin::Assert: {
-        auto& a = positional(c, 1, 2, "assert");
+        // Jai's assert :: (arg: bool, message := "", args: ..Any, loc := #caller_location):
+        // `loc` follows the (not yet supported) format arguments, so it is passed by name.
+        auto args = builtin_args(c, {"arg", "message", "loc"}, 1, "assert");
+        if (c->args.size() >= 3 && c->args[2].name.empty())
+          fail(c->args[2].value->loc, "'assert' does not take format arguments yet (pass 'loc' by name)");
+        // resolved: condition, message (or null), and the file and line to report (or null for the call site)
+        c->resolved_args = {args[0], args[1], nullptr, nullptr};
+        auto& a = c->resolved_args;
         check_cond(a[0]);
-        if (a.size() == 2) check_value(a[1], T.string_t);
+        if (a[1]) check_value(a[1], T.string_t);
+        if (args[2]) {
+          check_value(args[2], source_loc_t_);
+          // Read only when the assertion fails; `loc` is evaluated once for each member.
+          a[2] = ast_.make<Member>(args[2]->loc, args[2], "fully_pathed_filename");
+          a[3] = ast_.make<Member>(args[2]->loc, args[2], "line_number");
+          check_value(a[2], T.string_t);
+          check_value(a[3], T.s64);
+        }
         return T.void_t;
       }
       case Builtin::CommandLineArguments:

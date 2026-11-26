@@ -97,8 +97,8 @@ Type* TypeTable::array_of(Type* elem, ArrayKind kind, int64_t count) {
 }
 
 Type* TypeTable::proc(const std::vector<Type*>& params, const std::vector<Type*>& returns, bool c_call,
-                      bool variadic) {
-  auto key = std::make_tuple(params, returns, c_call, variadic);
+                      int vararg) {
+  auto key = std::make_tuple(params, returns, c_call, vararg);
   auto it = procs_.find(key);
   if (it != procs_.end()) return it->second;
   const int ps = layout_.pointer_size;
@@ -106,7 +106,8 @@ Type* TypeTable::proc(const std::vector<Type*>& params, const std::vector<Type*>
   t->params = params;
   t->returns = returns;
   t->c_call = c_call;
-  t->variadic = variadic;
+  t->variadic = vararg >= 0;
+  t->vararg = vararg;
   procs_[key] = t;
   return t;
 }
@@ -169,6 +170,7 @@ void TypeTable::copy_distinct(Type* t) {
   t->returns = b->returns;
   t->c_call = b->c_call;
   t->variadic = b->variadic;
+  t->vararg = b->vararg;
   t->elems = b->elems;
 }
 
@@ -223,7 +225,7 @@ std::string type_name(const Type* t) {
       std::string s = "(";
       for (size_t i = 0; i < t->params.size(); ++i) {
         if (i) s += ", ";
-        if (t->variadic && i + 1 == t->params.size()) s += ".." + type_name(t->params[i]->elem);
+        if ((int)i == t->vararg) s += ".." + type_name(t->params[i]->elem);
         else s += type_name(t->params[i]);
       }
       s += ")";

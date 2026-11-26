@@ -1,0 +1,18 @@
+a: 6 (3 values)
+b: 60 (3 values)
+c: 0 (0 values)!
+d: 9 (2 values) (spread)
+e: 0 (0 values)
+21
+1, 2, 3
+1.5 | 2.5
+2 1
+1-2-3
+[a, b, c]
+[/a/b/]
+[] [solo] []
+[x+y]
+[app line 62 flags 0 user 0] hello 42
+[app line 63 flags 2 user 7] warn
+[app line 64 flags 1 user 3] bad 1 2
+true

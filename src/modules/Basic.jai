@@ -245,6 +245,31 @@ builder_to_string :: (builder: *String_Builder) -> string {
     return result;
 }
 
+// The strings one after another with `separator` between them (and before the
+// first / after the last one if asked), in memory from context.allocator.
+join :: (inputs: .. string, separator := "", before_first := false, after_last := false) -> string {
+    if !inputs.count  return "";
+    seps := inputs.count - 1;
+    if before_first  seps += 1;
+    if after_last  seps += 1;
+    count := seps * separator.count;
+    for inputs  count += it.count;
+    if !count  return "";
+    result := alloc_string(count);
+    at := result.data;
+    put :: (at: *u8, s: string) -> *u8 {
+        if s.count  memcpy(at, s.data, s.count);
+        return at + s.count;
+    }
+    if before_first  at = put(at, separator);
+    for inputs {
+        if it_index  at = put(at, separator);
+        at = put(at, it);
+    }
+    if after_last  at = put(at, separator);
+    return result;
+}
+
 // Empties the builder, keeping its memory.
 reset :: (builder: *String_Builder) {
     builder.buffer.count = 0;
@@ -257,21 +282,24 @@ free_buffers :: (builder: *String_Builder) {
 
 // ------------------------------------------------------------------ logging
 
-// Formats a message (as sprint does) and hands it to context.logger.
-log :: (format: string, args: .. Any) {
-    __log(format, args, .NONE);
+// Formats a message (as sprint does) and hands it to context.logger, with
+// the caller's location and the flags in the Log_Info.
+log :: (format: string, args: .. Any, loc := #caller_location, flags := Log_Flags.NONE, user_flags: u32 = 0) {
+    __log(format, args, loc, flags, user_flags);
 }
 
 // log with Log_Flags.ERROR: the default logger writes it to stderr.
-log_error :: (format: string, args: .. Any) {
-    __log(format, args, .ERROR);
+log_error :: (format: string, args: .. Any, loc := #caller_location, user_flags: u32 = 0) {
+    __log(format, args, loc, .ERROR, user_flags);
 }
 
-__log :: (format: string, args: [] Any, flags: Log_Flags) {
+__log :: (format: string, args: [] Any, loc: Source_Code_Location, flags: Log_Flags, user_flags: u32) {
     message := sprint(format, ..args);
     info: Log_Info;
     info.source_identifier = context.log_source_identifier;
+    info.location = loc;
     info.common_flags = flags;
+    info.user_flags = user_flags;
     if context.logger  context.logger(message, context.logger_data, info);
     free(message);
 }

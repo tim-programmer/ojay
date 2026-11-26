@@ -1,82 +1,53 @@
 # TODO
 
-## Tooling
-
-- [x] Generate a script that will convert from SVD files or CMSIS headers to importable jai code
-      (`tools/regs2jai.py`).
+What is implemented is documented in `README.md`; this file lists only what is not done yet.
 
 ## Language
 
-- [x] `#run` (compile-time execution) (not yet: `#run,stallable` and the compiler message loop,
-      unions, pointers and procedure values in results)
-- [x] Polymorphic procedures and structs (`$T`) (not yet: `$$`, `#bake_arguments`,
-      `/interface`, `$R` in return types, polymorphic procedure values)
-- [x] `using` (not yet: pointer members, top level, `#as`)
-- [x] Procedure overloading
-- [x] Operator overloading
-- [x] Metaprogramming: `#insert`, `#code`, `#modify`, `#expand` (not yet: `#insert,scope()`,
-      `Code_Node` introspection / `compiler_get_nodes`, `` `break``/`` `continue``,
-      `#modify` on structs, macros with several return values)
-- [x] The context and custom allocators (not yet: Basic's `log`, threads and thread contexts,
-      the `STARTUP` / `CAPS` / ... allocator modes; alignment requests are ojay's own
-      `ALLOCATE_ALIGNED` mode)
-- [x] Named module imports (`Name :: #import "..."`) with a real namespace
-- [x] `#foreign` procedures that pass or return structs by value (C ABI lowering) for x86-64 SysV,
-      Arm AAPCS (VFP) and RISC-V ilp32, plus `#program_export` (not yet: variadic `#foreign`
-      procedures, other targets' C ABIs, the RISC-V hard-float ABIs ilp32f/ilp32d)
-- [x] `if x == { case ...; }` switches on strings
-
-- [x] Runtime type info: `type_info(T)` and the `Type_Info_*` structs (`Type_Info_Struct`
-      members, ...), for generic printing and serialization; `print` uses the same tables, and
-      `#run` code can read them (not yet: member `notes`, struct `initializer`,
-      `polymorph_source_struct` and parameters, the enums nested inside the structs as in Jai,
-      `Type_Info_Variant` / `_Overload_Set` / `_Polymorphic_Variable`)
-- [x] `for_expansion` (custom iteration with `For_Flags`) and `remove it` in `for` loops, with
-      `#insert (remove = { ... }) body;`, backtick declarations nested in a macro body, and `#if`
-      on numbers and enums (not yet: `continue x` of a `for_expansion` loop)
-- [x] `#caller_location` / `#location` and `Source_Code_Location` (not yet: `log` with
-      `loc := #caller_location` and `Log_Info.location` (needs parameters after a variadic
-      one), a `loc` argument for `assert`, `#procedure_of_call`)
-- [x] Struct layout and members: constants inside structs (`S :: struct { N :: 3; }`), `#place`,
-      `#align` (also on variables), `#this`, `void` members as `#place` markers, such structs
-      by value across the C ABI, alignment requests to allocators (`ALLOCATE_ALIGNED`)
-- [x] Distinct types (`#type,distinct`, `#type,isa`) (Type_Info_Variant has `name`,
-      `variant_of` and ojay's `variant_flags`; Jai's full declaration is not public)
+- [ ] `#scope_file`, `#scope_export` and `#scope_module`: parsed and ignored, so a module's
+      private declarations are visible to (and can clash with) the code that imports it
 - [ ] Short lambdas: `(x: int) => x * 2`
 - [ ] Smaller directives and intrinsics: `#procedure_name()`, `is_constant()`, `#bytes`,
       `#exists`, `initializer_of(T)`, `enum_highest_value` and the other enum helpers,
-      `#no_abc`, `#bake_constants`, `#asm`
+      `#bake_constants`, `#asm`
+- [ ] Directives that are accepted but have no effect: `#no_abc` (bounds checks stay on),
+      `#must` (no warning for an unused result), `#deprecated` (no warning), call-site `inline`
 - [ ] Remaining polymorphism: `$$` auto-baking, `#bake_arguments`, `$T/Interface` constraints,
       `$R` introduced in a return type, polymorphic procedure values, `#modify` on structs
-- [ ] Procedures: parameters after a variadic one (named only, e.g. `join(..s, separator = ",")`),
-      variadic `#foreign` procedures (C varargs), `#expand` macros with several return values
+- [ ] Procedures: variadic `#foreign` procedures (C varargs), `#expand` macros with several
+      return values
 - [ ] `using` on pointer members and at top level, `#as`
+- [ ] Metaprogramming: `` `break`` / `` `continue``, `continue x` of a `for_expansion` loop,
+      `#insert -> string { ... }`, `#insert (...)` options other than `remove`, `#code` of a bare
+      statement
 - [ ] Compiler integration: `#compiler` procedures, the message loop (`#run,stallable`),
       `Code_Node` introspection (`compiler_get_nodes`), `#insert,scope(...)`, `#procedure_of_call`
-- [ ] Threads and thread contexts
-- [ ] Check what `#scope_file`, `inline`, `#must` and `#deprecated` actually do (they compile,
-      but may only be accepted and ignored)
+- [ ] `#run` results that contain pointers, array views, dynamic arrays, `Any`, unions or
+      procedure values (Jai can bake some of them, such as a `Context` or `Allocator`)
+- [ ] Runtime type info: member `notes`, struct `initializer`, `polymorph_source_struct` and
+      parameters, the enums nested inside the structs as in Jai, `Type_Info_Overload_Set` and
+      `Type_Info_Polymorphic_Variable`
+- [ ] The other `Allocator_Mode`s (`STARTUP`, `CAPS`, ...)
+- [ ] Threads and thread contexts (the context is a single global pointer, so this means
+      changing how the context is found)
+
+## C ABI
+
+- [ ] Other targets' C ABIs (only scalars cross the C boundary there)
+- [ ] The RISC-V hard-float ABIs ilp32f / ilp32d
 
 ## Runtime and modules
 
 - [ ] More modules: `Hash_Table` first, then `String`, `File`, `Random`, `POSIX`, `Compiler`,
       `Thread`
-- [x] A real allocator for bare-metal targets: a first-fit free list with boundary tags and
-      immediate merging (not yet: size-class bins for faster allocation with many free blocks)
-- [x] `get_command_line_arguments()` (not yet: `__command_line_arguments`, arguments for
-      bare-metal programs, e.g. from semihosting `SYS_GET_CMDLINE`)
-- [x] Write more of `Basic` and `Math` in Jai once polymorphism exists: `src/modules/Basic.jai`
-      (polymorphic array procedures, `swap`, string procedures, `String_Builder`, `log`) and
-      `src/modules/Math.jai` (`clamp`, `lerp`, `Vector2/3/4` with operators, `dot`, `cross`,
-      `length`, `normalize`), plus `f(..array)` arguments and an `array_reserve` built-in
-      (not yet: `join` and other procedures with parameters after a variadic one, `Matrix` /
-      `Quaternion`, Jai's chained `String_Builder` buffers, moving `min` / `max` / `abs` from
-      built-ins to Jai, the `String` module)
-- [x] Cortex-M: console output without a debugger (UART), and avoid halting in
-      semihosting when DHCSR.C_DEBUGEN was left set by a detached debugger: LPUART4 on the
-      FRDM-MCXN947 or a program-defined `__ojay_console_write`; semihosting only when the
-      debugger announces itself (not yet: console input, a UART for the MPS2 / QEMU board,
-      separate stdout and stderr on the console)
+- [ ] Basic and Math: `Matrix` / `Quaternion`, Jai's chained `String_Builder` buffers, moving
+      `min` / `max` / `abs` from built-ins to Jai, an allocator parameter for `builder_to_string`,
+      log sections (`Log_Section`, `Log_Info.section`), format arguments for `assert`
+      (`assert(x > 0, "x is %", x)`)
+- [ ] Allocator: size-class bins for faster allocation with many free blocks
+- [ ] Command-line arguments: `__command_line_arguments`, arguments for bare-metal programs (e.g.
+      from semihosting `SYS_GET_CMDLINE`)
+- [ ] Cortex-M console: input, a UART for the MPS2 / QEMU board, separate stdout and stderr
 
 ## Targets and boards
 

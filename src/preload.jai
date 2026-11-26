@@ -34,6 +34,7 @@ Log_Flags :: enum_flags u32 {
 
 Log_Info :: struct {
     source_identifier: string;
+    location: Source_Code_Location;  // where log / log_error was called
     common_flags: Log_Flags;
     user_flags: u32;
 }
