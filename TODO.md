@@ -30,7 +30,9 @@
       `#run` code can read them (not yet: member `notes`, struct `initializer`,
       `polymorph_source_struct` and parameters, the enums nested inside the structs as in Jai,
       `Type_Info_Variant` / `_Overload_Set` / `_Polymorphic_Variable`)
-- [ ] `for_expansion` (custom iteration with `For_Flags`) and `remove it` in `for` loops
+- [x] `for_expansion` (custom iteration with `For_Flags`) and `remove it` in `for` loops, with
+      `#insert (remove = { ... }) body;`, backtick declarations nested in a macro body, and `#if`
+      on numbers and enums (not yet: `continue x` of a `for_expansion` loop)
 - [ ] `#caller_location` / `#location`
 - [ ] Struct layout and members: constants inside structs (`S :: struct { N :: 3; }`), `#place`,
       `#align`, `#this`

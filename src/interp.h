@@ -28,7 +28,7 @@ class InterpHost {
   // interpreter's heap directly).
   virtual Symbol* default_context() = 0;
   virtual ProcLit* allocate_proc() = 0;
-  // The Type_Info_* structs (type_info.jai), for laying out Type_Info in
+  // The Type_Info_* structs (core.jai), for laying out Type_Info in
   // compile-time memory.
   virtual const Program::TypeInfoTypes& type_info_types() = 0;
 };

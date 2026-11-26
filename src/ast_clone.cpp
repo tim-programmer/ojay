@@ -201,7 +201,12 @@ class Cloner {
         n->backtick = as<Defer>(s)->backtick;
         return n;
       }
-      case NK::Insert: return ast_.make<Insert>(s->loc, expr(as<Insert>(s)->operand));
+      case NK::Insert: {
+        auto* n = ast_.make<Insert>(s->loc, expr(as<Insert>(s)->operand));
+        if (as<Insert>(s)->remove_code) n->remove_code = static_cast<Block*>(stmt(as<Insert>(s)->remove_code));
+        return n;
+      }
+      case NK::Remove: return ast_.make<Remove>(s->loc, as<Remove>(s)->name);
       case NK::Import: {
         auto* i = as<Import>(s);
         auto* n = ast_.make<Import>(s->loc, i->module);

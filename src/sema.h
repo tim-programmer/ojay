@@ -85,7 +85,7 @@ struct Program {
   Symbol* default_context = nullptr;  // the global Context `context` starts as
   ProcLit* allocate_proc = nullptr;   // __allocate: an allocation through an Allocator (or the context's)
   Type* allocator_type = nullptr;     // Allocator
-  // Runtime type information (type_info.jai): the structs codegen and the
+  // Runtime type information (core.jai): the structs codegen and the
   // #run interpreter fill in for each type's Type_Info.
   struct TypeInfoTypes {
     Type* info = nullptr;       // Type_Info

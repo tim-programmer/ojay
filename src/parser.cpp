@@ -207,6 +207,13 @@ class Parser {
       }
       case Tok::Directive:
         return parse_directive_stmt(top_level);
+      case Tok::KwRemove: {  // `remove it;` in a for loop
+        if (top_level) fail(loc, "'remove' is only allowed in a for loop");
+        advance();
+        std::string name = expect(Tok::Ident, "after 'remove' (the iterator to remove, e.g. remove it;)").text;
+        expect(Tok::Semi, "after remove statement");
+        return ast_.make<Remove>(loc, name);
+      }
       case Tok::Ident:
         // `push_context ctx { ... }`. push_context is not a reserved word: it
         // starts the statement when an expression follows it.
@@ -293,9 +300,26 @@ class Parser {
       // `#insert expr;`: expr is a Code or string constant.
       advance();
       reject_insert_modifiers();
+      // `#insert (remove = { ... }) body;` (for_expansion)
+      Block* remove_code = nullptr;
+      if (at(Tok::LParen) && (peek().kind == Tok::Ident || peek().kind == Tok::KwRemove) && peek(2).kind == Tok::Eq) {
+        advance();
+        while (!at(Tok::RParen)) {
+          Token name = advance();
+          expect(Tok::Eq);
+          if (name.kind != Tok::KwRemove)
+            fail(name.loc, "#insert (", name.text, " = ...) is not supported (only remove = { ... })");
+          if (!at(Tok::LBrace)) fail(cur().loc, "expected a block after 'remove =', found ", describe(cur()));
+          remove_code = parse_block();
+          if (!accept(Tok::Comma)) break;
+        }
+        expect(Tok::RParen);
+      }
       Expr* e = parse_expr();
       expect(Tok::Semi, "after #insert statement");
-      return ast_.make<Insert>(loc, e);
+      auto* ins = ast_.make<Insert>(loc, e);
+      ins->remove_code = remove_code;
+      return ins;
     }
     if (d == "add_context") {
       // `#add_context name: T = value;`: a member added to the Context struct.

@@ -17,7 +17,7 @@ namespace ojay {
 extern const char* const kPreloadSource;  // preload.jai (generated preload.cpp)
 extern const char* const kBasicSource;    // modules/Basic.jai (generated modules.cpp)
 extern const char* const kMathSource;     // modules/Math.jai
-extern const char* const kTypeInfoSource; // type_info.jai
+extern const char* const kCoreSource; // core.jai
 
 namespace {
 
@@ -77,6 +77,8 @@ struct MacroCtx {
   bool caller_in_run_operand = false;  // the caller is the expression of a #run
   int caller_defer_depth = 0;
   Scope* body_scope = nullptr;         // the scope of the expansion's top level
+  // The expansion of a for_expansion for `for x, i: ...`: its `it / `it_index declare x and i.
+  std::string rename_it, rename_index;
 };
 
 struct Context {
@@ -128,7 +130,7 @@ class Checker : public InterpHost {
       collect(prog_.modules[i].top_level, false);
       // The Preload is visible in every module, after the module's own imports.
       scope_->imports.push_back(preload_);
-      scope_->imports.push_back(type_info_);
+      scope_->imports.push_back(core_);
     }
     scope_ = global_;
 
@@ -181,7 +183,30 @@ class Checker : public InterpHost {
   std::vector<std::pair<Stmt*, Scope*>> top_directives_;
   // The Preload (preload.jai): its declarations are resolved only when used.
   Scope* preload_ = nullptr;
-  Scope* type_info_ = nullptr;      // Type_Info and the Type_Info_* structs (type_info.jai)
+  Scope* core_ = nullptr;           // core.jai: For_Flags, Type_Info and the Type_Info_* structs
+  Type* for_flags_t_ = nullptr;     // For_Flags
+  // Backtick declarations nested inside a macro body (e.g. `it in a
+  // for_expansion's loop): Code from the caller inserted where they are
+  // visible sees them.
+  std::vector<std::pair<int, Symbol*>> nested_backticks_;  // (macro id, symbol)
+  // `remove` targets: the loops being checked (innermost last). A for over
+  // a value with a for_expansion has `inserts_depth`: the #insert (remove = ...)
+  // that inserted its body comes after it in removes_.
+  struct RemoveTarget {
+    For* loop;
+    bool expanded;
+    size_t inserts_depth;
+  };
+  std::vector<RemoveTarget> remove_targets_;
+  struct InsertRemove {
+    Block* code;
+    Context ctx;  // where the #insert is (the macro's context)
+    bool in_run_operand;
+  };
+  std::vector<InsertRemove> insert_removes_;
+  // Set while a for_expansion call is being checked: the loop and its iterator names.
+  For* pending_for_ = nullptr;
+  std::unordered_map<For*, MacroExpansion*> for_expansions_;  // a for over a value -> its expansion
   Symbol* context_sym_ = nullptr;   // `context`
   bool lazy_collect_ = false;       // collecting the Preload: declarations are not resolved eagerly
   bool context_ready_ = false;
@@ -537,7 +562,7 @@ class Checker : public InterpHost {
     preload_ = new_scope(universe_, nullptr);
     preload_->is_module = true;
     preload_->imports.push_back(internals);
-    preload_->imports.push_back(type_info_);
+    preload_->imports.push_back(core_);
     std::vector<Stmt*> stmts = parse_source_stmts(ast_, sm_, sm_.add("<preload>", kPreloadSource), true);
     Scope* saved = scope_;
     scope_ = preload_;
@@ -565,7 +590,7 @@ class Checker : public InterpHost {
     lazy_collect_ = false;
     scope_ = saved;
     sc->imports.push_back(preload_);
-    sc->imports.push_back(type_info_);
+    sc->imports.push_back(core_);
   }
 
   Symbol* preload_sym(const char* name) { return preload_->syms.at(name); }
@@ -576,16 +601,16 @@ class Checker : public InterpHost {
   // resolved up front (they are only types: they cost nothing until used),
   // as codegen and the #run interpreter lay out every type's Type_Info with them.
   void setup_type_info() {
-    type_info_ = new_scope(universe_, nullptr);
-    type_info_->is_module = true;
-    std::vector<Stmt*> stmts = parse_source_stmts(ast_, sm_, sm_.add("<type_info>", kTypeInfoSource), true);
+    core_ = new_scope(universe_, nullptr);
+    core_->is_module = true;
+    std::vector<Stmt*> stmts = parse_source_stmts(ast_, sm_, sm_.add("<core>", kCoreSource), true);
     Scope* saved = scope_;
-    scope_ = type_info_;
+    scope_ = core_;
     lazy_collect_ = true;
     collect(stmts, true);
     lazy_collect_ = false;
     auto get = [&](const char* name) {
-      Symbol* sym = type_info_->syms.at(name);
+      Symbol* sym = core_->syms.at(name);
       resolve(sym);
       Type* t = sym->cv.t;
       complete_type(t, SourceLoc{});
@@ -601,6 +626,7 @@ class Checker : public InterpHost {
     ti.member = get("Type_Info_Struct_Member");
     ti.enum_ = get("Type_Info_Enum");
     ti.procedure = get("Type_Info_Procedure");
+    for_flags_t_ = get("For_Flags");
     scope_ = saved;
   }
 
@@ -864,10 +890,16 @@ class Checker : public InterpHost {
     }
   }
 
+  // A #if condition: a constant bool, or a number or enum (`#if flags & .REVERSE`) that is not zero.
   bool eval_static_cond(Expr*& cond) {
-    check_value(cond, T.bool_t);
+    Type* t = check_value(cond, nullptr);
+    if (t->is_untyped() || t->kind == TypeKind::Int || t->kind == TypeKind::Enum) {
+      if (cond->is_const() && cond->cv.kind == ConstValue::Int) return cond->cv.i != 0;
+    } else {
+      coerce(cond, T.bool_t);
+    }
     if (!cond->is_const() || cond->cv.kind != ConstValue::Bool)
-      fail(cond->loc, "#if condition must be a compile-time constant bool");
+      fail(cond->loc, "#if condition must be a compile-time constant (a bool, number or enum)");
     return cond->cv.b;
   }
 
@@ -1366,7 +1398,11 @@ class Checker : public InterpHost {
             if (contains_break_to(x, loop)) return true;
         return false;
       case NK::While: return contains_break_to(static_cast<While*>(s)->body, loop);
-      case NK::For: return contains_break_to(static_cast<For*>(s)->body, loop);
+      case NK::For: {
+        auto* f = static_cast<For*>(s);
+        return contains_break_to(f->expansion ? f->expansion : f->body, loop);
+      }
+      case NK::Remove: return contains_break_to(static_cast<Remove*>(s)->lowered, loop);
       case NK::StaticIf: {
         auto* si = static_cast<StaticIf*>(s);
         for (Stmt* x : si->taken == 1 ? si->then_s : si->else_s)
@@ -1490,6 +1526,18 @@ class Checker : public InterpHost {
         auto* bc = static_cast<BreakContinue*>(s);
         const char* what = s->kind == NK::Break ? "break" : "continue";
         if (defer_depth_ > 0) fail(s->loc, "'", what, "' is not allowed inside defer");
+        if (!bc->label.empty()) {  // `break x` of a loop with a for_expansion: leaves the expansion
+          for (auto it = remove_targets_.rbegin(); it != remove_targets_.rend(); ++it) {
+            if (it->loop->it_name != bc->label) continue;
+            if (!it->expanded) break;
+            if (s->kind == NK::Continue)
+              fail(s->loc, "'continue ", bc->label, "' of a loop with a for_expansion is not supported yet");
+            auto x = for_expansions_.find(it->loop);
+            if (x == for_expansions_.end()) break;
+            bc->leave = x->second;
+            return;
+          }
+        }
         if (loops_.empty()) fail(s->loc, "'", what, "' outside of a loop");
         if (bc->label.empty()) {
           bc->target = loops_.back();
@@ -1517,6 +1565,7 @@ class Checker : public InterpHost {
         return;
       }
       case NK::Insert: check_insert(static_cast<Insert*>(s)); return;
+      case NK::Remove: check_remove(static_cast<Remove*>(s)); return;
       case NK::StaticIf: {
         auto* si = static_cast<StaticIf*>(s);
         bool taken = eval_static_cond(si->cond);
@@ -1536,10 +1585,25 @@ class Checker : public InterpHost {
 
   void check_local_decl(Decl* d) {
     Scope* into = scope_;  // `x := ...; in a macro: the caller's scope
+    bool nested_backtick = false;
     if (d->backtick) {
-      into = top_level_macro(d->loc, "a backtick declaration").caller_scope;
-      if (into->is_module || !into->proc)
+      if (macros_.empty()) fail(d->loc, "a backtick declaration is only allowed in the body of an #expand macro");
+      const MacroCtx& m = macros_.back();
+      if (m.caller_scope->is_module || !m.caller_scope->proc)
         fail(d->loc, "a backtick declaration needs a caller inside a procedure");
+      // A for_expansion's `it and `it_index take the names of `for x, i: ...`.
+      for (DeclName& n : d->names) {
+        if (n.name == "it" && !m.rename_it.empty()) n.name = m.rename_it;
+        else if (n.name == "it_index" && !m.rename_index.empty()) n.name = m.rename_index;
+      }
+      if (scope_ == m.body_scope) {
+        into = m.caller_scope;
+      } else {
+        // Nested in the macro body (e.g. in its loop): declared there, and
+        // visible to the caller's Code inserted within that block.
+        if (d->is_const) fail(d->loc, "a backtick constant must be at the top level of the macro body");
+        nested_backtick = true;
+      }
     }
     if (d->is_const) {
       if (d->values.size() != d->names.size()) fail(d->loc, "constant declaration needs one value per name");
@@ -1593,6 +1657,7 @@ class Checker : public InterpHost {
       s->decl_index = (int)i;
       s->state = Symbol::State::Resolved;
       d->syms.push_back(s);
+      if (nested_backtick) nested_backticks_.push_back({macros_.back().id, s});
       if (d->is_using) add_using_var(s, d->loc);
     }
     if (d->names.size() == 1) d->declared_type = types[0];
@@ -1787,8 +1852,10 @@ class Checker : public InterpHost {
       if (it_type->kind != TypeKind::Int) fail(f->loc, "range bounds must be integers, not ", type_name(it_type));
     } else {
       Type* t = check_value(f->iterable, nullptr);
-      if (t->kind != TypeKind::Array)
-        fail(f->iterable->loc, "cannot iterate over a value of type ", type_name(t));
+      if (t->kind != TypeKind::Array) {
+        expand_for(f, t);
+        return;
+      }
       if (f->by_pointer && t->is_fixed_array() && !is_lvalue(f->iterable))
         fail(f->iterable->loc, "cannot iterate by pointer over a temporary array");
       it_type = f->by_pointer ? T.pointer_to(t->elem) : t->elem;
@@ -1807,9 +1874,116 @@ class Checker : public InterpHost {
       f->index_sym->state = Symbol::State::Resolved;
     }
     loops_.push_back(f);
+    remove_targets_.push_back({f, false, 0});
     check_body(f->body);
+    remove_targets_.pop_back();
     loops_.pop_back();
     scope_ = saved;
+  }
+
+  // `for x, i: value { body }` over a value that is not an array: a call of
+  // the #expand macro for_expansion(value, #code body, flags), as in Jai. The
+  // macro declares `it and `it_index (here x and i) and inserts the body;
+  // flags (For_Flags: POINTER for `for *`, REVERSE for `for <`) is a constant
+  // in it. A first parameter that is a pointer gets the value's address.
+  void expand_for(For* f, Type* t) {
+    std::vector<Symbol*> cands;
+    Builtin no_builtin = Builtin::None;
+    gather_procs("for_expansion", cands, no_builtin);
+    if (cands.empty())
+      fail(f->iterable->loc, "cannot iterate over a value of type ", type_name(t),
+           " (it is not an array, and no for_expansion is declared for it)");
+    auto flags_arg = [&] {
+      int v = (f->by_pointer ? 1 : 0) | (f->reverse ? 2 : 0);
+      auto* e = ast_.make<IntLit>(f->loc, (uint64_t)v);
+      e->type = for_flags_t_;
+      e->cv = ConstValue::of_int(v);
+      return e;
+    };
+    // The value's address when an overload takes a pointer to it (the usual
+    // `for_expansion :: (list: *List, ...)`), else the value. Only the
+    // signatures are matched here.
+    Expr* subject = f->iterable;
+    if (!t->is_pointer() && is_lvalue(subject)) {
+      auto* addr = ast_.make<Unary>(subject->loc, UnOp::AddrOf, subject);
+      Expr* probe_addr = addr;
+      check(probe_addr, nullptr);
+      auto* probe = ast_.make<Call>(f->loc, ast_.make<Ident>(f->loc, "for_expansion"));
+      probe->args.push_back(Arg{"", f->loc, probe_addr});
+      probe->args.push_back(Arg{"", f->loc, ast_.make<CodeLit>(f->loc)});
+      probe->args.push_back(Arg{"", f->loc, flags_arg()});
+      bool fits = false;
+      Context ctx = save();
+      try {
+        fits = pick_overload(probe, cands, "for_expansion", /*builtin_fallback=*/true) != nullptr;
+      } catch (const CompileError&) {
+      }
+      restore(ctx);
+      if (fits) subject = ast_.make<Unary>(subject->loc, UnOp::AddrOf, subject);
+    }
+    Block* body;
+    if (f->body->kind == NK::Block) {
+      body = static_cast<Block*>(f->body);
+    } else {
+      body = ast_.make<Block>(f->body->loc);
+      body->stmts.push_back(f->body);
+    }
+    auto* code = ast_.make<CodeLit>(f->body->loc);
+    code->code_block = body;
+    Expr* flags = flags_arg();
+    auto* callee = ast_.make<Ident>(f->loc, "for_expansion");
+    auto* call = ast_.make<Call>(f->loc, callee);
+    call->args.push_back(Arg{"", f->loc, subject});
+    call->args.push_back(Arg{"", f->loc, code});
+    call->args.push_back(Arg{"", f->loc, flags});
+    Expr* e = call;
+    For* saved_pending = pending_for_;
+    pending_for_ = f;
+    remove_targets_.push_back({f, true, insert_removes_.size()});
+    Scope* saved_scope = scope_;
+    scope_ = new_scope(scope_, proc_);  // the loop's own scope: `it and `it_index go here
+    f->scope = scope_;
+    with_note(cat("in the for_expansion for ", type_name(t), " (the for at ", sm_.describe(f->loc), ")"), [&] {
+      check(e, nullptr);
+      return 0;
+    });
+    scope_ = saved_scope;
+    remove_targets_.pop_back();
+    pending_for_ = saved_pending;
+    if (e->kind != NK::Expansion)
+      fail(f->loc, "for_expansion for ", type_name(t), " must be an #expand macro");
+    f->expansion = ast_.make<ExprStmt>(f->loc, e);
+  }
+
+  // `remove x;`
+  void check_remove(Remove* r) {
+    for (auto it = remove_targets_.rbegin(); it != remove_targets_.rend(); ++it) {
+      For* f = it->loop;
+      if (f->it_name != r->name) continue;
+      if (!it->expanded) {
+        Type* at = f->iterable ? f->iterable->type : nullptr;
+        if (!at) fail(r->loc, "cannot remove from a range ('", r->name, "' is a number)");
+        if (at->is_fixed_array()) fail(r->loc, "cannot remove from a fixed array (", type_name(at), ")");
+        if (!is_lvalue(f->iterable))
+          fail(r->loc, "cannot remove from this array: it is not a variable (or other lvalue)");
+        if (f->reverse && f->by_pointer) {}  // fine
+        r->target = f;
+        f->has_remove = true;
+        return;
+      }
+      // A for_expansion: the code of the #insert (remove = { ... }) that inserted this body.
+      if (insert_removes_.size() <= it->inserts_depth)
+        fail(r->loc, "the for_expansion of this loop does not support 'remove' (it inserts the body without "
+                     "#insert (remove = { ... }) body;)");
+      const InsertRemove& ir = insert_removes_.back();
+      r->lowered = static_cast<Block*>(clone_stmt(ast_, ir.code));
+      ContextGuard guard(*this);
+      restore(ir.ctx);
+      in_run_operand_ = ir.in_run_operand;
+      check_block(r->lowered);
+      return;
+    }
+    fail(r->loc, "'remove ", r->name, "': no enclosing for loop with iterator '", r->name, "'");
   }
 
   void check_return(Return* r) {
@@ -3596,10 +3770,24 @@ class Checker : public InterpHost {
           found = true;
         }
       if (found && keep < macros_.size()) {
+        // Backtick declarations the macros being left made in the blocks
+        // around this point (innermost first) are visible to the code.
+        std::vector<Symbol*> visible;
+        for (auto it = nested_backticks_.rbegin(); it != nested_backticks_.rend(); ++it) {
+          bool left = false;
+          for (size_t k = keep; k < macros_.size(); ++k) left |= macros_[k].id == it->first;
+          if (!left) continue;
+          for (Scope* sc = scope_; sc; sc = sc->parent)
+            if (sc == it->second->scope) {
+              visible.push_back(it->second);
+              break;
+            }
+        }
         ContextGuard guard(*this);
         in_run_operand_ = macros_[keep].caller_in_run_operand;
         macros_.resize(keep);
         scope_ = new_scope(c.scope, proc_);
+        for (Symbol* v : visible) scope_->syms.emplace(v->name, v);  // keeps an inner one of the same name
         f();
         return;
       }
@@ -3616,6 +3804,7 @@ class Checker : public InterpHost {
     ins->result = blk;
     with_note(insert_note(ins->loc), [&] {
       if (v.kind == ConstValue::String) {
+        if (ins->remove_code) fail(ins->loc, "#insert (remove = ...) needs a Code value, not a string");
         blk->stmts = parse_source_stmts(ast_, sm_, insert_source(v.s, ins->loc), false);
         for (Stmt* x : blk->stmts) check_stmt(x);
         return 0;
@@ -3623,9 +3812,11 @@ class Checker : public InterpHost {
       const CodeEntry& c = code_entry(v);
       if (c.block) blk->stmts = static_cast<Block*>(clone_stmt(ast_, c.block))->stmts;
       else blk->stmts.push_back(ast_.make<ExprStmt>(c.expr->loc, clone_expr(ast_, c.expr)));
+      if (ins->remove_code) insert_removes_.push_back({ins->remove_code, save(), in_run_operand_});
       in_code_context(c, [&] {
         for (Stmt* x : blk->stmts) check_stmt(x);
       });
+      if (ins->remove_code) insert_removes_.pop_back();
       return 0;
     });
   }
@@ -3681,6 +3872,18 @@ class Checker : public InterpHost {
     if (macros_.empty())
       fail(id->loc, "backtick names (`", id->name, ") are only allowed in the body of an #expand macro");
     MacroCtx m = macros_.back();
+    // In a for_expansion for `for x, i: ...`, `it and `it_index are x and i.
+    if (id->name == "it" && !m.rename_it.empty()) id->name = m.rename_it;
+    else if (id->name == "it_index" && !m.rename_index.empty()) id->name = m.rename_index;
+    // A backtick declaration of this macro in an enclosing block (`it := ...; ... `it).
+    for (auto it = nested_backticks_.rbegin(); it != nested_backticks_.rend(); ++it) {
+      if (it->first != m.id || it->second->name != id->name) continue;
+      for (Scope* sc = scope_; sc; sc = sc->parent)
+        if (sc == it->second->scope) {
+          id->sym = it->second;
+          return check_name(e, hint);
+        }
+    }
     ContextGuard guard(*this);
     macros_.pop_back();
     scope_ = m.caller_scope;
@@ -3714,6 +3917,12 @@ class Checker : public InterpHost {
     ctx.caller_defer_depth = defer_depth_;
     ctx.body_scope = new_scope(m->scope, proc_);
     body->scope = ctx.body_scope;
+    if (pending_for_ && m->name == "for_expansion") {
+      for_expansions_[pending_for_] = x;
+      if (pending_for_->it_name != "it") ctx.rename_it = pending_for_->it_name;
+      if (pending_for_->index_name != "it_index") ctx.rename_index = pending_for_->index_name;
+      pending_for_ = nullptr;  // not for macros it expands in turn
+    }
     // A bare break in the body may leave a loop of the caller, unless that
     // would cross a defer or the #run boundary.
     if (defer_depth_ > 0 || in_run_operand_) loops_.clear();
@@ -3727,6 +3936,14 @@ class Checker : public InterpHost {
         Decl* pd = m->params[i];
         Expr* a = c->resolved_args[i];
         const DeclName& pn = pd->names[0];
+        // A for_expansion's For_Flags is a constant too (`#if flags & .REVERSE`).
+        if (m->type->params[i] == for_flags_t_ && a->is_const()) {
+          Symbol* s = declare(scope_, pn.name, SymKind::Const, pn.loc);
+          s->type = for_flags_t_;
+          s->cv = a->cv;
+          s->state = Symbol::State::Resolved;
+          continue;
+        }
         if (m->type->params[i]->kind == TypeKind::Code) {  // a constant: #insert can use it
           if (!a->is_const())
             fail(a->loc, "the argument for Code parameter '", pn.name, "' of macro '", name,

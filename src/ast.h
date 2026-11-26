@@ -29,7 +29,7 @@ enum class NK {
   Ifx, ImplicitConv, TupleGet, Library, Directive, CodeLit, Expansion,
   // statements
   Block, ExprStmt, Decl, Assign, If, Switch, While, For, Return, Break, Continue, Defer, Import,
-  Load, StaticIf, Through, Using, Insert, PushContext,
+  Load, StaticIf, Through, Using, Insert, PushContext, Remove,
 };
 
 struct Node {
@@ -443,7 +443,20 @@ struct For : Stmt {
   Symbol* it_sym = nullptr;
   Symbol* index_sym = nullptr;
   Scope* scope = nullptr;
+  Stmt* expansion = nullptr;  // a for over a value with a for_expansion: the expanded call (codegen runs it instead)
+  bool has_remove = false;    // a for over an array whose body has `remove it`
   explicit For(SourceLoc l) : Stmt(NK::For, l) {}
+};
+
+// `remove it;` in a for loop: removes the current element (for arrays by
+// moving the last one into its place); for a for_expansion it is the code the
+// expansion gives in `#insert (remove = { ... }) body;`.
+struct Remove : Stmt {
+  std::string name;       // the iterator named
+  // sema
+  For* target = nullptr;  // the loop (an array for), or null when `lowered` replaces it
+  Block* lowered = nullptr;
+  Remove(SourceLoc l, std::string n) : Stmt(NK::Remove, l), name(std::move(n)) {}
 };
 
 struct Return : Stmt {
@@ -456,6 +469,7 @@ struct Return : Stmt {
 struct BreakContinue : Stmt {
   std::string label;
   Stmt* target = nullptr;  // sema: For or While
+  MacroExpansion* leave = nullptr;  // sema: `break x` of a for_expansion loop leaves its expansion instead
   BreakContinue(NK k, SourceLoc l, std::string lab) : Stmt(k, l), label(std::move(lab)) {}
 };
 
@@ -497,6 +511,7 @@ struct StaticIf : Stmt {
 // statements into `result`, which runs in place: it opens no scope.
 struct Insert : Stmt {
   Expr* operand;
+  Block* remove_code = nullptr;  // `#insert (remove = { ... }) body;`: what `remove it` in the body does
   Block* result = nullptr;
   Insert(SourceLoc l, Expr* e) : Stmt(NK::Insert, l), operand(e) {}
 };

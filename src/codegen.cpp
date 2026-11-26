@@ -23,7 +23,7 @@
 namespace ojay {
 namespace {
 
-// Type_Info_Tag (type_info.jai, runtime/ojay_runtime.c)
+// Type_Info_Tag (core.jai, runtime/ojay_runtime.c)
 enum TiTag : int64_t {
   TI_INTEGER = 0, TI_FLOAT = 1, TI_BOOL = 2, TI_STRING = 3, TI_POINTER = 4, TI_PROCEDURE = 5, TI_VOID = 6,
   TI_STRUCT = 7, TI_ARRAY = 8, TI_ANY = 10, TI_ENUM = 11, TI_TYPE = 13, TI_CODE = 14,
@@ -558,7 +558,7 @@ class CodeGen {
   // ---- runtime type information
   //
   // Each type gets one constant global holding its Type_Info as the
-  // Type_Info_* struct for its kind (type_info.jai); a Type value points to it.
+  // Type_Info_* struct for its kind (core.jai); a Type value points to it.
 
   using TiFields = std::map<std::string, llvm::Constant*>;
 
@@ -893,6 +893,7 @@ class CodeGen {
       case NK::Switch: emit_switch(static_cast<Switch*>(s)); return;
       case NK::While: emit_while(static_cast<While*>(s)); return;
       case NK::For: emit_for(static_cast<For*>(s)); return;
+      case NK::Remove: emit_remove(static_cast<Remove*>(s)); return;
       case NK::Return: {
         auto* r = static_cast<Return*>(s);
         if (r->expand_target) emit_macro_return(r);
@@ -905,6 +906,12 @@ class CodeGen {
       case NK::Break:
       case NK::Continue: {
         auto* bc = static_cast<BreakContinue*>(s);
+        if (bc->leave) {  // `break x` of a for_expansion loop: leaves its expansion
+          size_t e = expansion_scope(bc->leave);
+          emit_defers_down_to(e);
+          if (!terminated()) b_.CreateBr(scopes_[e].break_bb);
+          return;
+        }
         size_t idx = scopes_.size();
         while (idx-- > 0)
           if (scopes_[idx].loop == bc->target) break;
@@ -1143,7 +1150,41 @@ class CodeGen {
     b_.SetInsertPoint(end_bb);
   }
 
+  // A for over an array whose body removes elements: the array's address
+  // and the index variable, for `remove it`.
+  struct RemoveLoop {
+    llvm::Value* array;
+    llvm::AllocaInst* index;
+  };
+  std::unordered_map<For*, RemoveLoop> remove_loops_;
+
+  // `remove it;`: the last element moves into the current one's place, the
+  // count shrinks, and (going forward) the index is visited again.
+  void emit_remove(Remove* r) {
+    if (r->lowered) {
+      emit_stmt(r->lowered);
+      return;
+    }
+    For* f = r->target;
+    const RemoveLoop& rl = remove_loops_.at(f);
+    Type* at = f->iterable->type;
+    llvm::Type* arr_t = lt(at);
+    llvm::Type* elem_t = lt(at->elem);
+    llvm::Value* count_p = b_.CreateStructGEP(arr_t, rl.array, 0);
+    llvm::Value* data = b_.CreateLoad(ptr_, b_.CreateStructGEP(arr_t, rl.array, 1));
+    llvm::Value* i = b_.CreateLoad(i64_, rl.index);
+    llvm::Value* last = b_.CreateSub(b_.CreateLoad(i64_, count_p), llvm::ConstantInt::get(i64_, 1));
+    b_.CreateStore(b_.CreateLoad(elem_t, b_.CreateInBoundsGEP(elem_t, data, {last})),
+                   b_.CreateInBoundsGEP(elem_t, data, {i}));
+    b_.CreateStore(last, count_p);
+    if (!f->reverse) b_.CreateStore(b_.CreateSub(i, llvm::ConstantInt::get(i64_, 1)), rl.index);
+  }
+
   void emit_for(For* f) {
+    if (f->expansion) {  // a for_expansion
+      emit_stmt(f->expansion);
+      return;
+    }
     auto* it_a = make_alloca(f->it_sym->type, f->it_name);
     f->it_sym->llvm_value = it_a;
     llvm::AllocaInst* idx_a = make_alloca(T.s64, f->index_name);
@@ -1192,7 +1233,13 @@ class CodeGen {
       Type* at = f->iterable->type;
       llvm::Value* count;
       llvm::Value* data;
-      if (at->is_fixed_array()) {
+      llvm::Value* array = nullptr;  // with remove: count and data are read again each iteration
+      if (f->has_remove) {
+        array = addr_of(f->iterable);
+        count = b_.CreateLoad(i64_, b_.CreateStructGEP(lt(at), array, 0));
+        data = nullptr;
+        remove_loops_[f] = {array, idx_a};
+      } else if (at->is_fixed_array()) {
         llvm::Value* addr = addr_of(f->iterable, /*read_only=*/!f->by_pointer);
         count = llvm::ConstantInt::get(i64_, at->count);
         data = addr;
@@ -1209,11 +1256,13 @@ class CodeGen {
       b_.CreateBr(cond_bb);
       b_.SetInsertPoint(cond_bb);
       llvm::Value* i = b_.CreateLoad(i64_, idx_a);
+      if (array) count = b_.CreateLoad(i64_, b_.CreateStructGEP(lt(at), array, 0));
       llvm::Value* ok = f->reverse ? b_.CreateICmpSGE(i, llvm::ConstantInt::get(i64_, 0)) : b_.CreateICmpSLT(i, count);
       b_.CreateCondBr(ok, body_bb, end_bb);
 
       body_bb->insertInto(fn_);
       b_.SetInsertPoint(body_bb);
+      if (array) data = b_.CreateLoad(ptr_, b_.CreateStructGEP(lt(at), array, 1));
       llvm::Value* ep = b_.CreateInBoundsGEP(elem_t, data, {i});
       b_.CreateStore(f->by_pointer ? ep : b_.CreateLoad(elem_t, ep), it_a);
       push_loop(f, end_bb, step_bb);

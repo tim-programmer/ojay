@@ -295,8 +295,9 @@ Implemented:
   `using x;` / `using Enum_Type;` statements
 * Statements: `if`/`else` (with or without `then`), `if x == { case ...; }`
   switches (on integers, enums, bools and strings) with `#through` and
-  `#complete`, `while`, `for` over ranges and arrays
-  (`it`, `it_index`, named iterators, `for *`, `for <`), labeled
+  `#complete`, `while`, `for` over ranges, arrays and values with a
+  `for_expansion` (`it`, `it_index`, named iterators, `for *`, `for <`,
+  `remove it`), labeled
   `break`/`continue`, `defer`, `return`, compound assignment, parallel
   assignment
 * Expressions: arithmetic, bitwise and shift operators, pointer arithmetic,
@@ -611,7 +612,7 @@ for e.names  print("% = %\n", it, e.values[it_index]);
   `internal_type`, `enum_type_flags` (`.FLAGS`), `names` and `values` for
   enums; `argument_types`, `return_types` and `procedure_flags`
   (`IS_C_CALL`, `HAS_VARARGS`) for procedure types. The declarations are in
-  `src/type_info.jai`.
+  `src/core.jai`.
 * `print` reads the same tables, so they are one copy per type in
   read-only data. On 32-bit targets they are smaller than the tables used
   before (e.g. 2657 -> 2162 bytes of text and read-only data for
@@ -666,7 +667,10 @@ add :: (a: $T, b: T) -> T #modify { if T == s16  T = s64; return true; } { retur
   in order; `Code` parameters stay constants, so `#insert body;` works on
   them. Names in the body mean what they mean where the macro is declared;
   `` `x`` reads, assigns or calls a name of the caller's scope, and
-  `` `x := v;`` declares one there (only at the top level of the body). A
+  `` `x := v;`` declares one there: at the top level of the body in the
+  caller's scope; nested in the body (e.g. in its loop, as a `for_expansion`
+  does) in that block, where `Code` from the caller inserted inside the block
+  sees it. A
   plain `return v;` ends the expansion with value `v`; `` `return`` returns
   from the caller, which for a macro expanded by another macro is that
   macro's expansion. `` `defer`` (at the top level of the body) defers to
@@ -686,9 +690,43 @@ add :: (a: $T, b: T) -> T #modify { if T == s16  T = s64; return true; } { retur
   resolution tries the others, and the message appears in the error.
   Assigning a type variable (`T = s64;`) changes the instance. Compile-time
   values (`$N`) are constants in it.
+* `for` over a value that is not an array or range calls the `#expand`
+  macro `for_expansion(value, body, flags)`, as in Jai:
+
+  ```jai
+  for_expansion :: (list: *List($T), body: Code, flags: For_Flags) #expand {
+      i := 0;
+      while i < list.count {
+          defer i += 1;
+          #if flags & .POINTER  `it := *list.items[i];
+          else                  `it := list.items[i];
+          `it_index := i;
+          #insert (remove = { list.items[i] = list.items[list.count - 1]; list.count -= 1; i -= 1; }) body;
+      }
+  }
+  for list  print("% ", it);
+  for x, i: list  if x == 0  remove x;
+  ```
+
+  The body is the `Code`; `flags` (`For_Flags`: `POINTER` for `for *`,
+  `REVERSE` for `for <`) is a constant, so `#if` can test it. A first
+  parameter that takes a pointer gets the value's address (when an overload
+  takes one). The loop has its own scope, where the macro's `` `it`` and
+  `` `it_index`` are declared; with `for x, i:` they are named `x` and `i`.
+  `break`, `continue` and `return` in the body work as in other inserted
+  code, and `break x` leaves the loop named `x`. `remove it` in the body runs
+  the `remove` code of the `#insert (remove = { ... }) body;` that inserted
+  it, in the macro's scope; without one it is an error.
+* `remove it` (or `remove x` for a named iterator) in a `for` over a dynamic
+  array or view (a variable) removes the current element by moving the last
+  one into its place, as in Jai: the count shrinks, and going forward the
+  moved element is visited next. Such a loop reads the array's count and
+  data again on every iteration.
+* `#if` takes a constant bool, number or enum (`#if flags & .REVERSE`).
 * Differences from Jai: `#insert,scope()`, `#insert -> string { ... }`,
-  `Code_Node` introspection, `#caller_location`, `` `break`` / `` `continue``
-  and `#modify` on structs are not supported. `#code` takes an expression or
+  `Code_Node` introspection, `#caller_location`, `` `break`` / `` `continue``,
+  `continue x` of a `for_expansion` loop and `#modify` on structs are not
+  supported. `#insert (...)` only takes `remove = { ... }`. `#code` takes an expression or
   a `{ }` block, not a bare statement. Macros return at most one value. A
   string inserted inside a macro resolves names in the macro's scope (the
   insertion point), while inserted `Code` follows the rules above.

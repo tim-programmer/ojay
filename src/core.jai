@@ -1,8 +1,23 @@
-// ojay's runtime type information, as in Jai's Preload. A `Type` value
-// points to its Type_Info, and type_info(T) returns it as the Type_Info_*
-// struct for T's kind. The compiler emits these tables (codegen and the #run
-// interpreter fill them in by member name), and the runtime's print reads
-// them (runtime/ojay_runtime.c mirrors the layout), so the three must agree.
+// ojay's core declarations: the parts of Jai's Preload that every module
+// sees and that need no context (the context and allocators are in
+// preload.jai). Using them costs nothing until a program does.
+
+// ------------------------------------------------------------------ for_expansion
+
+// The flags a `for` over a value passes to its for_expansion macro (a
+// compile-time constant there): `for *` sets POINTER, `for <` REVERSE.
+For_Flags :: enum_flags u32 {
+    POINTER :: 0x1;
+    REVERSE :: 0x2;
+}
+
+// ------------------------------------------------------------------ runtime type information
+//
+// A `Type` value points to its Type_Info, and type_info(T) returns it as the
+// Type_Info_* struct for T's kind. The compiler emits these tables (codegen
+// and the #run interpreter fill them in by member name), and the runtime's
+// print reads them (runtime/ojay_runtime.c mirrors the layout), so the three
+// must agree.
 //
 // Differences from Jai: enums that Jai nests inside the structs are top-level
 // here (Type_Info_Array_Type, Type_Info_Struct_Member_Flags, ...), and there

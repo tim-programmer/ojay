@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <optional>
 #include <exception>
 #include <map>
 #include <unordered_map>
@@ -948,9 +949,14 @@ class Machine {
         }
       }
       case NK::For: return exec_for(static_cast<For*>(s));
+      case NK::Remove: return exec_remove(static_cast<Remove*>(s));
       case NK::Return: return exec_return(static_cast<Return*>(s));
       case NK::Break:
       case NK::Continue:
+        if (static_cast<BreakContinue*>(s)->leave) {  // `break x` of a for_expansion loop
+          flow_target_ = static_cast<BreakContinue*>(s)->leave->body;
+          return Flow::Break;
+        }
         flow_target_ = static_cast<BreakContinue*>(s)->target;
         return s->kind == NK::Break ? Flow::Break : Flow::Continue;
       case NK::Defer: {
@@ -1122,7 +1128,27 @@ class Machine {
     return Flow::Normal;
   }
 
+  // Active array loops with `remove it`: the array's address and the index variable.
+  std::unordered_map<For*, std::pair<u64, u64>> remove_loops_;
+
+  Flow exec_remove(Remove* r) {
+    if (r->lowered) return exec(r->lowered);
+    For* f = r->target;
+    auto [arr, idx_a] = remove_loops_.at(f);
+    Type* et = conc(f->iterable->type)->elem;
+    int64_t esz = sz(et);
+    i64 count = load_i64(arr, r->loc);
+    u64 data = load_ptr(arr + 8, r->loc);
+    i64 i = load_i64(idx_a, r->loc);
+    if (i < 0 || i >= count) err(r->loc, "remove: the element at index ", i, " is gone (count ", count, ")");
+    std::memmove(at(data + (u64)(i * esz), esz, r->loc), at(data + (u64)((count - 1) * esz), esz, r->loc), (size_t)esz);
+    store_i64(arr, count - 1, r->loc);
+    if (!f->reverse) store_i64(idx_a, i - 1, r->loc);
+    return Flow::Normal;
+  }
+
   Flow exec_for(For* f) {
+    if (f->expansion) return exec(f->expansion);  // a for_expansion
     u64 it_a = alloc_stack(f->it_sym->type, f->loc);
     u64 idx_a = alloc_stack(T.s64, f->loc);
     bind(f->it_sym, it_a);
@@ -1150,6 +1176,31 @@ class Machine {
     Type* at_t = conc(f->iterable->type);
     i64 count;
     u64 data;
+    if (f->has_remove) {  // count and data are read again each iteration
+      u64 arr = addr_of(f->iterable);
+      auto saved = remove_loops_.find(f) != remove_loops_.end() ? std::optional(remove_loops_[f]) : std::nullopt;
+      remove_loops_[f] = {arr, idx_a};
+      int64_t esz = sz(at_t->elem);
+      store_i64(idx_a, f->reverse ? load_i64(arr, f->loc) - 1 : 0, f->loc);
+      Flow result = Flow::Normal;
+      for (;;) {
+        i64 i = load_i64(idx_a, f->loc);
+        if (f->reverse ? i < 0 : i >= load_i64(arr, f->loc)) break;
+        step(f->loc);
+        u64 ep = load_ptr(arr + 8, f->loc) + (u64)(i * esz);
+        store(it_a, f->by_pointer ? make_ptr(ep) : load(ep, at_t->elem, f->iterable->loc), f->loc);
+        Flow fl = exec_body(f->body);
+        if (loop_exit(fl, f)) {
+          result = fl;
+          break;
+        }
+        i64 cur = load_i64(idx_a, f->loc);
+        store_i64(idx_a, f->reverse ? cur - 1 : cur + 1, f->loc);
+      }
+      if (saved) remove_loops_[f] = *saved;
+      else remove_loops_.erase(f);
+      return result;
+    }
     if (at_t->is_fixed_array()) {
       data = addr_of(f->iterable);
       count = at_t->count;

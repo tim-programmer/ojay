@@ -1,0 +1,17 @@
+forward: 10 20 30 40 50 60
+named: [0]=10 [1]=20 [2]=30 [3]=40 [4]=50 [5]=60
+reverse: 60 50 40 30 20 10
+by pointer: 11 21 31 41 51 61
+break and continue: 11 21 41
+return from the body: 41, -1
+removed: [11, 51, 31] (count 3)
+removed in reverse: [31, 51]
+pairs before break outer: 2
+stepped: 0:1 1:4 2:7 3:10
+stepped named: 0 5 10 15 20
+words: 0=alpha 1=gamma
+array: [1, 2, 10, 4, 5, 8, 7]
+array reverse: [1, 7, 5]
+view: [5, 7] (the array still has 3)
+names: [keep, keep too]
+COMPILE_TIME: 2
