@@ -29,7 +29,9 @@ What is implemented is documented in `README.md`; this file lists only what is n
 - [ ] Basic and Math: `Matrix2`, Jai's chained `String_Builder` buffers, moving
       `min` / `max` / `abs` from built-ins to Jai
 - [ ] Command-line arguments: Jai's `__command_line_arguments` global (`get_command_line_arguments()` works)
-- [ ] Cortex-M console: input, a UART for the MPS2 / QEMU board, separate stdout and stderr
+- [ ] Cortex-M console: a UART for the MPS2 / QEMU board, separate stdout and stderr; console
+      input with interrupts (it is polled, so the UART FIFO can overflow while the program does
+      something else)
 
 ## Targets and boards
 
@@ -42,4 +44,3 @@ What is implemented is documented in `README.md`; this file lists only what is n
       * the Thread module over RTOS tasks, mutexes and semaphores (wait timeouts from the RTOS clock)
       * an example project for each
 - [ ] More RISC-V chips beyond the ESP32-C6
-- [ ] Flash programming for the MCX N947 from OpenOCD (currently LinkServer only)

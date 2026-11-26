@@ -161,6 +161,7 @@ typedef struct {
 #if !defined(__x86_64__)
 #error "freestanding Linux runtime is only implemented for x86_64"
 #endif
+#define SYS_READ 0
 #define SYS_WRITE 1
 #define SYS_MMAP 9
 #define SYS_MUNMAP 11
@@ -194,6 +195,12 @@ static void plat_write(int fd, const void *buf, int64_t n) {
 
 __attribute__((noreturn)) static void plat_exit(int code) {
   for (;;) sys3(SYS_EXIT_GROUP, code, 0, 0);
+}
+
+static int64_t plat_read(uint8_t *buf, int64_t n) {
+  long r;
+  do r = sys3(SYS_READ, 0, (long)buf, (long)n); while (r == -4 /* EINTR */);
+  return r < 0 ? -1 : r;
 }
 
 /* More memory for the heap: at least `min` bytes at [*start, *end). */
@@ -263,6 +270,8 @@ static int semihost_available(void) {
 #define LPUART_FIFO 0x28u
 #define LPUART_STAT_TDRE (1u << 23)
 #define LPUART_STAT_TC (1u << 22)
+#define LPUART_STAT_RDRF (1u << 21)
+#define LPUART_STAT_ERRORS (0xFu << 16) /* OR, NF, FE, PF (write 1 to clear) */
 
 static int mcx_uart_ready;
 
@@ -280,8 +289,8 @@ static void mcx_uart_init(void) {
   MMIO(MCX_FC4 + LPUART_CTRL) = 0;
   /* 12 MHz / (26 * 4) = 115385 baud (+0.16%): OSR = 26 - 1, SBR = 4. */
   MMIO(MCX_FC4 + LPUART_BAUD) = (25u << 24) | 4u;
-  MMIO(MCX_FC4 + LPUART_FIFO) |= 1u << 7;     /* TXFE: transmit FIFO */
-  MMIO(MCX_FC4 + LPUART_CTRL) = 1u << 19;     /* TE: the transmitter idles high */
+  MMIO(MCX_FC4 + LPUART_FIFO) |= (1u << 7) | (1u << 3); /* TXFE, RXFE: the FIFOs */
+  MMIO(MCX_FC4 + LPUART_CTRL) = (1u << 19) | (1u << 18); /* TE (the transmitter idles high), RE */
   /* Route the pins only now, with a pull-up on TX, so the line never goes
    * low (which the receiver would take for a NUL byte or a break). */
   MMIO(MCX_PORT1 + 0x80 + 4 * 9) = (2u << 8) | 3u;          /* PCR9: TX, ALT2, pull-up */
@@ -301,9 +310,48 @@ static void mcx_uart_write(const uint8_t *p, int64_t n) {
   }
 }
 
+/* Waits for at least one byte, then takes what has arrived (up to n). A
+ * terminal's Enter (CR, or CR LF) becomes "\n", and Ctrl-D ends the input
+ * (reads then return 0). */
+static int64_t mcx_uart_read(uint8_t *p, int64_t n) {
+  static int after_cr;
+  static int ended;
+  if (ended) return 0;
+  if (!mcx_uart_ready) mcx_uart_init();
+  int64_t got = 0;
+  while (got < n) {
+    uint32_t stat = MMIO(MCX_FC4 + LPUART_STAT);
+    if (stat & LPUART_STAT_ERRORS) MMIO(MCX_FC4 + LPUART_STAT) = stat & LPUART_STAT_ERRORS;
+    if (!(stat & LPUART_STAT_RDRF)) {
+      if (got > 0) break;
+      continue;
+    }
+    uint8_t c = (uint8_t)MMIO(MCX_FC4 + LPUART_DATA);
+    if (c == 4) {  /* Ctrl-D: the end of the input (this read's bytes come first) */
+      ended = 1;
+      break;
+    }
+    if (c == '\n' && after_cr) {
+      after_cr = 0;
+      continue;
+    }
+    after_cr = c == '\r';
+    p[got++] = after_cr ? '\n' : c;
+  }
+  return got;
+}
+
 static void console_write(const void *buf, int64_t n) {
   if (__ojay_console_write) __ojay_console_write((const uint8_t *)buf, n);
   else if ((uintptr_t)&__ojay_console_mcxn947 != 0) mcx_uart_write((const uint8_t *)buf, n);
+}
+
+extern int64_t __ojay_console_read(uint8_t *data, int64_t len) __attribute__((weak));
+
+static int64_t console_read(uint8_t *buf, int64_t n) {
+  if (__ojay_console_read) return __ojay_console_read(buf, n);
+  if ((uintptr_t)&__ojay_console_mcxn947 != 0) return mcx_uart_read(buf, n);
+  return -1;
 }
 
 static void console_drain(void) {
@@ -318,16 +366,17 @@ static int semihost(int op, void *arg) {
   return r0;
 }
 
-enum { SH_OPEN = 0x01, SH_WRITE = 0x05, SH_GET_CMDLINE = 0x15, SH_EXIT = 0x18, SH_EXIT_EXTENDED = 0x20 };
+enum { SH_OPEN = 0x01, SH_WRITE = 0x05, SH_READ = 0x06, SH_GET_CMDLINE = 0x15, SH_EXIT = 0x18,
+       SH_EXIT_EXTENDED = 0x20 };
 
 static int sh_handles[3] = {-1, -1, -1};
 
 static int sh_handle(int fd) {
-  if (fd != 1 && fd != 2) fd = 1;
+  if (fd < 0 || fd > 2) fd = 1;
   if (sh_handles[fd] < 0) {
-    /* ":tt" is the console; mode 4 = "w" (stdout), 8 = "a" (stderr). */
+    /* ":tt" is the console; mode 0 = "r" (stdin), 4 = "w" (stdout), 8 = "a" (stderr). */
     static const char tt[] = ":tt";
-    uintptr_t args[3] = {(uintptr_t)tt, fd == 1 ? 4u : 8u, 3};
+    uintptr_t args[3] = {(uintptr_t)tt, fd == 0 ? 0u : fd == 1 ? 4u : 8u, 3};
     sh_handles[fd] = semihost(SH_OPEN, args);
   }
   return sh_handles[fd];
@@ -341,6 +390,13 @@ static void plat_write(int fd, const void *buf, int64_t n) {
   }
   uintptr_t args[3] = {(uintptr_t)sh_handle(fd), (uintptr_t)buf, (uintptr_t)n};
   semihost(SH_WRITE, args);
+}
+
+static int64_t plat_read(uint8_t *buf, int64_t n) {
+  if (!semihost_available()) return console_read(buf, n);
+  uintptr_t args[3] = {(uintptr_t)sh_handle(0), (uintptr_t)buf, (uintptr_t)n};
+  int r = semihost(SH_READ, args);  /* the bytes not read */
+  return r < 0 || r > n ? -1 : n - r;
 }
 
 /* Without semihosting the program ends in a wfi loop with r0 = OJAY_EXITED_MAGIC
@@ -405,18 +461,19 @@ static int semihost(int op, void *arg) {
   return a0;
 }
 
-enum { SH_WRITE = 0x05, SH_GET_CMDLINE = 0x15, SH_EXIT = 0x18, SH_EXIT_EXTENDED = 0x20 };
+enum { SH_WRITE = 0x05, SH_READ = 0x06, SH_GET_CMDLINE = 0x15, SH_EXIT = 0x18, SH_EXIT_EXTENDED = 0x20 };
 
 /* Espressif's OpenOCD does not map the ":tt" console name (it would create a
  * file of that name), but passes write handles through as host descriptors:
  * handle 1 is the debugger's stdout and 2 its stderr. */
-static int sh_handle(int fd) { return fd == 2 ? 2 : 1; }
+static int sh_handle(int fd) { return fd == 0 || fd == 2 ? fd : 1; }
 
 /* USB Serial/JTAG controller: CDC-ACM console (e.g. /dev/ttyACM0). */
 #define USJ_EP1 (*(volatile uint32_t *)0x6000F000u)
 #define USJ_EP1_CONF (*(volatile uint32_t *)0x6000F004u)
 #define USJ_WR_DONE (1u << 0)
 #define USJ_IN_EP_DATA_FREE (1u << 1)
+#define USJ_OUT_EP_DATA_AVAIL (1u << 2)
 
 static int usj_dead;
 
@@ -442,6 +499,44 @@ static void plat_write(int fd, const void *buf, int64_t n) {
     if (!__ojay_semihost_dead) return;
   }
   usj_write((const uint8_t *)buf, n);
+}
+
+/* Waits for at least one byte from the host, then takes what has arrived (up
+ * to n). The host's USB stack holds back what does not fit, so nothing is
+ * lost. A terminal's Enter (CR, or CR LF) becomes "\n", and Ctrl-D ends the
+ * input (reads then return 0). */
+static int64_t usj_read(uint8_t *p, int64_t n) {
+  static int after_cr;
+  static int ended;
+  if (ended) return 0;
+  int64_t got = 0;
+  while (got < n) {
+    if (!(USJ_EP1_CONF & USJ_OUT_EP_DATA_AVAIL)) {
+      if (got > 0) break;
+      continue;
+    }
+    uint8_t c = (uint8_t)USJ_EP1;
+    if (c == 4) {  /* Ctrl-D: the end of the input (this read's bytes come first) */
+      ended = 1;
+      break;
+    }
+    if (c == '\n' && after_cr) {
+      after_cr = 0;
+      continue;
+    }
+    after_cr = c == '\r';
+    p[got++] = after_cr ? '\n' : c;
+  }
+  return got;
+}
+
+static int64_t plat_read(uint8_t *buf, int64_t n) {
+  if (!__ojay_semihost_dead) {
+    uintptr_t args[3] = {(uintptr_t)sh_handle(0), (uintptr_t)buf, (uintptr_t)n};
+    int r = semihost(SH_READ, args);  /* the bytes not read */
+    if (!__ojay_semihost_dead) return r < 0 || r > n ? -1 : n - r;
+  }
+  return usj_read(buf, n);
 }
 
 __attribute__((noreturn)) static void plat_exit(int code) {
@@ -482,6 +577,11 @@ static void plat_write(int fd, const void *buf, int64_t n) {
   }
 }
 __attribute__((noreturn)) static void plat_exit(int code) { exit(code); }
+long read(int fd, void *buf, size_t n);
+static int64_t plat_read(uint8_t *buf, int64_t n) {
+  long r = read(0, buf, (size_t)n);
+  return r < 0 ? -1 : r;
+}
 __attribute__((noreturn)) static void heap_out_of_memory(int64_t n);
 static void *plat_alloc(int64_t size) {
   void *p = size < 0 ? 0 : malloc(size > 0 ? (size_t)size : 1);
@@ -1279,6 +1379,11 @@ void __ojay_sprint(OString *result, const uint8_t *fmt, int64_t len, const OAny 
 
 void __ojay_write_string(const uint8_t *data, int64_t len, int fd) { plat_write(fd, data, len); }
 
+/* Console input (the Console module): waits for input, then reads what is
+ * there, up to len bytes. Returns the count, 0 at the end of the input, -1
+ * when there is no console input (or an error). */
+int64_t __ojay_read_input(uint8_t *data, int64_t len) { return len <= 0 ? 0 : plat_read(data, len); }
+
 void *__ojay_alloc(int64_t size) { return plat_alloc(size); }
 /* New / NewArray of a type aligned more than the heap guarantees (#align). */
 void *__ojay_alloc_aligned(int64_t size, int64_t align) { return plat_alloc_aligned(size, align); }
@@ -1476,14 +1581,49 @@ extern uint8_t __bss_start[], __bss_end[];
 #define SCB_CPACR (*(volatile uint32_t *)0xE000ED88u)
 #define SCB_CFSR (*(volatile uint32_t *)0xE000ED28u)
 #define SCB_HFSR (*(volatile uint32_t *)0xE000ED2Cu)
+#define SCB_CCR (*(volatile uint32_t *)0xE000ED14u)
+#define CFSR_STKOF (1u << 20) /* UsageFault: stack limit (MSPLIM) violated */
+
+/* Defined by the MCX N947 board scripts. */
+extern uint8_t __ojay_board_mcxn947 __attribute__((weak));
+
+/* The reset vector. On the MCX N947 the SRAM's ECC is on after reset
+ * (SYSCON ECC_ENABLE_CTRL), and then part of the 256 KB holds the ECC bits of
+ * the rest: a program that uses all of it sees writes to one place change
+ * another. NXP's startup code turns it off, and so does this, before anything
+ * touches RAM (the C code after it pushes onto the stack). r0 / r1 are passed
+ * on unchanged. */
+__asm__(
+    ".section .text.Reset_Handler, \"ax\", %progbits\n"
+    ".global Reset_Handler\n"
+    ".type Reset_Handler, %function\n"
+    ".thumb_func\n"
+    "Reset_Handler:\n"
+    "  ldr r2, =__ojay_board_mcxn947\n"
+    "  cbz r2, 1f\n"
+    "  ldr r2, =0x40000E44\n"            /* SYSCON ECC_ENABLE_CTRL */
+    "  movs r3, #0\n"
+    "  str r3, [r2]\n"
+    "  dsb\n"
+    "  isb\n"
+    "1:\n"
+    "  b __ojay_reset\n"
+    ".ltorg\n");
+void Reset_Handler(void);
 
 /* r0 / r1 hold whatever the core had at reset, or the values a debugger set
  * to announce that it handles semihosting (see "Console"). */
-__attribute__((noreturn, used)) void Reset_Handler(uint32_t r0, uint32_t r1) {
+__attribute__((noreturn, used)) void __ojay_reset(uint32_t r0, uint32_t r1) {
   int announced = r0 == OJAY_DEBUGGER_MAGIC && r1 == ~OJAY_DEBUGGER_MAGIC;
   /* Enable the FPU (CP10/CP11 full access) before any floating-point code. */
   SCB_CPACR |= 0xFu << 20;
   __asm__ volatile("dsb\n isb" ::: "memory");
+  /* A stack overflow faults (ARMv8-M stack limit) instead of overwriting the
+   * heap: the main stack ends at __heap_end (the Thread module switches the
+   * limit with each thread's stack). The fault handlers ignore the limit
+   * (CCR.STKOFHFNMIGN), so they can still report it. */
+  SCB_CCR |= 1u << 10;
+  __asm__ volatile("msr msplim, %0" : : "r"(__heap_end));
   if ((uintptr_t)__data_start != (uintptr_t)__data_load) {
     for (uint8_t *d = __data_start, *s = __data_load; d < __data_end;) *d++ = *s++;
   }
@@ -1503,6 +1643,8 @@ __attribute__((noreturn, used)) void Reset_Handler(uint32_t r0, uint32_t r1) {
 }
 
 static void fault(const char *what) {
+  if (SCB_CFSR & CFSR_STKOF)
+    what = "stack overflow (a thread's stack_size or the board script's STACK_SIZE is too small)";
   Out o;
   out_init_fd(&o, 2);
   out_cstr(&o, "\n*** ");
@@ -1758,15 +1900,19 @@ int64_t __ojay_atomic_cas64(int64_t *p, int64_t expected, int64_t desired) {
 #if defined(OJAY_PLATFORM_CORTEXM) || defined(OJAY_PLATFORM_ESP32C6)
 
 extern void *__ojay_context __attribute__((weak));
-void __ojay_stack_switch(void **save_sp, void *new_sp);
+void __ojay_stack_switch(void **save_sp, void *new_sp, void *new_limit);
 void __ojay_task_trampoline(void);
 
 /* Switches from the running task (its stack pointer goes to *save_sp) to the
  * one whose saved stack pointer is new_sp. Returns when something switches
- * back to this task. */
-void __ojay_task_switch(void **save_sp, void *new_sp) {
+ * back to this task. new_limit is the lowest address the new task's stack may
+ * reach (null: the main stack's); Cortex-M33 enforces it in hardware (MSPLIM). */
+void __ojay_task_switch(void **save_sp, void *new_sp, void *new_limit) {
   void *ctx = &__ojay_context ? __ojay_context : 0;
-  __ojay_stack_switch(save_sp, new_sp);
+#if defined(OJAY_PLATFORM_CORTEXM)
+  if (!new_limit) new_limit = __heap_end;
+#endif
+  __ojay_stack_switch(save_sp, new_sp, new_limit);
   if (&__ojay_context) __ojay_context = ctx;
 }
 
@@ -1795,9 +1941,12 @@ __asm__(
     "__ojay_stack_switch:\n"
     "  push {r4-r11, lr}\n"
     TASK_FP_SAVE
-    "  mov r2, sp\n"
-    "  str r2, [r0]\n"
+    "  mov r3, sp\n"
+    "  str r3, [r0]\n"
+    "  movs r3, #0\n"
+    "  msr msplim, r3\n"            /* (no limit while sp moves to the other stack) */
     "  mov sp, r1\n"
+    "  msr msplim, r2\n"
     TASK_FP_RESTORE
     "  pop {r4-r11, pc}\n"
     "\n"

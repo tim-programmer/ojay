@@ -1,0 +1,6 @@
+ready
+1 [first line] 10
+2 [second: words, punctuation] 26
+3 [] 0
+4 [after an empty line] 19
+end 4 0

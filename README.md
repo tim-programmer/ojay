@@ -28,7 +28,7 @@ python3 tests/run_tests.py      # or: ctest --test-dir build
 ARM32 tests run on an attached FRDM-MCXN947 when one is connected, otherwise
 under `qemu-system-arm` if installed, otherwise they are only built
 (`--arm=board|board-flash|qemu|none` to choose; `board-flash` programs every
-test into flash). OpenOCD is needed for the board, LinkServer for flash.
+test into flash, through OpenOCD). OpenOCD is needed for the board.
 
 The build produces `build/bin/ojay-*`, plus the runtime libraries and board
 linker scripts in `build/lib/ojay/`.
@@ -125,7 +125,16 @@ Serial/JTAG port.
 ### Bare-metal runtime behaviour
 
 * The runtime provides the vector table and reset handler (FPU enable,
-  `.data` copy, `.bss` clear, then `main`).
+  `.data` copy, `.bss` clear, then `main`). On the MCX N947 (its board
+  scripts define `__ojay_board_mcxn947`) the reset handler first turns the
+  SRAM's ECC off, as NXP's startup code does: with it on, part of the SRAM
+  holds the ECC bits of the rest, so a program using all 256 KB saw writes
+  to one place change another.
+* Cortex-M33 stack limits: the reset handler sets MSPLIM to the bottom of
+  the main stack, and the Thread module sets it to each thread's, so a stack
+  overflow faults ("stack overflow" on stderr, exit status 134) instead of
+  overwriting the heap. The RISC-V runtime has no such check for the main
+  stack.
 * The heap is the RAM between `.bss` and the stack (`STACK_SIZE` in the
   board script); on the MCX N947 RAM image that is about 110 KB. `free` and
   `realloc` give memory back: the allocator keeps free blocks in
@@ -153,6 +162,11 @@ Serial/JTAG port.
     It replaces the built-in UART.
   * Stdout and stderr share the console. Without semihosting the program
     ends in a `wfi` loop with r0 = 0xE417C0DE and r1 = its exit status.
+  * Console input (the Console module) comes from the UART's receiver
+    (polled, with its FIFO), or from the program's
+    `__ojay_console_read(data: *u8, count: s64) -> s64` when it defines
+    one. A terminal's Enter (CR or CR LF) arrives as `\n`, and Ctrl-D ends
+    the input (reads then return 0).
 * Cortex-M semihosting: a semihosting call halts the core whenever halting
   debug is enabled (DHCSR.C_DEBUGEN), even when the debugger that enabled it
   has gone, and that bit survives resets until a power cycle (LinkServer
@@ -169,7 +183,9 @@ Serial/JTAG port.
 * ESP32-C6: startup turns off the watchdogs (timer groups, RTC and super
   watchdog). Semihosting goes to the debugger's stdout/stderr; when no
   debugger is attached the semihosting trap is caught and output goes to the
-  chip's USB Serial/JTAG port (e.g. `/dev/ttyACM0`) instead.
+  chip's USB Serial/JTAG port (e.g. `/dev/ttyACM0`) instead, and console
+  input comes from it too (as on the MCX N947's UART: CR becomes `\n`,
+  Ctrl-D ends the input).
 
 ### Running on an ESP32-C6
 
@@ -188,12 +204,23 @@ These are development tools, separate from the compiler:
 * `tools/run_mcxn947.py image.elf` runs an image through the board's
   MCU-Link, forwarding its output and returning its exit status. RAM images
   (`mcxn947-ram.ld`) are loaded with OpenOCD (`tools/mcxn947.cfg`) without
-  touching flash. Flash images need `--flash`: they are programmed with NXP
-  LinkServer (`/opt/linkserver/LinkServer`, or set `OJAY_LINKSERVER`), then
-  started from their reset vector under OpenOCD. `--uart` starts the program
+  touching flash. Flash images need `--flash`: they are programmed through
+  OpenOCD, then started from their reset vector under it. OpenOCD 0.12 has
+  no MCX N flash driver, so `tools/mcxn947.cfg` calls the chip's ROM flash
+  API (`mcxn947_flash_write file.bin address`: `flash_init`, `flash_erase`
+  of the 8 KB sectors, `flash_program` in 64 KB chunks staged in SRAM, then
+  `verify_image`), with the core halted and a BKPT in SRAM as the return
+  address; the runner builds the binary from the ELF's load segments and
+  resets the chip afterwards. `--linkserver` programs with NXP LinkServer
+  instead (`/opt/linkserver/LinkServer`, or set `OJAY_LINKSERVER`).
+  `--program-only` programs the image and resets the board, which then runs
+  it on its own (output on the virtual COM port). `--uart` starts the program
   without announcing semihosting, reads its output from the virtual COM port
   (`--vcom` to choose the device) and its exit status from r0/r1, i.e. runs
-  it as it runs without a debugger. `tests/run_tests.py --arm=board-uart`
+  it as it runs without a debugger; the runner's standard input is sent to
+  the UART once the program has printed something, followed by Ctrl-D.
+  With semihosting the program's console input is OpenOCD's standard input.
+  `tests/run_tests.py --arm=board-uart`
   runs the tests that way (the ones that write to stderr then differ, as the
   UART carries both streams, and those that need semihosting skip that
   configuration with `// SKIP: uart`).
@@ -201,9 +228,9 @@ These are development tools, separate from the compiler:
   semihosting file calls (the File module) work there.
 * The core's debug port only appears after a session is opened through NXP's
   Debug Mailbox; `tools/mcxn947.cfg` does this (it resets the chip).
-* Flashing and a real cold boot can also be done directly with
-  `LinkServer flash MCXN947:FRDM-MCXN947 load hello.elf`; the program then
-  prints on the virtual COM port.
+* A real cold boot from flash: `tools/run_mcxn947.py --program-only
+  hello.elf`, or `LinkServer flash MCXN947:FRDM-MCXN947 load hello.elf`; the
+  program then prints on the virtual COM port.
 
 ### Register definitions from SVD files and CMSIS headers
 
@@ -403,6 +430,15 @@ Implemented:
   "message")`, `assert(cond, "x is %", x)` (formatted like `tprint`, only
   when the assertion fails), and `loc = ...` to report another location than the call
   (`check :: (x: int, loc := #caller_location) { assert(x > 0, loc = loc); }`)
+* ojay extension: `#import "Console"` (all Jai, `src/modules/Console.jai`)
+  reads the program's console input: `console_read(buffer, count)` (waits
+  for input, then returns what there is: the count, 0 at the end of the
+  input, -1 without console input) and `console_read_line()` (a line
+  without its `\n`, allocated with `context.allocator`, and false at the
+  end of the input). On Linux that is standard input; on the boards the
+  debugger's console through semihosting (OpenOCD's standard input),
+  otherwise the board's console (see "Bare-metal runtime behaviour").
+  Reading waits; on bare metal no thread runs meanwhile.
 * ojay extension for embedded targets: `#import "Hardware"` provides
   `volatile_load(p)` and `volatile_store(p, value)` for memory-mapped
   registers (integers, floats, enums, bools and pointers). Jai has no
@@ -521,9 +557,11 @@ Implemented:
       `wait_for` (which yield until the thing happens). The threads take
       turns in the order they were started, after the main thread. Each has
       its own stack (`stack_size` bytes, default 4096, allocated by
-      `thread_start` with the allocator `thread_init` was called with); a
-      thread that overflowed it (its lowest word, a canary, changed) stops
-      the program at its next yield. The runtime switches the stacks
+      `thread_start` with the allocator `thread_init` was called with). Its
+      lowest 256 bytes are a guard: on the Cortex-M33 the stack limit
+      register stops the thread before it reaches them (a fault, exit status
+      134), and a thread that wrote into them anyway (RISC-V) stops the
+      program at its next yield or when it ends. The runtime switches the stacks
       (`__ojay_task_switch`: the callee-saved integer and FPU registers) and
       the current context pointer with them, so a `push_context` stays in
       effect across yields. There is no clock, so waits do not measure time:

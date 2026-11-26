@@ -9,4 +9,6 @@ MEMORY
 STACK_SIZE = 16K;
 /* Console without a debugger: LPUART4, the MCU-Link virtual COM port (115200 8N1). */
 __ojay_console_mcxn947 = 1;
+/* Board setup in the runtime's reset code (the SRAM's ECC off). */
+__ojay_board_mcxn947 = 1;
 INCLUDE cortexm-sections.ld

@@ -6,6 +6,10 @@ tests/run/*.jai     compiled, linked and executed; stdout must equal the .out
                     `// SKIP: text` lines skip the configurations whose label
                     contains text (e.g. `// SKIP: static` for a test that
                     needs libc, which the static x86-64 runtime does not have).
+                    `// STDIN: text` lines give the program's input, one
+                    line each (embedded programs get it through semihosting,
+                    or, with --arm=board-uart, on the UART once they have
+                    printed something); without them the input is empty.
                     The ARM labels end in "uart" in --arm=board-uart runs,
                     which have no semihosting (`// SKIP: uart`).
                     `// ARGS: words` gives command-line arguments (shell
@@ -163,7 +167,7 @@ def make_configs(build_dir, arm_mode, riscv_mode):
     arm_suffix = " uart" if arm_mode == "board-uart" else ""
 
     configs_rv = []
-    rv_where = "toolchain (riscv32-esp-elf-gcc) not found; skipped"
+    rv_where = "skipped" if riscv_mode == "skip" else "toolchain (riscv32-esp-elf-gcc) not found; skipped"
     rv_gcc = find_riscv_gcc()
     if rv_gcc and riscv_mode != "skip":
         rv = os.path.join(build_dir, "bin", "ojay-riscv")
@@ -216,8 +220,8 @@ def runner_cmd(runner, exe, args):
     return list(runner) + [f"--arg={a}" for a in args] + [exe]
 
 
-def run(cmd, timeout=120):
-    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+def run(cmd, timeout=120, stdin=b""):
+    return subprocess.run(cmd, input=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
 
 
 def main():
@@ -240,7 +244,7 @@ def main():
     tmp = tempfile.mkdtemp(prefix="ojay-tests-")
 
     def check_program(name, src, want_out, want_code, want_compile_out="", c_src=None, skip=(), prog_args=(),
-                      want_warnings=()):
+                      want_warnings=(), stdin=b""):
         nonlocal passed, not_run
         for cfg in configs:
             if any(s in cfg.label for s in skip):
@@ -276,8 +280,10 @@ def main():
                 not_run += 1  # (without semihosting a board program gets no arguments)
                 passed += 1
                 continue
-            r = run(runner_cmd(cfg.runner, exe, prog_args))
-            out = r.stdout.decode()
+            r = run(runner_cmd(cfg.runner, exe, prog_args), stdin=stdin)
+            if args.verbose:
+                print(f"run  {name} [{cfg.label}]", flush=True)
+            out = r.stdout.decode(errors="replace")
             if out != want_out or r.returncode != want_code:
                 msg = f"exit {r.returncode} (want {want_code})\n--- got\n{out}--- want\n{want_out}"
                 if r.stderr:
@@ -303,8 +309,9 @@ def main():
         c_src = src[:-4] + ".c"
         prog_args = shlex.split(" ".join(re.findall(r"^// ARGS:(.*)$", text, re.M)))
         warnings = [w.strip() for w in re.findall(r"^// WARNING:(.*)$", text, re.M)]
+        stdin = "".join(line + "\n" for line in re.findall(r"^// STDIN: ?(.*)$", text, re.M)).encode()
         check_program(name, src, want_out, int(m.group(1)) if m else 0, compile_out,
-                      c_src if os.path.exists(c_src) else None, skip, prog_args, warnings)
+                      c_src if os.path.exists(c_src) else None, skip, prog_args, warnings, stdin)
 
     # tools/regs2jai.py: X_svd_test.jai #loads the conversion of X.svd (X_h_test.jai: of X.h)
     # as X_svd.jai. An optional `// REGS2JAI: args` line gives extra converter arguments.

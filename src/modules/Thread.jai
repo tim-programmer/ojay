@@ -174,11 +174,12 @@ wait_for :: (s: *Semaphore, milliseconds: s32 = -1) -> bool {
 // next yields.
 thread_start :: (thread: *Thread) {
     assert(!thread.started, "thread_start: the thread was started already");
-    assert(thread.stack_size >= 512, "thread_start: the stack size is too small (at least 512 bytes)");
+    assert(thread.stack_size >= 1024, "thread_start: the stack size is too small (at least 1024 bytes)");
     start_scheduler();
     thread.stack = alloc(thread.stack_size, thread.starting_context.allocator);
     assert(thread.stack != null, "thread_start: no memory for the thread's stack");
-    (cast(*u32) thread.stack).* = STACK_CANARY;
+    guard := cast(*u32) thread.stack;
+    for i: 0..STACK_GUARD / 4 - 1  guard[i] = STACK_CANARY;
     thread.saved_sp = __ojay_task_stack_init(thread.stack + thread.stack_size, thread_entry, thread);
     thread.started = true;
     last := current;  // (the ring's end: the threads run in the order they were started)
@@ -209,12 +210,9 @@ thread_deinit :: (thread: *Thread) {
 thread_yield :: () {
     if !current || current.next == current  return;
     from := current;
-    if from != *main_thread && (cast(*u32) from.stack).* != STACK_CANARY {
-        write_string("thread_yield: a thread overflowed its stack (give it a larger stack_size)\n", true);
-        exit(1);
-    }
+    if from != *main_thread  check_stack(from);
     current = from.next;
-    __ojay_task_switch(*from.saved_sp, current.saved_sp);
+    __ojay_task_switch(*from.saved_sp, current.saved_sp, stack_limit(current));
 }
 
 // ------------------------------------------------------------------ mutexes and semaphores
@@ -309,13 +307,22 @@ clock_gettime :: (clock: s32, t: *Timespec) -> s32 #foreign libc;
 // The runtime's part (runtime/ojay_runtime.c): stack switching and atomics.
 runtime :: #system_library "libc";  // (resolved against the runtime library at link time)
 
-__ojay_task_switch :: (save_sp: **void, new_sp: *void) #foreign runtime;
+__ojay_task_switch :: (save_sp: **void, new_sp: *void, new_limit: *void) #foreign runtime;
 __ojay_task_stack_init :: (stack_top: *u8, entry: (*void) #c_call, arg: *void) -> *void #foreign runtime;
 __ojay_atomic_add64 :: (p: *s64, delta: s64) -> s64 #foreign runtime;
 __ojay_atomic_swap64 :: (p: *s64, value: s64) -> s64 #foreign runtime;
 __ojay_atomic_cas64 :: (p: *s64, expected: s64, desired: s64) -> s64 #foreign runtime;
 
-STACK_CANARY :: 0xC0DE57AC;  // the lowest word of each thread's stack
+// The lowest STACK_GUARD bytes of each thread's stack hold STACK_CANARY; the
+// stack may not reach them (the Cortex-M33 faults first: its stack limit
+// register is set just above them).
+STACK_CANARY :: 0xC0DE57AC;
+STACK_GUARD :: 256;
+
+stack_limit :: (thread: *Thread) -> *void #c_call {
+    if thread == *main_thread  return null;  // (the runtime knows the main stack's)
+    return thread.stack + STACK_GUARD;
+}
 
 main_thread: Thread;   // the program's own thread (index 0) once threads run
 current: *Thread;      // the running thread (null until the first thread_start)
@@ -334,6 +341,7 @@ thread_entry :: (arg: *void) #c_call {
     thread := cast(*Thread) arg;
     push_context thread.starting_context {
         thread.result = thread.proc(thread);
+        check_stack(thread);
     }
     thread.done = true;
     events += 1;
@@ -341,7 +349,17 @@ thread_entry :: (arg: *void) #c_call {
     while before.next != thread  before = before.next;
     before.next = thread.next;
     current = thread.next;
-    __ojay_task_switch(*thread.saved_sp, current.saved_sp);
+    __ojay_task_switch(*thread.saved_sp, current.saved_sp, stack_limit(current));
+}
+
+// Stops the program if the thread wrote into the guard at the bottom of its
+// stack (it overflowed, or nearly).
+check_stack :: (thread: *Thread) {
+    guard := cast(*u32) thread.stack;
+    for i: 0..STACK_GUARD / 4 - 1  if guard[i] != STACK_CANARY {
+        write_string("Thread: a thread overflowed its stack (give it a larger stack_size)\n", true);
+        exit(1);
+    }
 }
 
 thread_finished :: (thread: *void) -> bool { return (cast(*Thread) thread).done; }

@@ -5,8 +5,11 @@ RAM images (linked with runtime/boards/mcxn947-ram.ld) are loaded into SRAM thro
 the on-board MCU-Link (CMSIS-DAP) with OpenOCD; nothing is written to flash.
 
 Flash images (linked with mcxn947-flash.ld) are only run with --flash: the
-image is programmed with NXP LinkServer, then started from its reset vector
-under OpenOCD so its exit status can be reported.
+image is programmed through OpenOCD, which calls the chip's ROM flash API
+(mcxn947_flash_write in mcxn947.cfg; --linkserver uses NXP LinkServer
+instead), then started from its reset vector under OpenOCD so its exit status
+can be reported. --program-only programs it and lets it run from a reset, with
+no debugger involved (its output then goes to the virtual COM port).
 
 In both cases the program's semihosting console output goes to stdout. The
 program is started with r0/r1 set to the runtime's "debugger present" values,
@@ -18,7 +21,9 @@ program's semihosting file calls (the File module) create and read files.
 With --uart the program is started without them, as if no debugger were
 attached: its output is read from the board's UART (LPUART4, the MCU-Link's
 virtual COM port) instead, and the exit status from r0/r1 once the program
-waits in its final wfi loop.
+waits in its final wfi loop. Standard input is sent to the UART once the
+program has printed something, followed by Ctrl-D (the end of the input).
+With semihosting it is the program's console input.
 
 Exit status: the program's exit status, or
   124  the program did not finish within --timeout seconds
@@ -53,9 +58,11 @@ def find_vcom():
 
 
 class SerialReader:
-    """Reads a tty at 115200 8N1 in the background, forwarding to stdout (CRLF -> LF)."""
+    """Reads a tty at 115200 8N1 in the background, forwarding to stdout (CRLF -> LF).
+    `send` is written to it once the program has printed something, paced so
+    the board's small receive FIFO keeps up."""
 
-    def __init__(self, path):
+    def __init__(self, path, send=b""):
         self.fd = os.open(path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
         attrs = termios.tcgetattr(self.fd)
         attrs[0] = 0                                        # iflag: raw
@@ -67,6 +74,7 @@ class SerialReader:
         termios.tcflush(self.fd, termios.TCIFLUSH)
         self.stop = False
         self.data = bytearray()
+        self.send = send
         self.thread = threading.Thread(target=self.run, daemon=True)
         self.thread.start()
 
@@ -79,6 +87,10 @@ class SerialReader:
                 except BlockingIOError:
                     continue
                 self.data += chunk
+            if self.send and self.data:
+                os.write(self.fd, self.send[:1])
+                self.send = self.send[1:]
+                time.sleep(0.003)
 
     def finish(self):
         time.sleep(0.2)  # the last bytes in flight
@@ -118,6 +130,27 @@ def image_vectors(path):
 
 
 
+def flash_contents(path):
+    """The bytes of an ELF image's loadable segments in flash (at their load
+    addresses), as (start address, data): unused gaps are 0xFF, and the end is
+    padded to a multiple of 512 bytes (the ROM API programs whole pages)."""
+    with open(path, "rb") as f:
+        data = f.read()
+    e_phoff, = struct.unpack_from("<I", data, 28)
+    e_phentsize, e_phnum = struct.unpack_from("<HH", data, 42)
+    pieces = []
+    for i in range(e_phnum):
+        p_type, p_offset, p_vaddr, p_paddr, p_filesz = struct.unpack_from("<IIIII", data, e_phoff + i * e_phentsize)
+        if p_type == 1 and p_filesz > 0 and FLASH_START <= p_paddr < FLASH_END:
+            pieces.append((p_paddr, data[p_offset:p_offset + p_filesz]))
+    start = min(a for a, _ in pieces) & ~0x1FFF
+    end = max(a + len(d) for a, d in pieces)
+    image = bytearray(b"\xff" * ((end - start + 511) // 512 * 512))
+    for a, d in pieces:
+        image[a - start:a - start + len(d)] = d
+    return start, bytes(image)
+
+
 def semihosting_cmdline(elf, args):
     """The Tcl words of `arm semihosting_cmdline` for the program's arguments:
     OpenOCD joins them with spaces, and the runtime splits the line at spaces
@@ -137,7 +170,11 @@ def main():
     ap.add_argument("--timeout", type=float, default=30.0, help="seconds (default 30)")
     ap.add_argument("--openocd", default=shutil.which("openocd") or "openocd")
     ap.add_argument("--cfg", default=os.path.join(HERE, "mcxn947.cfg"))
-    ap.add_argument("--flash", action="store_true", help="program a flash image (with LinkServer) and run it")
+    ap.add_argument("--flash", action="store_true", help="program a flash image and run it")
+    ap.add_argument("--linkserver", action="store_true",
+                    help="program flash with NXP LinkServer instead of OpenOCD (the ROM flash API)")
+    ap.add_argument("--program-only", action="store_true",
+                    help="program a flash image, then reset the board and let it run without the debugger")
     ap.add_argument("--uart", action="store_true",
                     help="run without semihosting; read the output from the board's UART (virtual COM port)")
     ap.add_argument("--vcom", default=os.environ.get("OJAY_MCXN947_VCOM"),
@@ -165,6 +202,11 @@ def main():
         print(f"run_mcxn947: {args.elf}: {e}", file=sys.stderr)
         return 125
     in_flash = FLASH_START <= base < FLASH_END
+    if args.program_only and not in_flash:
+        print(f"run_mcxn947: {args.elf} is not a flash image (link it with mcxn947-flash.ld)", file=sys.stderr)
+        return 125
+    if args.program_only:
+        args.flash = True
     if in_flash and not args.flash:
         print(f"run_mcxn947: {args.elf} is a flash image (linked at {base:#x}); pass --flash to program "
               "and run it, or link a RAM image with mcxn947-ram.ld", file=sys.stderr)
@@ -175,22 +217,46 @@ def main():
 
     elf = args.elf.replace("\\", "/")
     load = f"load_image {{{elf}}}; "
-    if in_flash:
+    work = tempfile.TemporaryDirectory(prefix="ojay-mcx-flash-")
+    if in_flash and not args.linkserver:
+        start_address, image = flash_contents(args.elf)
+        binary = os.path.join(work.name, "image.bin")
+        with open(binary, "wb") as f:
+            f.write(image)
+        # Then a reset (through the debug mailbox, as at the start), so that no
+        # flash cache or prefetch buffer still holds the old contents.
+        load = (f"mcxn947_flash_write {{{binary}}} {start_address:#x}; "
+                "mcxn947_start_debug_session; mcxn947.cpu0 arp_examine; halt; ")
+        if args.program_only:
+            r = subprocess.run([args.openocd, "-f", args.cfg, "-c",
+                                "init; mcxn947_start_debug_session; mcxn947.cpu0 arp_examine; halt; "
+                                f"mcxn947_flash_write {{{binary}}} {start_address:#x}; reset run; shutdown"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=180)
+            log = r.stderr.decode(errors="replace")
+            if args.verbose or "mcxn947: programmed" not in log:
+                sys.stderr.write(log)
+            if "mcxn947: programmed" not in log:
+                print("run_mcxn947: programming flash failed", file=sys.stderr)
+                return 125
+            return 0
+    elif in_flash:
         linkserver = find_linkserver()
         if not linkserver:
             print("run_mcxn947: LinkServer not found (set OJAY_LINKSERVER)", file=sys.stderr)
             return 125
-        r = subprocess.run([linkserver, "flash", DEVICE, "load", "--no-reset", args.elf],
-                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120)
+        r = subprocess.run([linkserver, "flash", DEVICE, "load"] + ([] if args.program_only else ["--no-reset"]) +
+                           [args.elf], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120)
         if r.returncode != 0:
             sys.stderr.write(r.stdout.decode(errors="replace"))
             print("run_mcxn947: programming flash failed", file=sys.stderr)
             return 125
+        if args.program_only:
+            return 0
         load = ""
 
     ms = int(args.timeout * 1000)
     start = (
-        "init; mcxn947_start_debug_session; mcxn947.cpu0 arp_examine; halt; "
+        "init; mcxn947_start_debug_session; mcxn947.cpu0 arp_examine; halt; mcxn947_ram_ecc_off; "
         f"{load}"
         f"mww 0xE000ED08 {base:#x}; reg msp {sp:#x}; reg pc {reset:#x}; reg xPSR 0x01000000; "
     )
@@ -200,7 +266,10 @@ def main():
         if not vcom:
             print("run_mcxn947: the MCU-Link virtual COM port was not found (use --vcom)", file=sys.stderr)
             return 125
-        reader = SerialReader(vcom)
+        # Standard input goes to the program's UART, ended by Ctrl-D (EOT),
+        # which the runtime takes for the end of the input.
+        send = b"" if sys.stdin.isatty() else sys.stdin.buffer.read() + b"\x04"
+        reader = SerialReader(vcom, send)
         # No semihosting: poll (halting briefly) until the program waits in
         # its exit loop with r0 = EXITED_MAGIC, then report r1.
         script = start + (
@@ -229,8 +298,10 @@ def main():
     try:
         # OpenOCD resolves semihosted file names against its working directory.
         with tempfile.TemporaryDirectory(prefix="ojay-mcx-") as tmp:
+            # With semihosting OpenOCD's standard input is the program's.
             proc = subprocess.run([args.openocd, "-f", args.cfg, "-c", script], stderr=subprocess.PIPE,
-                                  cwd=args.dir or tmp, timeout=args.timeout + 30)
+                                  stdin=subprocess.DEVNULL if args.uart else None,
+                                  cwd=args.dir or tmp, timeout=args.timeout + (150 if in_flash else 30))
     finally:
         if reader:
             reader.finish()
