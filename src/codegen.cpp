@@ -112,6 +112,7 @@ class CodeGen {
 
   std::unordered_map<std::string, llvm::GlobalVariable*> strings_;
   std::unordered_map<Type*, llvm::Constant*> defaults_;
+  std::unordered_map<const void*, llvm::GlobalVariable*> baked_objects_;  // ConstValue::Pointer objects
   // Structs whose members are not simply the LLVM struct's elements in order
   // (#align padding, #place overlaps): for each field, its element index, or
   // -1 for a member that overlaps an earlier one (reached by byte offset).
@@ -530,9 +531,53 @@ class CodeGen {
         return type_info(cv.t);
       case ConstValue::Code:
         return llvm::ConstantInt::get(i64_, (uint64_t)cv.i);
+      case ConstValue::Proc:
+        if (!cv.proc->llvm_fn)
+          throw CompileError(cv.proc->loc, "internal error: procedure of a #run result has no code");
+        return cv.proc->llvm_fn;
+      case ConstValue::Pointer: {  // into a baked object: one (writable) global per object
+        auto it = baked_objects_.find(cv.elems.get());
+        llvm::GlobalVariable* gv;
+        if (it != baked_objects_.end()) {
+          gv = it->second;
+        } else {
+          llvm::Constant* init = const_value((*cv.elems)[0], cv.t);
+          gv = new llvm::GlobalVariable(*mod_, init->getType(), false, llvm::GlobalValue::PrivateLinkage, init,
+                                        "baked");
+          gv->setAlignment(llvm::Align(align_of(cv.t)));
+          baked_objects_[cv.elems.get()] = gv;
+        }
+        if (cv.i == 0) return gv;
+        return llvm::ConstantExpr::getInBoundsGetElementPtr(i8_, gv, llvm::ConstantInt::get(i64_, (uint64_t)cv.i));
+      }
       case ConstValue::Aggregate: {
         const auto& es = *cv.elems;
         if (es.empty()) return llvm::Constant::getNullValue(lt(t));  // zero value (an empty array view)
+        if (t->kind == TypeKind::Array && !t->is_fixed_array()) {  // count, data (a dynamic array owns no memory)
+          auto* st = llvm::cast<llvm::StructType>(lt(t));
+          std::vector<llvm::Constant*> fs;
+          for (unsigned k = 0; k < st->getNumElements(); ++k) fs.push_back(llvm::Constant::getNullValue(st->getElementType(k)));
+          fs[0] = const_value(es[0], T.s64);
+          fs[1] = const_value(es[1], T.pointer_to(t->elem));
+          return llvm::ConstantStruct::get(st, fs);
+        }
+        if (t->kind == TypeKind::Any)
+          return llvm::ConstantStruct::get(llvm::cast<llvm::StructType>(lt(t)),
+                                           {const_value(es[0], T.type_t), const_value(es[1], T.void_ptr)});
+        if (t->is_union) {  // (member index, its value): the member's bytes, padded to the union's size
+          Type* mt = t->fields[(size_t)es[0].i].type;
+          llvm::Constant* m = const_value(es[1], mt);
+          auto* ut = llvm::cast<llvm::StructType>(lt(t));
+          if (ut->getNumElements() >= 1 && ut->getElementType(0) == m->getType()) {
+            std::vector<llvm::Constant*> fs{m};
+            for (unsigned k = 1; k < ut->getNumElements(); ++k) fs.push_back(llvm::Constant::getNullValue(ut->getElementType(k)));
+            return llvm::ConstantStruct::get(ut, fs);
+          }
+          int64_t pad = (int64_t)size_of(t) - (int64_t)dl_.getTypeAllocSize(m->getType());
+          if (pad <= 0) return llvm::ConstantStruct::getAnon(ctx_, {m}, /*Packed=*/true);
+          return llvm::ConstantStruct::getAnon(ctx_, {m, llvm::ConstantAggregateZero::get(llvm::ArrayType::get(i8_, pad))},
+                                               /*Packed=*/true);
+        }
         if (t->is_fixed_array()) {
           std::vector<llvm::Constant*> elems;
           elems.reserve(es.size());
@@ -867,10 +912,24 @@ class CodeGen {
           mv["offset_in_bytes"] = llvm::ConstantInt::get(i64_, (uint64_t)f.offset);
           uint32_t flags = (f.is_using ? 0x4 : 0) | (f.anonymous ? 0x100 : 0) | (f.type->is_proc() ? 0x8 : 0);
           mv["flags"] = i32c(flags);
+          if (!f.notes.empty()) {
+            std::vector<llvm::Constant*> ns;
+            for (auto& n : f.notes) ns.push_back(string_const(n));
+            mv["notes"] = ti_view(lt(T.string_t), ns, "__type_info_notes." + name + "." + f.name);
+          }
           ms.push_back(ti_const(prog_.type_info.member, mv));
         }
         add_constants(SIZE_MAX);
         v["members"] = ti_view(lt(prog_.type_info.member), ms, "__type_info_members." + name);
+        if (!t->struct_notes.empty()) {
+          std::vector<llvm::Constant*> ns;
+          for (auto& n : t->struct_notes) ns.push_back(string_const(n));
+          v["notes"] = ti_view(lt(T.string_t), ns, "__type_info_struct_notes." + name);
+        }
+        if (!t->is_union) {
+          llvm::Constant* def = default_value(t);
+          if (!def->isNullValue()) v["initializer"] = initializer_fn(t, def, name);
+        }
         break;
       }
       case TypeKind::Proc: {
@@ -2083,6 +2142,25 @@ class CodeGen {
     }
   }
 
+  // The memory dynamic array `arr` (of LLVM type dyn_t) owns: its data, or
+  // null when allocated is 0 (a baked #run result points to a global).
+  llvm::Value* owned_data(llvm::Type* dyn_t, llvm::Value* arr) {
+    llvm::Value* data = b_.CreateLoad(ptr_, b_.CreateStructGEP(dyn_t, arr, 1));
+    llvm::Value* allocated = b_.CreateLoad(i64_, b_.CreateStructGEP(dyn_t, arr, 2));
+    return b_.CreateSelect(b_.CreateICmpSGT(allocated, llvm::ConstantInt::get(i64_, 0)), data, null_ptr());
+  }
+
+  // Type_Info_Struct.initializer: `(p: *void) { p.* = <t's default>; }`.
+  llvm::Function* initializer_fn(Type* t, llvm::Constant* def, const std::string& name) {
+    auto* ft = llvm::FunctionType::get(void_, {ptr_}, false);
+    auto* f = llvm::Function::Create(ft, llvm::GlobalValue::PrivateLinkage, "__initializer." + name, mod_.get());
+    f->addFnAttr(llvm::Attribute::NoUnwind);
+    llvm::IRBuilder<> b(llvm::BasicBlock::Create(ctx_, "entry", f));
+    b.CreateAlignedStore(def, f->getArg(0), llvm::Align(align_of(t)));
+    b.CreateRetVoid();
+    return f;
+  }
+
   llvm::Value* emit_builtin(Call* c) {
     auto& a = c->resolved_args;
     switch (c->builtin) {
@@ -2214,15 +2292,13 @@ class CodeGen {
           return nullptr;
         }
         llvm::Value* arr = addr_of(a[0], /*read_only=*/true);  // freed with its own allocator
-        llvm::Value* data = b_.CreateLoad(ptr_, b_.CreateStructGEP(lt(t), arr, 1));
-        free_bytes(data, b_.CreateStructGEP(lt(t), arr, 3));
+        free_bytes(owned_data(lt(t), arr), b_.CreateStructGEP(lt(t), arr, 3));
         return nullptr;
       }
       case Builtin::ArrayReset: {
         llvm::Type* dyn_t = lt(a[0]->type->elem);
         llvm::Value* arr = rvalue(a[0]);
-        llvm::Value* data = b_.CreateLoad(ptr_, b_.CreateStructGEP(dyn_t, arr, 1));
-        free_bytes(data, b_.CreateStructGEP(dyn_t, arr, 3));
+        free_bytes(owned_data(dyn_t, arr), b_.CreateStructGEP(dyn_t, arr, 3));
         // count, data and allocated; the array keeps its allocator
         b_.CreateStore(llvm::ConstantInt::get(i64_, 0), b_.CreateStructGEP(dyn_t, arr, 0));
         b_.CreateStore(null_ptr(), b_.CreateStructGEP(dyn_t, arr, 1));

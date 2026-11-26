@@ -308,6 +308,7 @@ class Checker : public InterpHost {
   ProcLit* allocate_proc() override { return prog_.allocate_proc; }
   ProcLit* allocate_aligned_proc() override { return prog_.allocate_aligned_proc; }
   const Program::TypeInfoTypes& type_info_types() override { return prog_.type_info; }
+  ProcLit* initializer_for(Type* t) override { return type_has_default(t) ? initializer_proc(t) : nullptr; }
 
  private:
 
@@ -1132,6 +1133,7 @@ class Checker : public InterpHost {
     }
     complete_type(t, d->loc);
     d->cv = interp_.run(d->operand, d->loc, true);
+    want_const_procs(d->cv);
     if (d->cv.kind == ConstValue::None) fail(d->loc, "#run expression does not produce a value");
     return t;
   }
@@ -1327,6 +1329,7 @@ class Checker : public InterpHost {
     if (sd->struct_type) return sd->struct_type;
     Type* t = T.new_struct(name.empty() ? (sd->is_union ? "union" : "struct") : name);
     t->is_union = sd->is_union;
+    t->struct_notes = sd->notes;
     sd->struct_type = t;
     // The body's own scope holds its constants; #this names the struct there.
     Scope* ss = new_scope(scope_, scope_->proc);
@@ -1681,6 +1684,7 @@ class Checker : public InterpHost {
         f.anonymous = f.name.empty();
         f.is_using = d->is_using;
         f.is_as = d->is_as;
+        f.notes = d->notes;
         if (f.is_as && d->names.size() != 1) fail(d->loc, "#as needs a declaration of one member");
         if (!f.anonymous && !names.insert(f.name).second)
           fail(d->names[i].loc, "duplicate member '", f.name, "'");
@@ -2831,9 +2835,21 @@ class Checker : public InterpHost {
       case NK::ArrayLit: return check_array_lit(static_cast<ArrayLit*>(e), hint);
       case NK::ProcLit: {
         auto* p = static_cast<ProcLit*>(e);
-        if (p->is_poly || p->poly_returns)
-          fail(e->loc, "a polymorphic procedure must be declared as a named constant (name :: (x: $T) {...}); "
-               "polymorphic procedure values are not supported yet");
+        if (p->is_poly || p->poly_returns) {  // `f: (int) -> int = (x: $T) -> T {...};`: the instance for that type
+          if (!hint || !hint->is_proc())
+            fail(e->loc, "a polymorphic procedure literal can only be used where a procedure type is expected "
+                 "(f: (int) -> int = (x: $T) -> T {...};), or declared as a named constant");
+          if (p->name.empty()) p->name = "polymorphic procedure literal";
+          validate_poly_proc(p);
+          Symbol* tmpl = new_symbol(p->name, SymKind::PolyProc, p->loc);
+          tmpl->scope = scope_;
+          tmpl->proc = p;
+          tmpl->state = Symbol::State::Resolved;
+          Symbol* inst = poly_for_type(tmpl, hint, e->loc);
+          use_instance(inst, e->loc);
+          e = inst->proc;
+          return inst->type;
+        }
         if (lambda_hint_ != hint) {  // (infer_poly sets the hint itself, with lambda_hint_results_)
           lambda_hint_ = hint && hint->is_proc() ? hint : nullptr;
           lambda_hint_results_ = true;
@@ -3065,6 +3081,13 @@ class Checker : public InterpHost {
     s->kind = SymKind::Proc;
     define_proc(p);
     s->type = p->type;
+  }
+
+  // The procedures a #run result refers to get code.
+  void want_const_procs(const ConstValue& v) {
+    if (v.kind == ConstValue::Proc) want_proc(v.proc);
+    if ((v.kind == ConstValue::Aggregate || v.kind == ConstValue::Pointer) && v.elems)
+      for (const ConstValue& e : *v.elems) want_const_procs(e);
   }
 
   // `#exists(name)` / `#exists(Module.name)`: whether the name is visible here.
@@ -4596,7 +4619,9 @@ class Checker : public InterpHost {
       if (d->is_baked || d->auto_bake)
         fail(loc, "polymorphic procedure '", tmpl->name, "' has compile-time parameter '$", d->names[0].name,
              "', so it cannot be used as a value; bake it first (#bake_constants)");
-    if (p->params.size() != want->params.size() || p->returns.size() != want->returns.size() ||
+    bool results_inferred = p->short_expr && p->returns.empty();  // `(x: $T) => x - 1`: from the expression
+    if (p->params.size() != want->params.size() ||
+        (p->returns.size() != want->returns.size() && !results_inferred) ||
         p->variadic != (want->vararg >= 0) || p->c_call != want->c_call)
       fail(loc, "polymorphic procedure '", tmpl->name, "' (", proc_pattern_str(p), ") does not fit ", type_name(want));
     Bindings b = poly_vars(p);
@@ -6077,15 +6102,27 @@ class Checker : public InterpHost {
       }
       case Builtin::Assert: {
         // Jai's assert :: (arg: bool, message := "", args: ..Any, loc := #caller_location):
-        // `loc` follows the (not yet supported) format arguments, so it is passed by name.
+        // `loc` follows the format arguments, so it is passed by name.
+        std::vector<Arg> format_args, rest;
+        for (size_t i = 0; i < c->args.size(); ++i)
+          (i >= 2 && c->args[i].name.empty() ? format_args : rest).push_back(c->args[i]);
+        c->args = rest;
         auto args = builtin_args(c, {"arg", "message", "loc"}, 1, "assert");
-        if (c->args.size() >= 3 && c->args[2].name.empty())
-          fail(c->args[2].value->loc, "'assert' does not take format arguments yet (pass 'loc' by name)");
         // resolved: condition, message (or null), and the file and line to report (or null for the call site)
         c->resolved_args = {args[0], args[1], nullptr, nullptr};
         auto& a = c->resolved_args;
         check_cond(a[0]);
-        if (a[1]) check_value(a[1], T.string_t);
+        if (!format_args.empty()) {  // the message is tprint(message, args...), made only if the assertion fails
+          if (!a[1]) fail(format_args[0].value->loc, "'assert' format arguments need a message");
+          auto* fmt = ast_.make<Call>(a[1]->loc, ast_.make<Ident>(a[1]->loc, "tprint"));
+          fmt->args.push_back(Arg{"", a[1]->loc, a[1]});
+          for (auto& f : format_args) fmt->args.push_back(f);
+          fmt->builtin = Builtin::Sprint;
+          fmt->type = check_builtin(fmt, nullptr);
+          a[1] = fmt;
+        } else if (a[1]) {
+          check_value(a[1], T.string_t);
+        }
         if (args[2]) {
           check_value(args[2], source_loc_t_);
           // Read only when the assertion fails; `loc` is evaluated once for each member.

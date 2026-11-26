@@ -85,6 +85,10 @@ typedef struct {
   const OTypeInfo *type;
   int64_t offset_in_bytes;
   uint32_t flags;
+  struct {
+    int64_t count;
+    const OString *data;
+  } notes;
 } OTypeInfoMember;
 
 enum { TI_STRUCT_UNION = 0x2 };
@@ -1244,6 +1248,9 @@ typedef void *(*OAllocateAlignedFn)(int64_t size, int64_t align, const OAllocato
 void __ojay_array_reserve(ODynArray *a, int64_t elem_size, int64_t needed, int32_t exact, OAllocateFn allocate,
                           const OAllocator *context_allocator, int64_t align, OAllocateAlignedFn allocate_aligned) {
   if (a->allocated >= needed) return;
+  // Items it does not own (a baked #run result: allocated 0) are copied into new memory.
+  uint8_t *borrowed = a->allocated == 0 ? a->data : 0;
+  if (borrowed) a->data = 0;
   int64_t cap = needed;
   if (!exact) {
     cap = a->allocated * 2;
@@ -1270,6 +1277,8 @@ void __ojay_array_reserve(ODynArray *a, int64_t elem_size, int64_t needed, int32
     plat_write(2, msg, sizeof(msg) - 1);
     plat_exit(1);
   }
+  if (borrowed)
+    for (int64_t i = 0; i < a->count * elem_size; ++i) data[i] = borrowed[i];
   a->data = data;
   a->allocated = cap;
 }

@@ -47,14 +47,22 @@ struct Node {
 // Aggregate: a fixed array (one element per array element) or a struct (one
 // element per field, in field order), e.g. the result of `#run`. An empty
 // element list is the zero value of the type (used for empty array views).
+// From #run results also: an array view (count, data), a dynamic array
+// (count, data; it owns no memory) and an Any (type, value_pointer).
+// Pointer: a pointer into a baked object (a #run result's pointer): elems[0]
+// is the object's value, of type t (a fixed array), and i the byte offset.
+// The program gets the object as a global (one per object), so pointers into
+// the same object stay pointers into it.
+// Proc: a procedure value (proc).
 // The elements are shared and never modified, so copies are cheap.
 struct ConstValue {
-  enum Kind { None, Int, Float, Bool, String, TypeV, Null, Address, Aggregate, Code } kind = None;
+  enum Kind { None, Int, Float, Bool, String, TypeV, Null, Address, Aggregate, Code, Pointer, Proc } kind = None;
   __int128 i = 0;
   double f = 0;
   bool b = false;
   std::string s;
   Type* t = nullptr;
+  ProcLit* proc = nullptr;
   std::shared_ptr<const std::vector<ConstValue>> elems;
 
   static ConstValue of_int(__int128 v) { ConstValue c; c.kind = Int; c.i = v; return c; }
@@ -65,6 +73,15 @@ struct ConstValue {
   static ConstValue null() { ConstValue c; c.kind = Null; return c; }
   static ConstValue address(__int128 v) { ConstValue c; c.kind = Address; c.i = v; return c; }
   static ConstValue code(__int128 id) { ConstValue c; c.kind = Code; c.i = id; return c; }
+  static ConstValue pointer(Type* storage, ConstValue object, int64_t offset) {
+    ConstValue c;
+    c.kind = Pointer;
+    c.t = storage;
+    c.i = offset;
+    c.elems = std::make_shared<const std::vector<ConstValue>>(std::vector<ConstValue>{std::move(object)});
+    return c;
+  }
+  static ConstValue procedure(ProcLit* p) { ConstValue c; c.kind = Proc; c.proc = p; return c; }
   static ConstValue aggregate(std::vector<ConstValue> v) {
     ConstValue c;
     c.kind = Aggregate;
@@ -275,6 +292,7 @@ struct StructDef : Expr {
   std::vector<Decl*> members;
   bool is_union = false;
   Block* modify = nullptr;  // `struct ($T: Type) #modify { ... } { ... }`: runs for each instance
+  std::vector<std::string> notes;  // `struct @note { ... }`
   Type* struct_type = nullptr;
   explicit StructDef(SourceLoc l) : Expr(NK::StructDef, l) {}
 };
@@ -408,6 +426,7 @@ struct Decl : Stmt {
   bool backtick = false;    // `` `x := v; `` in an #expand macro: declared in the caller's scope
   bool add_context = false; // `#add_context name: T = v;`: a member added to Context
   bool is_as = false;       // struct member `#as [using] name: T;`
+  std::vector<std::string> notes;  // struct member: its notes (`x: int @note;`)
   Expr* insert = nullptr;   // a struct member `#insert expr;` (no names): members made by sema
   // Struct members: `#place name;` (no names, place_name set): the members after it start at
   // member `name`'s offset; `x: T #align N;`: member x's offset is a multiple of N.

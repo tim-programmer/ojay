@@ -1,0 +1,11 @@
+Config notes: [Serializable, Version2]
+  name: [Required]
+  retries: [Min1, Max10]
+  debug: []
+  initializer: true
+Plain notes: []
+  a: []
+  b: []
+  initializer: false
+default 3
+[Serializable, Version2] [Min1, Max10] default 3

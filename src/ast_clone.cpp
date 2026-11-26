@@ -85,6 +85,7 @@ class Cloner {
         auto* n = ast_.make<StructDef>(e->loc);
         n->is_union = s->is_union;
         n->modify = block(s->modify);
+        n->notes = s->notes;
         for (Decl* d : s->params) n->params.push_back(decl(d));
         for (Decl* d : s->members) n->members.push_back(decl(d));
         return n;
@@ -277,6 +278,7 @@ class Cloner {
     n->is_vararg = d->is_vararg;
     n->is_baked = d->is_baked;
     n->is_as = d->is_as;
+    n->notes = d->notes;
     n->auto_bake = d->auto_bake;
     n->is_global = d->is_global;
     n->backtick = d->backtick;

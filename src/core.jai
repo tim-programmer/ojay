@@ -21,7 +21,7 @@ For_Flags :: enum_flags u32 {
 //
 // Differences from Jai: enums that Jai nests inside the structs are top-level
 // here (Type_Info_Array_Type, Type_Info_Struct_Member_Flags, ...), and there
-// are no notes, initializers, polymorph sources or struct parameters.
+// are no polymorph sources or struct parameters.
 
 Type_Info_Tag :: enum u32 {
     INTEGER              :: 0;
@@ -87,6 +87,7 @@ Type_Info_Struct_Member :: struct {
     type: *Type_Info;
     offset_in_bytes: s64;
     flags: Type_Info_Struct_Member_Flags;
+    notes: [] string;  // `name: T @note;`: the notes, without '@'
 }
 
 Struct_Textual_Flags :: enum_flags u32 {
@@ -102,6 +103,8 @@ Type_Info_Struct :: struct {
     name: string;
     members: [] Type_Info_Struct_Member;
     textual_flags: Struct_Textual_Flags;
+    initializer: (*void) -> ();  // sets a value to the struct's default value; null when that is all zeros
+    notes: [] string;            // `S :: struct @note { ... }`
 }
 
 Enum_Type_Flags :: enum_flags u32 {

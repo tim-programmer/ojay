@@ -1328,9 +1328,17 @@ class Parser {
     }
   }
 
+  // The notes (@name) on the tokens from index `from` up to the cursor.
+  std::vector<std::string> notes_since(size_t from) const {
+    std::vector<std::string> out;
+    for (size_t i = from; i < p_; ++i) out.insert(out.end(), toks_[i].notes.begin(), toks_[i].notes.end());
+    return out;
+  }
+
   StructDef* parse_struct() {
     auto* s = ast_.make<StructDef>(cur().loc);
     s->is_union = at(Tok::KwUnion);
+    size_t header = p_;
     advance();
     if (accept(Tok::LParen)) {  // struct ($T: Type, $N: int): a polymorphic struct
       while (!at(Tok::RParen)) {
@@ -1361,13 +1369,18 @@ class Parser {
       // #type_info_none etc. are accepted and ignored
       advance();
     }
+    s->notes = notes_since(header);  // `struct @note {`
     expect(Tok::LBrace, "to begin struct body");
     while (!at(Tok::RBrace)) {
       if (at(Tok::Eof)) fail(s->loc, "unterminated struct body (missing '}')");
       if (accept(Tok::Semi)) continue;
-      s->members.push_back(parse_struct_member());
+      size_t start = p_;
+      Decl* m = parse_struct_member();
+      m->notes = notes_since(start);  // `x: int @note;`
+      s->members.push_back(m);
     }
     advance();
+    for (auto& n : toks_[p_ - 1].notes) s->notes.push_back(n);  // `struct { ... } @note`
     reject_align();
     return s;
   }

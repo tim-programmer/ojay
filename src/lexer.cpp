@@ -129,6 +129,15 @@ class Lexer {
         return out;
       }
       lex_one(t);
+      if (!pending_notes_.empty()) {
+        if (!out.empty())
+          for (auto& n : pending_notes_) out.back().notes.push_back(std::move(n));
+        pending_notes_.clear();
+      }
+      if (t.kind == Tok::Eof) {
+        out.push_back(t);
+        return out;
+      }
       // `#string TERM ... TERM` here-strings are handled right after the directive.
       if (t.kind == Tok::Directive && t.text == "string") {
         out.push_back(t);
@@ -147,6 +156,7 @@ class Lexer {
   uint32_t file_;
   const std::string& src_;
   size_t pos_ = 0;
+  std::vector<std::string> pending_notes_;  // notes lexed since the last token
   uint32_t line_ = 1, col_ = 1;
 
   SourceLoc here() const { return SourceLoc{file_, line_, col_}; }
@@ -220,9 +230,11 @@ class Lexer {
       return;
     }
     if (c == '@') {
-      // Notes (@foo) are accepted and ignored.
+      // A note (@foo): kept with the token before it (Lexer::run), for the parser.
       get();
-      while (ident_char(peek())) get();
+      std::string note;
+      while (ident_char(peek())) note += get();
+      pending_notes_.push_back(std::move(note));
       skip_space_and_comments();
       Token next;
       next.loc = here();

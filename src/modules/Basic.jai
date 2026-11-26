@@ -236,11 +236,16 @@ builder_string_length :: (builder: *String_Builder) -> s64 {
     return builder.buffer.count;
 }
 
-// The text so far, as a new string (allocated with context.allocator).
-// The builder is emptied (its memory is kept for reuse).
-builder_to_string :: (builder: *String_Builder) -> string {
-    result := alloc_string(builder.buffer.count);
-    if result.count  memcpy(result.data, builder.buffer.data, result.count);
+// The text so far, as a new string (allocated with `allocator`, else
+// context.allocator), after `extra_bytes_to_prepend` bytes left for the
+// caller. The builder is emptied (its memory is kept for reuse).
+builder_to_string :: (builder: *String_Builder, allocator: Allocator = .{}, extra_bytes_to_prepend := 0) -> string {
+    a := ifx allocator.proc then allocator else context.allocator;
+    n := builder.buffer.count;
+    result: string;
+    result.count = extra_bytes_to_prepend + n;
+    if result.count  result.data = alloc(result.count, a);
+    if n  memcpy(result.data + extra_bytes_to_prepend, builder.buffer.data, n);
     builder.buffer.count = 0;
     return result;
 }

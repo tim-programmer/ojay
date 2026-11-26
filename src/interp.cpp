@@ -16,6 +16,7 @@
 #include <optional>
 #include <exception>
 #include <map>
+#include <set>
 #include <unordered_map>
 
 namespace ojay {
@@ -219,6 +220,8 @@ class Machine {
   std::vector<uint8_t> typeinfo_;     // the Type_Info of Type values (at kTypeBase), as accessed
   std::vector<bool> typeinfo_done_;   // per kTypeStride block: filled in
   std::map<u64, int64_t> heap_blocks_;  // live allocations: address -> size
+  std::set<u64> baking_;                // read_const: the objects being baked (to find cycles)
+  std::unordered_map<const void*, u64> baked_objects_;  // put_const: where each Pointer constant's object is
   std::vector<Frame*> frames_;
   std::vector<Val> args_;  // arguments of the calls being made
   int64_t steps_ = 0;
@@ -431,6 +434,18 @@ class Machine {
   }
 
   // A view of `n` elements of `esz` bytes in static memory; returns its data address.
+  // A [] string of `notes` in static memory: (count, data).
+  std::pair<int64_t, u64> ti_strings(const std::vector<std::string>& notes, SourceLoc loc) {
+    int64_t ssz = sz(T.string_t);
+    u64 a = ti_array((int64_t)notes.size(), ssz, 8, loc);
+    for (size_t i = 0; i < notes.size(); ++i) {
+      uint8_t* p = at(a + (u64)((int64_t)i * ssz), ssz, loc);
+      store_u(p, 8, notes[i].size());
+      store_u(p + 8, ps_, notes[i].empty() ? 0 : intern(notes[i], loc));
+    }
+    return {(int64_t)notes.size(), a};
+  }
+
   u64 ti_array(int64_t n, int64_t esz, int64_t align, SourceLoc loc) {
     if (n == 0) return 0;
     u64 a = alloc(static_, n * esz, align, loc);
@@ -532,7 +547,7 @@ class Machine {
         put("textual_flags", 4, (t->is_union ? 0x2 : 0) | (t->has_align ? 0x10 : 0));
         Type* mt = ti.member;
         // The fields with the constants among them (as codegen lists them).
-        struct M { const std::string* name; Type* type; int64_t offset; uint32_t flags; };
+        struct M { const std::string* name; Type* type; int64_t offset; uint32_t flags; const StructField* f = nullptr; };
         std::vector<M> list;
         size_t k = 0;
         auto consts_before = [&](size_t i) {
@@ -545,7 +560,7 @@ class Machine {
           consts_before(i);
           const StructField& f = t->fields[i];
           uint32_t flags = (f.is_using ? 0x4 : 0) | (f.anonymous ? 0x100 : 0) | (conc(f.type)->is_proc() ? 0x8 : 0);
-          list.push_back({&f.name, f.type, f.offset, flags});
+          list.push_back({&f.name, f.type, f.offset, flags, &f});
         }
         consts_before(SIZE_MAX);
         int64_t n = (int64_t)list.size();
@@ -561,8 +576,19 @@ class Machine {
           store_u(p + ti_offset(mt, "type"), ps_, in_.type_id(m.type));
           store_u(p + ti_offset(mt, "offset_in_bytes"), 8, (u64)m.offset);
           store_u(p + ti_offset(mt, "flags"), 4, m.flags);
+          if (m.f && !m.f->notes.empty()) {
+            auto [nn, na] = ti_strings(m.f->notes, loc);
+            store_u(p + ti_offset(mt, "notes"), 8, (u64)nn);
+            store_u(p + ti_offset(mt, "notes") + 8, ps_, na);
+          }
         }
         put_view("members", n, members);
+        if (!t->struct_notes.empty()) {
+          auto [nn, na] = ti_strings(t->struct_notes, loc);
+          put_view("notes", nn, na);
+        }
+        if (!t->is_union)
+          if (ProcLit* ip = in_.host.initializer_for(t)) put("initializer", ps_, in_.proc_id(ip));
         break;
       }
       case TypeKind::Proc: {
@@ -691,9 +717,37 @@ class Machine {
       case ConstValue::Address: store_u(p, intlike(t) ? sz(t) : ps_, (u64)cv.i); return;
       case ConstValue::TypeV: store_u(p, ps_, in_.type_id(cv.t)); return;
       case ConstValue::Code: store_u(p, 8, (u64)cv.i); return;
+      case ConstValue::Proc: store_u(p, ps_, in_.proc_id(cv.proc)); return;
+      case ConstValue::Pointer: {  // the object, once per machine, in static memory
+        auto it = baked_objects_.find(cv.elems.get());
+        u64 a;
+        if (it != baked_objects_.end()) {
+          a = it->second;
+        } else {
+          a = alloc(static_, sz(cv.t), al(cv.t), loc);
+          baked_objects_[cv.elems.get()] = a;
+          put_const(at(a, sz(cv.t), loc), (*cv.elems)[0], cv.t, loc);
+        }
+        store_u(p, ps_, a + (u64)cv.i);
+        return;
+      }
       case ConstValue::Aggregate: {
         const auto& es = *cv.elems;
         if (es.empty()) return;  // zero value
+        if (t->kind == TypeKind::Array && !t->is_fixed_array()) {  // count, data (a dynamic array: allocated 0)
+          put_const(p, es[0], T.s64, loc);
+          put_const(p + 8, es[1], T.pointer_to(t->elem), loc);
+          return;
+        }
+        if (t->kind == TypeKind::Any) {
+          put_const(p, es[0], T.type_t, loc);
+          put_const(p + ps_, es[1], T.void_ptr, loc);
+          return;
+        }
+        if (t->is_union) {  // (member index, its value)
+          put_const(p, es[1], t->fields[(size_t)es[0].i].type, loc);
+          return;
+        }
         if (t->is_fixed_array()) {
           for (size_t i = 0; i < es.size(); ++i) put_const(p + (int64_t)i * sz(t->elem), es[i], t->elem, loc);
         } else {
@@ -749,11 +803,15 @@ class Machine {
       case TypeKind::Proc: {
         u64 v = load_u(p, ps_);
         if (v == 0) return ConstValue::null();
-        if (t->kind == TypeKind::Proc)
-          err(loc, where(), " (of type ", type_name(t), ") is a procedure; procedure values in #run results "
-              "are not supported yet");
-        err(loc, where(), " (of type ", type_name(t), ") is a pointer into compile-time memory, which does not "
-            "exist in the compiled program; a #run result cannot contain pointers (other than null)");
+        if (t->kind == TypeKind::Proc) {
+          ProcLit* pl = in_.proc_of_id(v);
+          if (!pl) err(loc, where(), " (of type ", type_name(t), ") is not a valid procedure value (", hex(v), ")");
+          return ConstValue::procedure(pl);
+        }
+        if (conc(t->elem)->kind == TypeKind::Void || sz(t->elem) <= 0)
+          err(loc, where(), " (of type ", type_name(t), ") is a pointer to data of unknown type; only typed pointers "
+              "can be baked into a #run result");
+        return bake_pointer(v, conc(t->elem), path, loc);
       }
       case TypeKind::Array: {
         if (t->is_fixed_array()) {
@@ -763,15 +821,33 @@ class Machine {
             es.push_back(read_const(p + i * sz(t->elem), t->elem, path + "[" + std::to_string(i) + "]", loc));
           return ConstValue::aggregate(std::move(es));
         }
-        bool empty = load_u(p, 8) == 0 && load_u(p + 8, ps_) == 0 &&
-                     (t->is_view() || load_u(p + dyn_allocated_off(), 8) == 0);
-        if (empty) return ConstValue::aggregate({});
-        err(loc, where(), " (of type ", type_name(t), ") points to compile-time memory, which does not exist in "
-            "the compiled program; return a fixed-size array ([N]", type_name(t->elem), ") instead");
+        // A view or dynamic array: its items become a baked array (a dynamic
+        // array owns no memory then: allocated is 0, and growing it copies).
+        i64 n = (i64)load_u(p, 8);
+        u64 data = load_u(p + 8, ps_);
+        if (n < 0) err(loc, where(), " is an array with a negative count (", n, ")");
+        if (n == 0 || data == 0) return ConstValue::aggregate({});
+        Type* elem = conc(t->elem);
+        Type* storage = T.array_of(elem, ArrayKind::Fixed, n);
+        in_.host.prepare_type(storage);
+        if (!baking_.insert(data).second) err(loc, where(), " is part of a cycle of pointers, which cannot be baked");
+        ConstValue items = read_const(at(data, n * sz(elem), loc), storage, path + ".data", loc);
+        baking_.erase(data);
+        std::vector<ConstValue> es{ConstValue::of_int(n), ConstValue::pointer(storage, std::move(items), 0)};
+        return ConstValue::aggregate(std::move(es));
       }
       case TypeKind::Struct: {
-        if (t->is_union) err(loc, where(), " is a union (", type_name(t), "); unions in #run results are not "
-                             "supported yet");
+        if (t->is_union) {  // through its first member that covers it all (so every byte is kept)
+          for (size_t i = 0; i < t->fields.size(); ++i) {
+            const StructField& f = t->fields[i];
+            if (f.type->kind == TypeKind::Void || sz(f.type) != sz(t)) continue;
+            std::string sub = f.name.empty() ? path : (path.empty() ? f.name : path + "." + f.name);
+            std::vector<ConstValue> es{ConstValue::of_int((__int128)i), read_const(p, f.type, sub, loc)};
+            return ConstValue::aggregate(std::move(es));
+          }
+          err(loc, where(), " is a union (", type_name(t), ") none of whose members covers all of it, so it "
+              "cannot be baked into a #run result");
+        }
         std::vector<ConstValue> es;
         es.reserve(t->fields.size());
         for (auto& f : t->fields) {
@@ -780,11 +856,55 @@ class Machine {
         }
         return ConstValue::aggregate(std::move(es));
       }
-      case TypeKind::Any:
-        err(loc, where(), " is an Any, which points to compile-time memory; it cannot be a #run result");
+      case TypeKind::Any: {  // the value it points to is baked
+        u64 tv = load_u(p, ps_);
+        u64 v = load_u(p + ps_, ps_);
+        if (tv == 0 && v == 0) return ConstValue::aggregate({});
+        Type* vt = in_.type_of_id(tv);
+        if (!vt) err(loc, where(), " is an Any with an invalid type (", hex(tv), ")");
+        vt = conc(vt);
+        std::vector<ConstValue> es{ConstValue::of_type(vt)};
+        if (v == 0 || sz(vt) <= 0) {
+          es.push_back(ConstValue::null());
+        } else {
+          Type* storage = T.array_of(vt, ArrayKind::Fixed, 1);
+          in_.host.prepare_type(storage);
+          if (!baking_.insert(v).second) err(loc, where(), " is part of a cycle of pointers, which cannot be baked");
+          ConstValue obj = read_const(at(v, sz(vt), loc), storage, path + ".value_pointer", loc);
+          baking_.erase(v);
+          es.push_back(ConstValue::pointer(storage, std::move(obj), 0));
+        }
+        return ConstValue::aggregate(std::move(es));
+      }
       default:
         err(loc, where(), " has type ", type_name(t), ", which cannot be a #run result");
     }
+  }
+
+  // A pointer of a #run result to an `elem` at address v: the object it points
+  // into is baked with it, as a fixed array: the whole heap block when v points
+  // to an item of one (so pointer arithmetic within the block keeps working),
+  // else the one item.
+  ConstValue bake_pointer(u64 v, Type* elem, const std::string& path, SourceLoc loc) {
+    int64_t es = sz(elem);
+    u64 base = v;
+    int64_t n = 1;
+    auto it = heap_blocks_.upper_bound(v);
+    if (it != heap_blocks_.begin()) {
+      --it;
+      int64_t size = it->second;
+      if (v < it->first + (u64)size && (v - it->first) % (u64)es == 0 && size % es == 0) {
+        base = it->first;
+        n = size / es;
+      }
+    }
+    Type* storage = T.array_of(elem, ArrayKind::Fixed, n);
+    in_.host.prepare_type(storage);
+    if (!baking_.insert(base).second)
+      err(loc, "the result's ", path.empty() ? "value" : path, " is part of a cycle of pointers, which cannot be baked");
+    ConstValue obj = read_const(at(base, n * es, loc), storage, path + ".*", loc);
+    baking_.erase(base);
+    return ConstValue::pointer(storage, std::move(obj), (int64_t)(v - base));
   }
 
   // ------------------------------------------------------------------ default values
@@ -2031,6 +2151,9 @@ class Machine {
       if (cap < needed) cap = needed;
     }
     u64 allocator = arr + (u64)dyn_allocator_off();
+    // Items it does not own (a baked #run result: allocated 0): copied into new memory.
+    u64 borrowed = allocated == 0 ? load_ptr(arr + 8, loc) : 0;
+    if (borrowed) store_ptr(arr + 8, 0, loc);
     u64 data;
     if (in_.host.allocate_proc()) {
       // The array keeps the allocator it first grew with: context.allocator then.
@@ -2056,8 +2179,17 @@ class Machine {
     } else {
       data = heap_realloc(load_ptr(arr + 8, loc), cap * esz, loc);
     }
+    if (borrowed) {
+      i64 n = load_i64(arr, loc) * esz;
+      if (n > 0) std::memmove(at(data, n, loc), at(borrowed, n, loc), (size_t)n);
+    }
     store_ptr(arr + 8, data, loc);
     store_i64(arr + (u64)dyn_allocated_off(), cap, loc);
+  }
+
+  // The memory a dynamic array owns (null for a baked one: allocated 0).
+  u64 owned_data(u64 arr, SourceLoc loc) {
+    return load_i64(arr + (u64)dyn_allocated_off(), loc) > 0 ? load_ptr(arr + 8, loc) : 0;
   }
 
   Val math1(Builtin b, const Val& x, Type* t) {
@@ -2190,12 +2322,12 @@ class Machine {
           return Val();
         }
         u64 arr = addr_of(a[0]);  // freed with its own allocator
-        allocate(FREE, 0, 0, load_ptr(arr + 8, loc), arr + (u64)dyn_allocator_off(), loc);
+        allocate(FREE, 0, 0, owned_data(arr, loc), arr + (u64)dyn_allocator_off(), loc);
         return Val();
       }
       case Builtin::ArrayReset: {
         u64 arr = get_ptr(eval(a[0]));
-        allocate(FREE, 0, 0, load_ptr(arr + 8, loc), arr + (u64)dyn_allocator_off(), loc);
+        allocate(FREE, 0, 0, owned_data(arr, loc), arr + (u64)dyn_allocator_off(), loc);
         std::memset(at(arr, dyn_allocator_off(), loc), 0, (size_t)dyn_allocator_off());  // it keeps its allocator
         return Val();
       }

@@ -300,7 +300,9 @@ Implemented:
 * Polymorphic procedures as values: where a procedure type is expected (`f:
   (int) -> int = square;`, an argument `apply(square, 9)` or `map(xs,
   square)`, an assignment, a cast), the instance of that type is used.
-  Procedures with compile-time parameters must be baked first.
+  Procedures with compile-time parameters must be baked first. A
+  polymorphic literal works the same way: `f: (int) -> int = (x: $T) -> T {
+  return x * 3; };`, `h: (s8) -> s8 = (x: $T) => x - 1;`.
 * A type variable introduced in the (first) return type, `convert :: (x:
   $T) -> $R`, takes the type the call's result is expected to have: `a:
   float = convert(7);`, an assignment, a typed parameter, a `return`, the
@@ -385,7 +387,8 @@ Implemented:
 * Runtime type information: `type_info(T)`, `Type_Info` and the
   `Type_Info_*` structs (see *Runtime type information* below)
 * Runtime checks: array bounds checks; `assert(cond)`, `assert(cond,
-  "message")`, and `loc = ...` to report another location than the call
+  "message")`, `assert(cond, "x is %", x)` (formatted like `tprint`, only
+  when the assertion fails), and `loc = ...` to report another location than the call
   (`check :: (x: int, loc := #caller_location) { assert(x > 0, loc = loc); }`)
 * ojay extension for embedded targets: `#import "Hardware"` provides
   `volatile_load(p)` and `volatile_store(p, value)` for memory-mapped
@@ -432,7 +435,20 @@ Implemented:
     the operators `+ - * /` (per component, and `*` / `/` by a scalar),
     unary `-` and `==`, `dot`, `cross`, `length`, `length_squared`,
     `distance`, `normalize` (leaves vectors shorter than `epsilon`
-    unchanged) and `lerp` of vectors.
+    unchanged) and `lerp` of vectors; `Matrix3` and `Matrix4` (row-major
+    `_11` .. `_44`, also `coef[row][column]`, `floats`, and a Matrix4's rows
+    as `v[i]`), `Matrix3_Identity` / `Matrix4_Identity`, `*` (with
+    matrices, vectors and scalars), `+`, `-`, `==`, `multiply`,
+    `transform_point`, `transform_vector`, `transpose`, `determinant`,
+    `inverse` (and whether there is one), `make_translation_matrix4`,
+    `make_scale_matrix3/4`, `make_matrix3` / `make_matrix4`,
+    `make_look_at_matrix`, `make_projection_matrix` (OpenGL clip space) and
+    `make_orthographic_projection_matrix`; `Quaternion` (`x`, `y`, `z`, `w`),
+    `Quaternion_Identity`, `make_quaternion`, `set_from_axis_and_angle`,
+    `make_quaternion_from_axis_and_angle`, `get_axis_and_angle`, `*` (the
+    Hamilton product), `+`, `-`, `dot`, `length`, `conjugate`, `inverse`,
+    `normalize`, `rotate`, `nlerp`, `slerp`, `get_rotation_matrix` and
+    `rotation_matrix`.
   * Hash_Table (all Jai, `src/modules/Hash_Table.jai`, `#import
     "Hash_Table"`): `Table(Key_Type, Value_Type)` with open addressing,
     `init`, `deinit`, `table_add`, `table_set`, `table_find` (value and
@@ -444,10 +460,25 @@ Implemented:
     custom hash and compare procedure parameters are not supported); a table
     allocates from `context.allocator` (or the `allocator` set before the
     first add).
+  * String (all Jai, `src/modules/String.jai`): `equal`, `equal_nocase`,
+    `compare_nocase`, `starts_with` / `begins_with`, `ends_with`,
+    `find_index_from_left` / `_from_right` (of a string or a byte),
+    `find_index_of_any_from_left` / `_from_right`, `contains`, `is_any`,
+    `count`, `slice`, `advance`, `trim` / `trim_left` / `trim_right`,
+    `split_from_left` / `split_from_right`, `split` (allocates the array;
+    the pieces are views), `replace`, `to_upper` / `to_lower` (of a byte),
+    `to_upper_copy`, `to_lower_copy`, `to_upper_in_place`,
+    `to_lower_in_place`, `string_to_int` (with a base) and `string_to_float`
+    (value, success, remainder), and paths (`path_filename`,
+    `path_strip_filename`, `path_extension`, `path_strip_extension`).
+  * Random (all Jai, `src/modules/Random.jai`): xorshift128+ with its state
+    in the context (`#add_context random_state`): `random_seed`,
+    `random_get` (64 bits), `random_get_zero_to_one`, `_open`, `_float64`,
+    and `random_get_within_range` (floats, or integers inclusive).
   Differences from Jai's modules: `array_reserve` and `String_Builder`
   memory come from the array's allocator (`context.allocator` when it first
   grows), `String_Builder` is one growing buffer rather than a chain of
-  buffers, `builder_to_string` takes no allocator, and there are no log
+  buffers, and there are no log
   sections (`Log_Info` has no `section`, `log` no `section` parameter).
   `print` shows anonymous struct and union members inline, so a `Vector3`
   prints as `{1, 2, 3}`.
@@ -652,6 +683,17 @@ buffer: [#run compute_size()]u8;        // anywhere a constant is needed
   integers, floats, bools, strings, enums, `Type`s, fixed arrays and structs
   (nested, including polymorphic struct instances). Indexing a constant array
   with a runtime index reads a read-only table in the object file.
+  Results can also contain memory: array views, dynamic arrays, typed
+  pointers, `Any`s and procedure values (also a whole `Context`). The memory
+  they point to is baked into the program as writable globals (one per
+  object, so two pointers into it stay consistent): the items of a view or
+  dynamic array, the heap block a pointer points into (the whole
+  allocation, so pointer arithmetic within it works) or else the one value,
+  and the value of an `Any`. A baked dynamic array owns no memory
+  (`allocated` is 0): `array_add` copies the items into new memory, and
+  `array_free` / `array_reset` leave them alone. A union is baked as its
+  first member that covers all of it. Pointers to `void` and cycles of
+  pointers cannot be baked.
 * `#run expr;` as a statement (at top level or in a procedure body) runs
   during compilation and produces no code. Top-level ones run in source order
   after the program's declarations are resolved.
@@ -797,9 +839,12 @@ for e.names  print("% = %\n", it, e.values[it_index]);
   `using info: Type_Info` and add: `signed` (integers); `pointer_to`;
   `element_type`, `array_type` (`FIXED`, `VIEW`, `RESIZABLE`) and
   `array_count` (-1 unless fixed); `name`, `members`
-  (`Type_Info_Struct_Member`: `name`, `type`, `offset_in_bytes`, `flags`)
-  and `textual_flags` (`.UNION`, `.ALIGNED` when a member has `#align`) for
-  structs and unions; the members include the struct's constants in
+  (`Type_Info_Struct_Member`: `name`, `type`, `offset_in_bytes`, `flags`,
+  `notes`), `textual_flags` (`.UNION`, `.ALIGNED` when a member has
+  `#align`), `initializer` (a procedure that sets a value to the struct's
+  defaults, null when those are all zeros) and `notes` for structs and
+  unions; notes are written `x: int @Min1 @Max10;` (members) and `S ::
+  struct @Serializable { ... }` (structs), and listed without the `@`; the members include the struct's constants in
   declaration order, with flag `CONSTANT`, offset 0 and the constant's type
   (`Type` for a type constant, the procedure type for a procedure; untyped
   numbers as `s64` / `float32`; polymorphic procedures and structs are not

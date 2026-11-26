@@ -35,6 +35,9 @@ class InterpHost {
   // The Type_Info_* structs (core.jai), for laying out Type_Info in
   // compile-time memory.
   virtual const Program::TypeInfoTypes& type_info_types() = 0;
+  // The procedure that sets a t to its default value (initializer_of(t)), or
+  // null when that is all zeros.
+  virtual ProcLit* initializer_for(Type* t) = 0;
 };
 
 class Interpreter {

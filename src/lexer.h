@@ -39,6 +39,7 @@ struct Token {
   std::string text;      // identifier / directive name / decoded string
   unsigned __int128 ival = 0;
   double fval = 0;
+  std::vector<std::string> notes;  // notes (`@name`) written right after this token
 };
 
 // Tokenizes a whole file. Throws CompileError on malformed input.

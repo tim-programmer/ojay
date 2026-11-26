@@ -52,6 +52,7 @@ struct StructField {
   bool uninit = false;            // `= ---`
   bool is_using = false;          // `using name: T;` - T's members are also members of the enclosing struct
   bool is_as = false;             // `#as name: T;` - the struct converts implicitly to T (this member)
+  std::vector<std::string> notes; // `name: T @note;`
   bool anonymous = false;         // `struct { ... }` / `union { ... }` member without a name: its members are
                                   // accessed as if they were members of the enclosing struct
   int place = -1;                 // `#place m;` before this member: it starts at the offset of field `place`
@@ -91,6 +92,7 @@ struct Type {
 
   // Struct
   std::vector<StructField> fields;
+  std::vector<std::string> struct_notes;  // Struct: `struct @note { ... }`
   bool is_union = false;
   bool has_place = false;    // some member follows a `#place`: members may overlap
   bool has_align = false;    // some member has `#align` (Struct_Textual_Flags.ALIGNED)

@@ -1,0 +1,17 @@
+[Hello, World] [Hello, World  ] [  Hello, World]
+true true true false
+4 8 true false
+3 2
+4 [a, b, , c]
+[x, y]
+true [key] [value=x]
+true [key=value] [x]
+the cog sog on the mog
+MIXED 1 mixed 1
+true -1 1
+-42 true [ apples]
+255 true
+0 false
+-125 true [xyz]
+/home/user/ file.tar.gz gz true /home/user/file.tar
+bc ell

@@ -34,13 +34,18 @@
 
 namespace ojay {
 
-extern const char* const kHashTableSource;  // modules/Hash_Table.jai (generated modules.cpp)
+// Modules written in Jai (src/modules/*.jai, in the generated modules.cpp).
+extern const char* const kHashTableSource;
+extern const char* const kStringSource;
+extern const char* const kRandomSource;
 
 namespace {
 
 // The source of a module written in Jai that comes with the compiler, or null.
 const char* embedded_module_source(const std::string& name) {
   if (name == "Hash_Table") return kHashTableSource;
+  if (name == "String") return kStringSource;
+  if (name == "Random") return kRandomSource;
   return nullptr;
 }
 
@@ -211,9 +216,9 @@ class Loader {
       tl.insert(tl.end(), stmts.begin(), stmts.end());
       return unit;
     }
-    if (name == "String" || name == "Compiler" || name == "POSIX" || name == "Random" || name == "File" ||
-        name == "Thread") {
-      fail(loc, "module \"", name, "\" is not available yet (built-in modules: Basic, Math, Hash_Table, Hardware)");
+    if (name == "Compiler" || name == "POSIX" || name == "File" || name == "Thread") {
+      fail(loc, "module \"", name, "\" is not available yet (built-in modules: Basic, Math, Hash_Table, String, "
+           "Random, Hardware)");
     }
     fail(loc, "module \"", name, "\" not found (searched ", dirs.size(), " director",
          dirs.size() == 1 ? "y" : "ies", "; use -I to add more)");
