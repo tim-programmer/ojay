@@ -1258,28 +1258,25 @@ class Machine {
   Flow exec_return(Return* r) {
     if (r->expand_target) {  // leaves the macro expansion with its value
       ActiveExpansion& a = active_expansion(r->expand_target, r->loc);
-      if (!r->values.empty()) *a.result = eval(r->values[0]);
+      if (!r->values.empty()) *a.result = return_value(r, r->expand_target->macro->type->returns);
       flow_target_ = r->expand_target->body;
       return Flow::Break;
     }
     Frame& f = *frames_.back();
-    const auto& rets = f.proc->type->returns;
-    if (rets.size() == 1) {
-      f.ret = eval(r->values[0]);
-    } else if (rets.size() > 1) {
-      if (r->values.size() == 1) {
-        f.ret = eval(r->values[0]);
-      } else {
-        Type* tt = T.tuple(rets);
-        Val tup(tt->size);
-        for (size_t i = 0; i < rets.size(); ++i) {
-          Val v = eval(r->values[i]);
-          std::memcpy(tup.data() + tuple_off(tt, i), v.data(), (size_t)v.size());
-        }
-        f.ret = tup;
-      }
-    }
+    if (!f.proc->type->returns.empty()) f.ret = return_value(r, f.proc->type->returns);
     return Flow::Return;
+  }
+
+  // The value a return statement gives for results `rets` (a tuple if several).
+  Val return_value(Return* r, const std::vector<Type*>& rets) {
+    if (rets.size() == 1 || r->values.size() == 1) return eval(r->values[0]);
+    Type* tt = T.tuple(rets);
+    Val tup(tt->size);
+    for (size_t i = 0; i < rets.size(); ++i) {
+      Val v = eval(r->values[i]);
+      std::memcpy(tup.data() + tuple_off(tt, i), v.data(), (size_t)v.size());
+    }
+    return tup;
   }
 
   // ------------------------------------------------------------------ addresses

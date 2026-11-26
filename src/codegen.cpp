@@ -285,9 +285,10 @@ class CodeGen {
   const AbiSignature& c_sig(Type* pt, SourceLoc loc = {}) {
     auto it = c_sigs_.find(pt);
     if (it != c_sigs_.end()) return it->second;
-    for (Type* x : pt->params)
-      if (std::string why = c_abi_unsupported(x); !why.empty())
-        throw CompileError(loc, cat("#c_call/#foreign parameters of type ", type_name(x), " are not supported: ", why));
+    for (size_t i = 0; i < pt->params.size(); ++i)  // (not the C varargs, which sema promoted)
+      if (std::string why = c_abi_unsupported(pt->params[i]); (int)i != pt->vararg && !why.empty())
+        throw CompileError(loc, cat("#c_call/#foreign parameters of type ", type_name(pt->params[i]),
+                                    " are not supported: ", why));
     for (Type* x : pt->returns)
       if (std::string why = c_abi_unsupported(x); !why.empty())
         throw CompileError(loc, cat("#c_call/#foreign return type ", type_name(x), " is not supported: ", why));
@@ -383,8 +384,9 @@ class CodeGen {
       sret = coerce_slot(pt->returns[0], nullptr, s.ret.align);
       args.push_back(sret);
     }
-    for (size_t i = 0; i < c->resolved_args.size(); ++i)
+    for (size_t i = 0; i < s.params.size(); ++i)
       lower_c_arg(s.params[i], pt->params[i], rvalue(c->resolved_args[i]), args);
+    for (Expr* v : c->c_varargs) args.push_back(rvalue(v));
     auto* call = b_.CreateCall(s.fn_type, callee, args);
     call->setAttributes(c_attrs(pt));
     if (c->force_inline) call->addFnAttr(llvm::Attribute::AlwaysInline);
@@ -1176,10 +1178,7 @@ class CodeGen {
   // A plain `return` in a macro body: leaves the expansion with its value.
   void emit_macro_return(Return* r) {
     size_t idx = expansion_scope(r->expand_target);
-    if (!r->values.empty()) {
-      llvm::Value* v = rvalue(r->values[0]);
-      b_.CreateStore(v, scopes_[idx].result);
-    }
+    if (!r->values.empty()) b_.CreateStore(return_value(r, r->expand_target->macro->type->returns), scopes_[idx].result);
     emit_defers_down_to(idx);
     if (terminated()) return;
     b_.CreateBr(scopes_[idx].break_bb);
@@ -1203,7 +1202,7 @@ class CodeGen {
     if (d->is_const) return;  // constants and local procedures need no code
     std::vector<llvm::Value*> vals;
     if (d->values.size() == 1 && d->names.size() > 1) {
-      llvm::Value* tuple = emit_call(static_cast<Call*>(d->values[0]));
+      llvm::Value* tuple = rvalue(d->values[0]);
       Type* tt = d->values[0]->type;
       for (size_t i = 0; i < d->names.size(); ++i)
         vals.push_back(convert(b_.CreateExtractValue(tuple, i), tt->elems[i], d->syms[i]->type));
@@ -1229,7 +1228,7 @@ class CodeGen {
       if (a->rhs.size() == 1 && a->lhs.size() > 1) {
         std::vector<llvm::Value*> addrs;
         for (Expr* l : a->lhs) addrs.push_back(lvalue(l));
-        llvm::Value* tuple = emit_call(static_cast<Call*>(a->rhs[0]));
+        llvm::Value* tuple = rvalue(a->rhs[0]);
         Type* tt = a->rhs[0]->type;
         for (size_t i = 0; i < a->lhs.size(); ++i)
           b_.CreateStore(convert(b_.CreateExtractValue(tuple, i), tt->elems[i], a->lhs[i]->type), addrs[i]);
@@ -1490,20 +1489,17 @@ class CodeGen {
     b_.SetInsertPoint(end_bb);
   }
 
+  // The value a return statement gives for results `rets` (a tuple if several).
+  llvm::Value* return_value(Return* r, const std::vector<Type*>& rets) {
+    if (rets.empty()) return nullptr;
+    if (rets.size() == 1 || r->values.size() == 1) return rvalue(r->values[0]);
+    llvm::Value* agg = llvm::UndefValue::get(lt(T.tuple(rets)));
+    for (size_t i = 0; i < rets.size(); ++i) agg = b_.CreateInsertValue(agg, rvalue(r->values[i]), i);
+    return agg;
+  }
+
   void emit_return(Return* r) {
-    const auto& rets = proc_->type->returns;
-    llvm::Value* ret = nullptr;
-    if (rets.size() == 1) {
-      ret = rvalue(r->values[0]);
-    } else if (rets.size() > 1) {
-      if (r->values.size() == 1) {
-        ret = emit_call(static_cast<Call*>(r->values[0]));
-      } else {
-        llvm::Value* agg = llvm::UndefValue::get(lt(T.tuple(rets)));
-        for (size_t i = 0; i < rets.size(); ++i) agg = b_.CreateInsertValue(agg, rvalue(r->values[i]), i);
-        ret = agg;
-      }
-    }
+    llvm::Value* ret = return_value(r, proc_->type->returns);
     emit_defers_down_to(0);
     if (terminated()) return;
     if (proc_->type->c_call) emit_c_ret(ret);

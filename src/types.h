@@ -51,6 +51,7 @@ struct StructField {
   Expr* default_value = nullptr;  // constant expression or null
   bool uninit = false;            // `= ---`
   bool is_using = false;          // `using name: T;` - T's members are also members of the enclosing struct
+  bool is_as = false;             // `#as name: T;` - the struct converts implicitly to T (this member)
   bool anonymous = false;         // `struct { ... }` / `union { ... }` member without a name: its members are
                                   // accessed as if they were members of the enclosing struct
   int place = -1;                 // `#place m;` before this member: it starts at the offset of field `place`

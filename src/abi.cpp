@@ -502,9 +502,22 @@ AbiArg CAbiLowering::riscv_arg(Type* t, bool is_return) {
 // ---------------------------------------------------------------- signatures
 
 AbiSignature CAbiLowering::classify(const Type* proc) {
+  // C varargs (a #foreign procedure's last parameter `..`): the parameters
+  // before it are the fixed ones; the variadic arguments (promoted by sema)
+  // follow them as they are. Arm passes everything of a variadic call by the
+  // base standard, also with hard float.
+  bool variadic = proc->vararg >= 0;
+  CAbi saved_abi = abi_;
+  if (variadic && abi_ == CAbi::AAPCS_VFP) abi_ = CAbi::AAPCS;
+  struct Restore {
+    CAbi& a;
+    CAbi v;
+    ~Restore() { a = v; }
+  } restore{abi_, saved_abi};
+  std::vector<Type*> fixed(proc->params.begin(), variadic ? proc->params.begin() + proc->vararg : proc->params.end());
   AbiSignature s;
   bool has_aggregate = false;
-  for (Type* p : proc->params) has_aggregate |= is_aggregate(p);
+  for (Type* p : fixed) has_aggregate |= is_aggregate(p);
   if (!proc->returns.empty()) has_aggregate |= is_aggregate(proc->returns[0]);
   if (has_aggregate && abi_ == CAbi::None)
     throw std::runtime_error("passing or returning structs by value in #c_call procedures is not supported on this target");
@@ -523,7 +536,7 @@ AbiSignature CAbiLowering::classify(const Type* proc) {
 
   int free_int = 6, free_sse = 8;
   if (s.ret.kind == AbiArg::Indirect) --free_int;
-  for (Type* p : proc->params) {
+  for (Type* p : fixed) {
     AbiArg a;
     switch (abi_) {
       case CAbi::X86_64_SysV: {
@@ -567,7 +580,7 @@ AbiSignature CAbiLowering::classify(const Type* proc) {
         break;
     }
   }
-  s.fn_type = llvm::FunctionType::get(ret, irs, false);
+  s.fn_type = llvm::FunctionType::get(ret, irs, variadic);
   return s;
 }
 

@@ -84,6 +84,7 @@ class Cloner {
         auto* s = as<StructDef>(e);
         auto* n = ast_.make<StructDef>(e->loc);
         n->is_union = s->is_union;
+        n->modify = block(s->modify);
         for (Decl* d : s->params) n->params.push_back(decl(d));
         for (Decl* d : s->members) n->members.push_back(decl(d));
         return n;
@@ -198,7 +199,11 @@ class Cloner {
       }
       case NK::Break:
       case NK::Continue:
-        return ast_.make<BreakContinue>(s->kind, s->loc, as<BreakContinue>(s)->label);
+      {
+        auto* n = ast_.make<BreakContinue>(s->kind, s->loc, as<BreakContinue>(s)->label);
+        n->backtick = as<BreakContinue>(s)->backtick;
+        return n;
+      }
       case NK::Defer: {
         auto* n = ast_.make<Defer>(s->loc, stmt(as<Defer>(s)->body));
         n->backtick = as<Defer>(s)->backtick;
@@ -271,6 +276,7 @@ class Cloner {
     n->is_using = d->is_using;
     n->is_vararg = d->is_vararg;
     n->is_baked = d->is_baked;
+    n->is_as = d->is_as;
     n->auto_bake = d->auto_bake;
     n->is_global = d->is_global;
     n->backtick = d->backtick;

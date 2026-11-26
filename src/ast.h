@@ -176,6 +176,7 @@ struct Call : Expr {
   bool no_init = false;              // New / NewArray with `initialized = false`
   bool spread_args = false;          // print / sprint: resolved_args[1] is a `..array` of Any
   bool force_inline = false;         // `inline f(x)`: the call is inlined
+  std::vector<Expr*> c_varargs;      // a call of a #foreign procedure with C varargs: the variadic arguments
   Call(SourceLoc l, Expr* c) : Expr(NK::Call, l), callee(c) {}
 };
 
@@ -273,6 +274,7 @@ struct StructDef : Expr {
   std::vector<Decl*> params;  // `struct ($T: Type, $N: int)`: a polymorphic struct
   std::vector<Decl*> members;
   bool is_union = false;
+  Block* modify = nullptr;  // `struct ($T: Type) #modify { ... } { ... }`: runs for each instance
   Type* struct_type = nullptr;
   explicit StructDef(SourceLoc l) : Expr(NK::StructDef, l) {}
 };
@@ -405,6 +407,7 @@ struct Decl : Stmt {
   bool is_global = false;
   bool backtick = false;    // `` `x := v; `` in an #expand macro: declared in the caller's scope
   bool add_context = false; // `#add_context name: T = v;`: a member added to Context
+  bool is_as = false;       // struct member `#as [using] name: T;`
   Expr* insert = nullptr;   // a struct member `#insert expr;` (no names): members made by sema
   // Struct members: `#place name;` (no names, place_name set): the members after it start at
   // member `name`'s offset; `x: T #align N;`: member x's offset is a multiple of N.
@@ -493,6 +496,7 @@ struct BreakContinue : Stmt {
   std::string label;
   Stmt* target = nullptr;  // sema: For or While
   MacroExpansion* leave = nullptr;  // sema: `break x` of a for_expansion loop leaves its expansion instead
+  bool backtick = false;  // `` `break `` / `` `continue `` in an #expand macro: of the caller's loop
   BreakContinue(NK k, SourceLoc l, std::string lab) : Stmt(k, l), label(std::move(lab)) {}
 };
 

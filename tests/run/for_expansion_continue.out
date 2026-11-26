@@ -1,0 +1,4 @@
+1 2 3 | [after 0] [after 1] 21 22 23 | [after 2] [after 3] 
+[after 0] [after 1] [after 0] [after 1] [after 0] [after 1] [after 0] [after 1] [after 0] [after 1] 
+count 5
+24

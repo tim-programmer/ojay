@@ -1,0 +1,7 @@
+entity 1 hero
+{{1, renamed}, 50}
+entity 2 dragon
+{2, big dragon} 100
+entity 7 made
+5
+renamed big dragon 

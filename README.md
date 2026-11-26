@@ -297,6 +297,14 @@ Implemented:
   in overloading (an equally good non-polymorphic overload wins) and work as
   operators and across modules; an instance is checked in the template's
   scope, and only when a call actually uses it.
+* Polymorphic procedures as values: where a procedure type is expected (`f:
+  (int) -> int = square;`, an argument `apply(square, 9)` or `map(xs,
+  square)`, an assignment, a cast), the instance of that type is used.
+  Procedures with compile-time parameters must be baked first.
+* A type variable introduced in the (first) return type, `convert :: (x:
+  $T) -> $R`, takes the type the call's result is expected to have: `a:
+  float = convert(7);`, an assignment, a typed parameter, a `return`, the
+  other operand of an arithmetic operator. Without one it is an error.
 * Type constraints: in `(e: *$T/Entity)` the type bound to `T` must be
   `Entity` or a struct with a `using` member that is (or `using`s) an
   `Entity`; `$T/Vec` with a polymorphic struct `Vec` accepts its instances;
@@ -320,13 +328,21 @@ Implemented:
   with default and named parameters (`Buffer(int, FILL = 7)`). Instances are
   cached by their parameter values, so `Vector(float32, 1 + 2)` is the same
   type, and are named like `Vector(float32, 3)` in diagnostics and `print`.
+  The parameters of an instance are constants of its values too: `v.N`,
+  `table.Key_Type`.
 * Operator overloading: `operator + :: (a: V, b: V) -> V {...}` for binary
   operators, comparisons (`!=` falls back to `operator ==`), unary `-`,
   compound assignment (`operator +=`, else `a = a + b`), `#symmetric`, and
   indexing with `operator []`, `operator []=` and `operator *[]`
-* `using`: struct members (`using pos: Vec2;`), parameters
+* `using`: struct members (`using pos: Vec2;`, also pointers: `using
+  transform: *Transform;` makes `e.x` mean `e.transform.x`), parameters
   (`(using e: *Entity)`), local declarations (`using e := ...;`), and
-  `using x;` / `using Enum_Type;` statements
+  `using x;` / `using Enum_Type;` statements, also at top level (for the
+  whole program or module, or with `#scope_file` the file)
+* `#as` struct members: with `#as using base: Entity;` a `Player` converts
+  implicitly to an `Entity` (its `base`), and a `*Player` to a `*Entity`
+  (`*p.base`), also through several levels; `#as value: float;` makes a
+  struct usable as a `float`.
 * Statements: `if`/`else` (with or without `then`), `if x == { case ...; }`
   switches (on integers, enums, bools and strings) with `#through` and
   `#complete`, `while`, `for` over ranges, arrays and values with a
@@ -417,6 +433,17 @@ Implemented:
     unary `-` and `==`, `dot`, `cross`, `length`, `length_squared`,
     `distance`, `normalize` (leaves vectors shorter than `epsilon`
     unchanged) and `lerp` of vectors.
+  * Hash_Table (all Jai, `src/modules/Hash_Table.jai`, `#import
+    "Hash_Table"`): `Table(Key_Type, Value_Type)` with open addressing,
+    `init`, `deinit`, `table_add`, `table_set`, `table_find` (value and
+    whether found), `table_find_pointer`, `table_contains`, `table_remove`,
+    `find_or_add`, `table_reset`, `table_ensure_space`, `get_hash`
+    overloads and `fnv1a_hash`; `for table` gives the values as `it` (`for
+    *` pointers to them) and the keys as `it_index`, and `remove it` works.
+    Keys can be integers, enums, bools, floats, pointers and strings (Jai's
+    custom hash and compare procedure parameters are not supported); a table
+    allocates from `context.allocator` (or the `allocator` set before the
+    first add).
   Differences from Jai's modules: `array_reserve` and `String_Builder`
   memory come from the array's allocator (`context.allocator` when it first
   grows), `String_Builder` is one growing buffer rather than a chain of
@@ -559,7 +586,16 @@ on_event :: (e: Event) -> s32 #c_call #program_export "app_on_event" { ... }  //
 * Not C types, so rejected as a parameter or result: `string`, array views,
   dynamic arrays, `Any`, `Type` and fixed arrays (C passes arrays as
   pointers; put the array in a struct). Also rejected: more than one return
-  value and variadic `#foreign` procedures (C varargs).
+  value.
+* C varargs: a `#foreign` procedure whose last parameter is `args: ..` (or
+  `..Any`), like `printf :: (format: *u8, args: ..) -> s32 #foreign libc;`,
+  takes any number of further arguments, passed as C passes them: integers
+  narrower than 32 bits and bools as `int`, `float32` as `double`, an
+  integer constant as `int` if it fits (as in C), else `s64`; pointers and
+  wider integers as they are. Strings, structs and arrays cannot be passed
+  (pass `s.data` or `to_c_string(s)`). On Arm the whole call uses the base
+  (soft-float) convention, as C does for variadic functions. `#c_call`
+  procedures written in Jai cannot be variadic.
 * Structs with `#align` members are C structs with `_Alignas` members, and
   overlapping `#place` members are an anonymous union in C
   (`a: s64; #place a; lo, hi: u32;` is
@@ -810,8 +846,9 @@ each_even(values, #code { total += elem; });
 add :: (a: $T, b: T) -> T #modify { if T == s16  T = s64; return true; } { return a + b; }
 ```
 
-* `#code expr` and `#code { statements }` are constants of type `Code`: the
-  syntax stays unchecked until it is inserted. A `Code` value can be a
+* `#code expr`, `#code { statements }` and `#code` of one bare statement
+  (`#code counter += 1;`, `#code n := 3;`, `#code if x print("x");`) are
+  constants of type `Code`: the syntax stays unchecked until it is inserted. A `Code` value can be a
   constant, an argument (of a macro, or a `$`-baked parameter, which gives
   each piece of code its own instance) or passed through `#run`; it cannot be
   printed or converted to `Any`.
@@ -823,6 +860,9 @@ add :: (a: $T, b: T) -> T #modify { if T == s16  T = s64; return true; } { retur
   declarations are known) and in struct bodies (members, also in polymorphic
   structs). Strings are parsed as source text; errors in them point into a
   file named `<inserted at file.jai:LINE>`, followed by the `#insert` site.
+  `#insert -> string { body }` is short for `#insert #run () -> string {
+  body }();` (also `-> Code`); in a polymorphic procedure or struct the
+  body sees the compile-time parameters (`for 1..N ...`).
 * `name :: (params) -> T #expand { ... }` is a macro: every call inlines a
   copy of the body. Parameters become locals of the caller, evaluated once,
   in order; `Code` parameters stay constants, so `#insert body;` works on
@@ -832,12 +872,16 @@ add :: (a: $T, b: T) -> T #modify { if T == s16  T = s64; return true; } { retur
   caller's scope; nested in the body (e.g. in its loop, as a `for_expansion`
   does) in that block, where `Code` from the caller inserted inside the block
   sees it. A
-  plain `return v;` ends the expansion with value `v`; `` `return`` returns
+  plain `return v;` ends the expansion with value `v` (a macro can return
+  several values, `-> int, int`, used like a procedure's: `q, r :=
+  divmod(17, 5);`); `` `return`` returns
   from the caller, which for a macro expanded by another macro is that
   macro's expansion. `` `defer`` (at the top level of the body) defers to
   the end of the caller's scope. `break` and `continue` work on the caller's
   loops, and in inserted code on the innermost loop (the macro's own, as in a
-  `for_expansion`). Macros can call macros; a compile-time parameter with
+  `for_expansion`). `` `break`` and `` `continue`` in the body (also inside
+  the macro's own loops) break or continue the caller's innermost loop
+  around the call. Macros can call macros; a compile-time parameter with
   `#if` ends recursion, and an expansion more than 100 levels deep is an
   error. Macros work in `#run` code too. Like polymorphic procedures, a
   macro's body is only checked where it is expanded.
@@ -850,7 +894,11 @@ add :: (a: $T, b: T) -> T #modify { if T == s16  T = s64; return true; } { retur
   (`return false, "why";`): `false` rejects the candidate, so overload
   resolution tries the others, and the message appears in the error.
   Assigning a type variable (`T = s64;`) changes the instance. Compile-time
-  values (`$N`) are constants in it.
+  values (`$N`) are constants in it. A polymorphic struct can have one too,
+  between its parameters and its body (`Acc :: struct ($T: Type) #modify {
+  ... } { total: T; }`): it runs for each new set of parameters, can reject
+  them (an error at the use), and `T = s64;` makes `Acc(u8)` the same type
+  as `Acc(s64)`.
 * Source locations: `Source_Code_Location` (`fully_pathed_filename`,
   `line_number`, `character_number`) is visible everywhere.
   `#location(x)` is a constant for where `x` is declared: a procedure (the
@@ -895,7 +943,9 @@ add :: (a: $T, b: T) -> T #modify { if T == s16  T = s64; return true; } { retur
   takes one). The loop has its own scope, where the macro's `` `it`` and
   `` `it_index`` are declared; with `for x, i:` they are named `x` and `i`.
   `break`, `continue` and `return` in the body work as in other inserted
-  code, and `break x` leaves the loop named `x`. `remove it` in the body runs
+  code, `break x` leaves the loop named `x`, and `continue x` continues the
+  macro's loop around the `#insert body;` of loop `x` (running the defers on
+  the way). `remove it` in the body runs
   the `remove` code of the `#insert (remove = { ... }) body;` that inserted
   it, in the macro's scope; without one it is an error.
 * `remove it` (or `remove x` for a named iterator) in a `for` over a dynamic

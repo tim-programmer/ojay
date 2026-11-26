@@ -79,6 +79,7 @@ struct MacroCtx {
   bool caller_in_run_operand = false;  // the caller is the expression of a #run
   int caller_defer_depth = 0;
   Scope* body_scope = nullptr;         // the scope of the expansion's top level
+  Stmt* caller_loop = nullptr;         // the caller's innermost loop around the call (`break / `continue)
   // The expansion of a for_expansion for `for x, i: ...`: its `it / `it_index declare x and i.
   std::string rename_it, rename_index;
 };
@@ -181,6 +182,7 @@ class Checker : public InterpHost {
   // the #code values (ids are index + 1).
   std::vector<MacroCtx> macros_;
   std::unordered_map<Type*, ProcLit*> initializers_;  // initializer_of(T)
+  Type* result_hint_ = nullptr;  // the type the result of the call being resolved is expected to have
   std::unordered_set<Symbol*> constant_macro_params_;  // macro parameters given a constant: is_constant() is true
   int next_macro_id_ = 0;
   std::vector<CodeEntry> codes_;
@@ -211,6 +213,10 @@ class Checker : public InterpHost {
     size_t inserts_depth;
   };
   std::vector<RemoveTarget> remove_targets_;
+  std::unordered_map<const Block*, For*> for_bodies_;  // the body Code of a for over a for_expansion -> the loop
+  // While a for_expansion's #insert of a loop's body is checked: the loop, and
+  // the loop of the macro around that #insert (null if none), which `continue x` continues.
+  std::vector<std::pair<For*, Stmt*>> body_insert_loops_;
   struct InsertRemove {
     Block* code;
     Context ctx;  // where the #insert is (the macro's context)
@@ -968,6 +974,7 @@ class Checker : public InterpHost {
   // belong to the file of the statement that made them (cur_file_scope_).
   void collect(const std::vector<Stmt*>& stmts, bool nested) {
     std::vector<std::pair<StaticIf*, Scope*>> static_ifs;
+    std::vector<std::pair<UsingStmt*, Scope*>> top_usings;
     std::vector<std::pair<Insert*, Scope*>> inserts;
     for (Stmt* s : stmts) {
       Scope* fs = lazy_collect_ ? scope_ : nested ? cur_file_scope_ : file_scope_for(s->loc.file);
@@ -1004,6 +1011,9 @@ class Checker : public InterpHost {
           break;  // handled by the driver
         case NK::StaticIf:
           static_ifs.push_back({static_cast<StaticIf*>(s), fs});
+          break;
+        case NK::Using:  // `using x;` at top level: once the unit's declarations are known
+          top_usings.push_back({static_cast<UsingStmt*>(s), fs});
           break;
         case NK::Insert:
           inserts.push_back({static_cast<Insert*>(s), fs});
@@ -1054,6 +1064,20 @@ class Checker : public InterpHost {
         cur_file_scope_ = saved_fs;
         return 0;
       });
+    }
+    // A top-level `using` applies to the whole unit (its file with #scope_file).
+    for (auto [u, fs] : top_usings) {
+      ContextGuard guard(*this);
+      scope_ = fs;
+      cur_file_scope_ = fs;
+      Scope* into = u->vis == ScopeVis::File ? fs : unit;
+      size_t before = fs->usings.size();
+      check_using(u);
+      cur_file_scope_ = saved_fs;
+      if (into != fs && fs->usings.size() > before) {
+        into->usings.push_back(fs->usings.back());
+        fs->usings.pop_back();
+      }
     }
   }
 
@@ -1485,19 +1509,22 @@ class Checker : public InterpHost {
         }
       }
     }
-    if (p->is_macro && rets.size() > 1)
-      fail(p->returns.size() > 1 ? p->returns[1].loc : p->loc,
-           "#expand macros with more than one return value are not supported yet");
     if (p->is_macro && p->c_call) fail(p->loc, "an #expand macro cannot be #c_call");
     p->type = T.proc(params, rets, p->c_call, vararg_index(p));
-    if (p->is_foreign && p->variadic) fail(p->loc, "variadic #foreign procedures are not supported yet");
+    if (p->variadic && p->c_call) {  // C varargs: `args: ..` (or ..Any) as the last parameter
+      int va = vararg_index(p);
+      if (!p->is_foreign)
+        fail(p->params[va]->loc, "a #c_call procedure written in Jai cannot be variadic (only #foreign ones can: C varargs)");
+      if (va != (int)p->params.size() - 1)
+        fail(p->params[va]->loc, "the C variadic parameter must be the last parameter of a #foreign procedure");
+    }
     if (p->program_export) {
       if (!p->c_call) fail(p->loc, "#program_export procedures must be #c_call (C calls them with the C calling convention)");
       if (p->is_foreign) fail(p->loc, "a #foreign procedure cannot be #program_export");
     }
     if (p->c_call) {
       for (size_t i = 0; i < params.size(); ++i)
-        check_c_type(params[i], p->params[i]->loc, false);
+        if (!p->params[i]->is_vararg) check_c_type(params[i], p->params[i]->loc, false);
       if (rets.size() > 1) fail(p->loc, "#c_call/#foreign procedures cannot return multiple values");
       if (rets.size() == 1) check_c_type(rets[0], p->returns.empty() ? p->loc : p->returns[0].loc, true);
     }
@@ -1653,16 +1680,18 @@ class Checker : public InterpHost {
         f.name = d->names[i].name;
         f.anonymous = f.name.empty();
         f.is_using = d->is_using;
+        f.is_as = d->is_as;
+        if (f.is_as && d->names.size() != 1) fail(d->loc, "#as needs a declaration of one member");
         if (!f.anonymous && !names.insert(f.name).second)
           fail(d->names[i].loc, "duplicate member '", f.name, "'");
         if (f.anonymous || f.is_using) {
-          if (!ft || ft->kind != TypeKind::Struct) {
-            if (ft && ft->is_pointer() && f.is_using)
-              fail(d->loc, "'using' on a pointer member is not supported yet");
-            fail(d->loc, "'using' needs a struct member");
-          }
-          complete_type(ft, d->loc);
-          for (const std::string& n : member_names(ft))
+          // `using p: *T;` brings in the members of the struct p points to.
+          Type* st = ft && f.is_using && ft->is_pointer() ? ft->elem : ft;
+          if (!st || st->kind != TypeKind::Struct)
+            fail(d->loc, "'using' needs a struct member (or a pointer to a struct)");
+          if (st == t) fail(d->loc, "'using' of a pointer to the struct itself");
+          complete_type(st, d->loc);
+          for (const std::string& n : member_names(st))
             if (!names.insert(n).second) fail(d->loc, "duplicate member '", n, "'");
         }
         f.uninit = d->uninit;
@@ -1941,12 +1970,31 @@ class Checker : public InterpHost {
         auto* bc = static_cast<BreakContinue*>(s);
         const char* what = s->kind == NK::Break ? "break" : "continue";
         if (defer_depth_ > 0) fail(s->loc, "'", what, "' is not allowed inside defer");
+        if (bc->backtick) {  // `break / `continue: the loop around the macro's call
+          if (macros_.empty()) fail(s->loc, "`", what, " is only allowed in the body of an #expand macro");
+          const MacroCtx& m = macros_.back();
+          if (!bc->label.empty()) fail(s->loc, "`", what, " takes no label");
+          if (!m.caller_loop)
+            fail(s->loc, "`", what, ": macro '", m.exp->macro->name, "' is not called inside a loop",
+                 m.caller_in_run_operand ? " (of the same #run expression)" : "", " (or the call is inside a defer)");
+          bc->target = m.caller_loop;
+          return;
+        }
         if (!bc->label.empty()) {  // `break x` of a loop with a for_expansion: leaves the expansion
           for (auto it = remove_targets_.rbegin(); it != remove_targets_.rend(); ++it) {
             if (it->loop->it_name != bc->label) continue;
             if (!it->expanded) break;
-            if (s->kind == NK::Continue)
-              fail(s->loc, "'continue ", bc->label, "' of a loop with a for_expansion is not supported yet");
+            if (s->kind == NK::Continue) {  // the next iteration of the macro's loop around `#insert body`
+              for (auto b = body_insert_loops_.rbegin(); b != body_insert_loops_.rend(); ++b) {
+                if (b->first != it->loop) continue;
+                if (!b->second)
+                  fail(s->loc, "'continue ", bc->label, "': the for_expansion of this loop does not insert the body "
+                               "inside a loop of its own");
+                bc->target = b->second;
+                return;
+              }
+              fail(s->loc, "'continue ", bc->label, "' must be in the body of that loop");
+            }
             auto x = for_expansions_.find(it->loop);
             if (x == for_expansions_.end()) break;
             bc->leave = x->second;
@@ -2348,6 +2396,7 @@ class Checker : public InterpHost {
     }
     auto* code = ast_.make<CodeLit>(f->body->loc);
     code->code_block = body;
+    for_bodies_[body] = f;
     Expr* flags = flags_arg();
     auto* callee = ast_.make<Ident>(f->loc, "for_expansion");
     auto* call = ast_.make<Call>(f->loc, callee);
@@ -2447,6 +2496,8 @@ class Checker : public InterpHost {
       return false;
     }
     if (from->distinct_of || to->distinct_of) return false;
+    if (!as_path(from, to).empty()) return true;  // #as members
+    if (from->is_pointer() && to->is_pointer() && !as_path(from->elem, to->elem).empty()) return true;
     if (from->kind == TypeKind::Int && to->kind == TypeKind::Int) {
       if (from->is_signed == to->is_signed) return from->bits < to->bits;
       return !from->is_signed && to->is_signed && from->bits < to->bits;
@@ -2463,6 +2514,54 @@ class Checker : public InterpHost {
       return from->array_kind != ArrayKind::View && from->elem == to->elem;
     }
     return false;
+  }
+
+  // The #as members that lead from struct `from` to a value of type `to`
+  // (field indices, outermost first; empty if none).
+  std::vector<int> as_path(Type* from, Type* to, int depth = 0) {
+    if (from->kind != TypeKind::Struct || depth > 16) return {};
+    complete_type(from, SourceLoc{});
+    for (size_t i = 0; i < from->fields.size(); ++i) {
+      const StructField& f = from->fields[i];
+      if (!f.is_as) continue;
+      if (f.type == to) return {(int)i};
+      std::vector<int> rest = as_path(f.type, to, depth + 1);
+      if (!rest.empty()) {
+        rest.insert(rest.begin(), (int)i);
+        return rest;
+      }
+    }
+    return {};
+  }
+
+  // A conversion through #as members: `d` (a Derived) as a Base is `d.base`,
+  // and a *Derived as a *Base is `*d.base`. Returns false if there is none.
+  bool apply_as(Expr*& e, Type* to) {
+    Type* from = e->type;
+    bool ptr = from->is_pointer() && to->is_pointer();
+    std::vector<int> path = ptr ? as_path(from->elem, to->elem) : as_path(from, to);
+    if (path.empty()) return false;
+    Type* t = ptr ? from->elem : from;
+    Expr* cur = e;
+    bool through = ptr;
+    for (int i : path) {
+      const StructField& f = t->fields[i];
+      auto* m = ast_.make<Member>(e->loc, cur, f.name);
+      m->mkind = MemberKind::Field;
+      m->field_path = {i};
+      m->through_pointer = through;
+      m->type = f.type;
+      through = false;
+      cur = m;
+      t = f.type;
+    }
+    if (ptr) {
+      auto* a = ast_.make<Unary>(e->loc, UnOp::AddrOf, cur);
+      a->type = to;
+      cur = a;
+    }
+    e = cur;
+    return true;
   }
 
   void coerce(Expr*& e, Type* to) {
@@ -2514,6 +2613,7 @@ class Checker : public InterpHost {
       }
       fail(e->loc, "cannot use null as ", type_name(to));
     }
+    if (apply_as(e, to)) return;
     if (implicit_ok(from, to)) {
       e = ast_.make<ImplicitConv>(e->loc, e, to);
       return;
@@ -3061,9 +3161,15 @@ class Checker : public InterpHost {
       case SymKind::Builtin: fail(id->loc, "'", id->name, "' is a built-in procedure and can only be called");
       case SymKind::Library: return T.void_t;  // only meaningful in #foreign
       case SymKind::Module: fail(id->loc, "module '", id->name, "' cannot be used as a value");
-      case SymKind::PolyProc:
-        fail(id->loc, "'", id->name, "' is a polymorphic procedure; using it as a value without calling it "
-             "(polymorphic procedure values) is not supported yet");
+      case SymKind::PolyProc: {  // a value: the instance for the procedure type expected here
+        if (!hint || !hint->is_proc())
+          fail(id->loc, "'", id->name, "' is a polymorphic procedure; to use it as a value, use it where a procedure "
+               "type is expected (f: (int) -> int = ", id->name, ";), which picks its instance");
+        Symbol* inst = poly_for_type(s, hint, id->loc);
+        id->sym = inst;
+        use_instance(inst, id->loc);
+        return inst->type;
+      }
       case SymKind::PolyStruct:
         fail(id->loc, "'", id->name, "' is a polymorphic struct; give its parameters: ", id->name, "(...)");
     }
@@ -3426,12 +3532,20 @@ class Checker : public InterpHost {
   }
 
   // Names reachable as members of struct t, including those of anonymous members.
+  // The struct whose members field f brings in (anonymous or `using` members,
+  // also `using p: *T`), or null.
+  static Type* used_struct(const StructField& f) {
+    if (!f.anonymous && !f.is_using) return nullptr;
+    Type* t = f.is_using && f.type->is_pointer() ? f.type->elem : f.type;
+    return t->kind == TypeKind::Struct ? t : nullptr;
+  }
+
   std::vector<std::string> member_names(Type* t) {
     std::vector<std::string> out;
     for (auto& f : t->fields) {
       if (!f.anonymous) out.push_back(f.name);
-      if (f.anonymous || f.is_using)
-        for (auto& n : member_names(f.type)) out.push_back(n);
+      if (Type* u = used_struct(f))
+        for (auto& n : member_names(u)) out.push_back(n);
     }
     return out;
   }
@@ -3443,8 +3557,8 @@ class Checker : public InterpHost {
       auto& f = t->fields[i];
       path.push_back((int)i);
       if (!f.anonymous && f.name == name) return f.type;
-      if (f.anonymous || f.is_using)
-        if (Type* ft = find_field(f.type, name, path)) return ft;
+      if (Type* u = used_struct(f))  // (a `using` pointer: the path continues in the struct it points to)
+        if (Type* ft = find_field(u, name, path)) return ft;
       path.pop_back();
     }
     return nullptr;
@@ -3478,10 +3592,12 @@ class Checker : public InterpHost {
         complete_type(bt, m->loc);
         if (Type* ft = find_field(bt, m->name, m->field_path)) {
           m->mkind = MemberKind::Field;
+          split_pointer_hops(m, bt);
           if (!m->through_pointer && m->base->is_const() && m->base->cv.kind == ConstValue::Aggregate)
             m->cv = const_field(m->base->cv, bt, m->field_path);
           return ft;
         }
+        if (Type* pt = struct_param_member(m, bt)) return pt;
         fail(m->loc, "struct ", type_name(bt), " has no member '", m->name, "'");
       }
       case TypeKind::Array:
@@ -3527,6 +3643,54 @@ class Checker : public InterpHost {
         fail(m->loc, "Any has no member '", m->name, "'");
       default:
         fail(m->loc, "type ", type_name(bt), " has no members");
+    }
+  }
+
+  // `x.N` / `x.T` for an instance of a polymorphic struct: its parameter (a
+  // constant), and `x.C` for a constant C of the struct.
+  Type* struct_param_member(Member* m, Type* st) {
+    auto it = poly_struct_types_.find(st);
+    if (it != poly_struct_types_.end())
+      for (const PolyBinding& x : it->second.args)
+        if (x.name == m->name) {
+          m->cv = x.is_value ? x.value : ConstValue::of_type(x.type);
+          return x.is_value ? x.type : T.type_t;
+        }
+    if (Symbol* k = struct_constant(st, m->name, m->loc)) {
+      resolve(k);
+      if (k->kind == SymKind::Const || k->kind == SymKind::Type) {
+        m->cv = k->cv;
+        return k->kind == SymKind::Type ? T.type_t : k->type;
+      }
+    }
+    return nullptr;
+  }
+
+  // A member path through `using p: *T` members: `e.x` becomes `e.p.x`, so
+  // each Member's path stays inside one struct.
+  void split_pointer_hops(Member* m, Type* bt) {
+    for (;;) {
+      Type* t = bt;
+      size_t hop = m->field_path.size();
+      for (size_t i = 0; i + 1 < m->field_path.size(); ++i) {
+        const StructField& f = t->fields[m->field_path[i]];
+        if (f.type->is_pointer()) {
+          hop = i;
+          break;
+        }
+        t = f.type;
+      }
+      if (hop == m->field_path.size()) return;
+      const StructField& pf = t->fields[m->field_path[hop]];
+      auto* inner = ast_.make<Member>(m->loc, m->base, pf.name);
+      inner->mkind = MemberKind::Field;
+      inner->through_pointer = m->through_pointer;
+      inner->field_path.assign(m->field_path.begin(), m->field_path.begin() + (long)hop + 1);
+      inner->type = pf.type;
+      m->base = inner;
+      m->through_pointer = true;
+      m->field_path.erase(m->field_path.begin(), m->field_path.begin() + (long)hop + 1);
+      bt = pf.type->elem;
     }
   }
 
@@ -3788,7 +3952,9 @@ class Checker : public InterpHost {
   }
 
   static bool is_poly_proc_decl(const Symbol* s) {
-    return is_proc_decl(s->decl, s->decl_index) && static_cast<ProcLit*>(s->decl->values[s->decl_index])->is_poly;
+    if (!is_proc_decl(s->decl, s->decl_index)) return false;
+    auto* p = static_cast<ProcLit*>(s->decl->values[s->decl_index]);
+    return p->is_poly || p->poly_returns;
   }
   static bool is_poly_struct_decl(const Symbol* s) {
     const Decl* d = s->decl;
@@ -3994,10 +4160,10 @@ class Checker : public InterpHost {
   }
 
   void validate_poly_proc(ProcLit* p) {
-    for (auto& r : p->returns)
-      if (Ident* id = find_poly(r.type_expr))
-        fail(id->loc, "'$", id->name, "' in a return type is not supported yet; introduce type variables in the ",
-             "parameters and write plain '", id->name, "' in the return type");
+    for (size_t i = 1; i < p->returns.size(); ++i)
+      if (Ident* id = find_poly(p->returns[i].type_expr))
+        fail(id->loc, "'$", id->name, "' can only be introduced in the first return type (its type comes from where "
+             "the call's result is used)");
     if (p->is_foreign) fail(p->loc, "a #foreign procedure cannot be polymorphic");
     for (Decl* d : p->params) {
       if (!d->is_baked && !d->auto_bake) continue;
@@ -4035,6 +4201,7 @@ class Checker : public InterpHost {
       if (d->is_baked || d->auto_bake) add(d->names[0].name, d->loc);
       for_each_poly(d->type_expr, visit);
     }
+    for (auto& r : p->returns) for_each_poly(r.type_expr, visit);  // `-> $R`: from the call's expected type
     return b;
   }
 
@@ -4336,10 +4503,26 @@ class Checker : public InterpHost {
       check(a, lambda_hint_);
       match_type(tmpl, l.pat, a->type, a, l.pname, b);
     }
+    // `-> $R`: the type the call's result is expected to have binds it.
+    if (!p->returns.empty() && find_poly(p->returns[0].type_expr)) {
+      Type* want = result_hint_;
+      if (want && !want->is_untyped() && want->kind != TypeKind::Any && want->kind != TypeKind::Void &&
+          want->kind != TypeKind::Tuple) {
+        IntLit at(loc, 0);
+        at.type = want;
+        match_type(tmpl, p->returns[0].type_expr, want, &at, "the result", b);
+      }
+    }
     for (auto& x : b)
-      if (!x.bound)
+      if (!x.bound) {
+        bool in_params = false;
+        for (Decl* d : p->params) in_params |= (d->is_baked && d->names[0].name == x.name) || mentions(d->type_expr, x.name);
+        if (!in_params)
+          fail(loc, "cannot infer '$", x.name, "' of '", p->name, "': it is introduced in the return type, and the "
+               "call's result is not used where a type is expected (e.g. `x: float = ", p->name, "(...)`)");
         fail(loc, "cannot infer '$", x.name, "' of '", p->name, "' from the arguments (", p->name, " :: ",
              proc_pattern_str(p), ")");
+      }
     check_constraints(tmpl, b, loc);
     run_modify(tmpl, b, loc);
     return b;
@@ -4403,6 +4586,44 @@ class Checker : public InterpHost {
     for (auto& f : t->fields)
       if ((f.is_using || f.anonymous) && uses_type(f.type, x)) return true;
     return false;
+  }
+
+  // The instance of polymorphic procedure `tmpl` whose type is procedure type
+  // `want`: its parameter (and result) patterns are matched against want's.
+  Symbol* poly_for_type(Symbol* tmpl, Type* want, SourceLoc loc) {
+    ProcLit* p = tmpl->proc;
+    for (Decl* d : p->params)
+      if (d->is_baked || d->auto_bake)
+        fail(loc, "polymorphic procedure '", tmpl->name, "' has compile-time parameter '$", d->names[0].name,
+             "', so it cannot be used as a value; bake it first (#bake_constants)");
+    if (p->params.size() != want->params.size() || p->returns.size() != want->returns.size() ||
+        p->variadic != (want->vararg >= 0) || p->c_call != want->c_call)
+      fail(loc, "polymorphic procedure '", tmpl->name, "' (", proc_pattern_str(p), ") does not fit ", type_name(want));
+    Bindings b = poly_vars(p);
+    IntLit at(loc, 0);
+    for (size_t i = 0; i < p->params.size(); ++i) {
+      Type* t = want->params[i];
+      Expr* pat = p->params[i]->type_expr;
+      if (p->params[i]->is_vararg) {
+        if (t->kind != TypeKind::Array) continue;
+        t = t->elem;
+      }
+      at.type = t;
+      if (pat) match_type(tmpl, pat, t, &at, p->params[i]->names[0].name, b);
+    }
+    for (size_t i = 0; i < p->returns.size(); ++i) {
+      at.type = want->returns[i];
+      match_type(tmpl, p->returns[i].type_expr, want->returns[i], &at, "the result", b);
+    }
+    for (auto& x : b)
+      if (!x.bound) fail(loc, "cannot infer '$", x.name, "' of '", tmpl->name, "' from ", type_name(want));
+    check_constraints(tmpl, b, loc);
+    run_modify(tmpl, b, loc);
+    Symbol* inst = instantiate_proc(tmpl, b, loc);
+    if (inst->type != want)
+      fail(loc, "'", tmpl->name, "' with ", bindings_desc(b), " has type ", type_name(inst->type), ", not ",
+           type_name(want));
+    return inst;
   }
 
   // The instance of polymorphic procedure `tmpl` for bindings `b`, with its
@@ -4525,6 +4746,7 @@ class Checker : public InterpHost {
       }
       b.push_back(x);
     }
+    if (sd->modify) run_modify_block(sd, tmpl->name, sd->modify, tmpl->scope, b, loc);
     auto key = std::make_pair((const Node*)sd, binding_key(b));
     auto it = poly_structs_.find(key);
     if (it != poly_structs_.end()) return it->second;
@@ -4636,9 +4858,12 @@ class Checker : public InterpHost {
       if (c.block) blk->stmts = static_cast<Block*>(clone_stmt(ast_, c.block))->stmts;
       else blk->stmts.push_back(ast_.make<ExprStmt>(c.expr->loc, clone_expr(ast_, c.expr)));
       if (ins->remove_code) insert_removes_.push_back({ins->remove_code, save(), in_run_operand_});
+      auto fb = c.block ? for_bodies_.find(c.block) : for_bodies_.end();
+      if (fb != for_bodies_.end()) body_insert_loops_.push_back({fb->second, loops_.empty() ? nullptr : loops_.back()});
       in_code_context(c, [&] {
         for (Stmt* x : blk->stmts) check_stmt(x);
       });
+      if (fb != for_bodies_.end()) body_insert_loops_.pop_back();
       if (ins->remove_code) insert_removes_.pop_back();
       return 0;
     });
@@ -4729,7 +4954,8 @@ class Checker : public InterpHost {
     bind_args(c, m->type, m);  // in the caller's context
     auto* body = ast_.make<Block>(c->loc);
     auto* x = ast_.make<MacroExpansion>(c->loc, m, body);
-    x->type = m->type->returns.empty() ? T.void_t : m->type->returns[0];
+    const auto& mrets = m->type->returns;
+    x->type = mrets.empty() ? T.void_t : mrets.size() == 1 ? mrets[0] : T.tuple(mrets);
     ContextGuard guard(*this);
     MacroCtx ctx;
     ctx.id = ++next_macro_id_;
@@ -4748,6 +4974,7 @@ class Checker : public InterpHost {
     // A bare break in the body may leave a loop of the caller, unless that
     // would cross a defer or the #run boundary.
     if (defer_depth_ > 0 || in_run_operand_) loops_.clear();
+    ctx.caller_loop = loops_.empty() ? nullptr : loops_.back();
     macros_.push_back(ctx);
     scope_ = ctx.body_scope;
     in_run_operand_ = false;
@@ -4848,14 +5075,15 @@ class Checker : public InterpHost {
   // (cached). The block becomes a procedure executed by the interpreter: the
   // type variables are its `Type` parameters, and each `return ok[, message];`
   // returns them along with the verdict. Compile-time values ($N) stay constants.
-  ModifyResult eval_modify(Symbol* tmpl, const Bindings& b, SourceLoc loc) {
-    ProcLit* p = tmpl->proc;
-    SourceLoc ml = p->modify->loc;
+  // Runs #modify block `modify` of `owner` (a polymorphic procedure or
+  // struct, declared in `tscope`) for bindings `b`.
+  ModifyResult eval_modify(const std::string& owner, Block* modify, Scope* tscope, const Bindings& b, SourceLoc loc) {
+    SourceLoc ml = modify->loc;
     Type* rt = T.new_struct("#modify result");
     rt->fields.push_back(StructField{"ok", T.bool_t});
     rt->fields.push_back(StructField{"message", T.string_t});
     auto* mp = ast_.make<ProcLit>(ml);
-    mp->name = "#modify of '" + p->name + "'";
+    mp->name = "#modify of '" + owner + "'";
     Bindings values;
     std::vector<Expr*> args;
     std::vector<std::string> vars;
@@ -4874,7 +5102,7 @@ class Checker : public InterpHost {
     }
     T.layout_struct(rt);
     mp->returns.push_back(ReturnSpec{"", type_const(rt, ml), ml});
-    mp->body = static_cast<Block*>(clone_stmt(ast_, p->modify));
+    mp->body = static_cast<Block*>(clone_stmt(ast_, modify));
     auto rewrite = [&](Return* r) {
       if (r->backtick || r->values.empty() || r->values.size() > 2)
         fail(r->loc, "#modify must return a bool, and optionally a message: return false, \"why\";");
@@ -4889,7 +5117,7 @@ class Checker : public InterpHost {
     ms->proc = mp;
     ms->state = Symbol::State::Resolved;
     ComptimeMode mode(*this, true, mp, false);
-    with_bindings(tmpl->scope, values, [&] {
+    with_bindings(tscope, values, [&] {
       define_proc(mp, /*for_codegen=*/false);
       return 0;
     });
@@ -4907,7 +5135,7 @@ class Checker : public InterpHost {
     r.message = es.at(1).s;
     for (size_t i = 0; i < vars.size(); ++i) {
       const ConstValue& t = es.at(2 + i);
-      if (t.kind != ConstValue::TypeV) fail(ml, "#modify of '", p->name, "' set '", vars[i], "' to null; it must be a type");
+      if (t.kind != ConstValue::TypeV) fail(ml, "#modify of '", owner, "' set '", vars[i], "' to null; it must be a type");
       r.types.push_back(t.t);
     }
     return r;
@@ -4916,19 +5144,23 @@ class Checker : public InterpHost {
   // Applies the #modify block of `tmpl` (if any) to the inferred bindings:
   // fails if it rejects them, and updates the type variables it changed.
   void run_modify(Symbol* tmpl, Bindings& b, SourceLoc loc) {
-    ProcLit* p = tmpl->proc;
-    if (!p->modify) return;
-    auto key = std::make_pair((const Node*)p, binding_key(b));
+    if (!tmpl->proc->modify) return;
+    run_modify_block(tmpl->proc, tmpl->proc->name, tmpl->proc->modify, tmpl->scope, b, loc);
+  }
+
+  void run_modify_block(const Node* owner, const std::string& name, Block* modify, Scope* tscope, Bindings& b,
+                        SourceLoc loc) {
+    auto key = std::make_pair(owner, binding_key(b));
     auto it = modify_results_.find(key);
     if (it == modify_results_.end()) {
-      ModifyResult r = with_note("in #modify of '" + p->name + "' with " + bindings_desc(b), [&] {
-        return eval_modify(tmpl, b, loc);
+      ModifyResult r = with_note("in #modify of '" + name + "' with " + bindings_desc(b), [&] {
+        return eval_modify(name, modify, tscope, b, loc);
       });
       it = modify_results_.emplace(key, std::move(r)).first;
     }
     const ModifyResult& r = it->second;
     if (!r.ok)
-      fail(loc, "#modify of '", p->name, "' rejected ", bindings_desc(b), r.message.empty() ? "" : ": ", r.message);
+      fail(loc, "#modify of '", name, "' rejected ", bindings_desc(b), r.message.empty() ? "" : ": ", r.message);
     size_t k = 0;
     for (auto& x : b)
       if (!x.is_value && !x.runtime) x.type = r.types[k++];
@@ -4982,7 +5214,16 @@ class Checker : public InterpHost {
         bool any_poly = false;
         for (Symbol* o : cands) any_poly |= is_poly_proc_decl(o);
         if (cands.size() > 1 || fallback != Builtin::None || any_poly) {
-          Symbol* pick = pick_overload(c, cands, id->name, fallback != Builtin::None);
+          Type* saved_hint = result_hint_;
+          result_hint_ = hint;  // for `-> $R`
+          Symbol* pick = nullptr;
+          try {
+            pick = pick_overload(c, cands, id->name, fallback != Builtin::None);
+          } catch (...) {
+            result_hint_ = saved_hint;
+            throw;
+          }
+          result_hint_ = saved_hint;
           if (!pick) {
             c->builtin = fallback;
             return check_builtin(c, hint);
@@ -5060,8 +5301,15 @@ class Checker : public InterpHost {
   // ---- overload resolution
 
   // Arguments whose type comes from the parameter they are passed to.
-  static bool needs_hint(const Expr* e) {
+  bool needs_hint(const Expr* e) {
     switch (e->kind) {
+      case NK::Ident: {  // a polymorphic procedure passed as a value
+        auto* id = static_cast<const Ident*>(e);
+        if (id->sym || id->backtick || id->poly) return id->sym && id->sym->kind == SymKind::PolyProc;
+        Symbol* s = find(id->name, id->loc).sym;
+        if (s && is_bake_decl(s)) resolve(s);
+        return s && is_poly_proc_decl(s) && s->overloads.size() <= 1;
+      }
       case NK::ProcLit:  // a short lambda with untyped parameters
         for (const Decl* d : static_cast<const ProcLit*>(e)->params)
           if (!d->type_expr && d->values.empty()) return true;
@@ -5082,6 +5330,10 @@ class Checker : public InterpHost {
         case NK::ArrayLit: return p->kind == TypeKind::Array ? 1 : -1;
         case NK::ProcLit:
           return p->is_proc() && p->params.size() == static_cast<ProcLit*>(e)->params.size() ? 1 : -1;
+        case NK::Ident: {  // a polymorphic procedure: one with as many parameters
+          Symbol* s = find(static_cast<Ident*>(e)->name, e->loc).sym;
+          return p->is_proc() && s && s->proc && s->proc->params.size() == p->params.size() ? 1 : -1;
+        }
         case NK::Member:
           if (!p->is_enum()) return -1;
           for (auto& m : p->members)
@@ -5384,6 +5636,37 @@ class Checker : public InterpHost {
       if (a.spread) fail(a.value->loc, "'", name, "' has no variadic parameter to pass '..' to");
   }
 
+  // An argument for C varargs, promoted as C does: small integers and bools to
+  // int (s32), float32 to float64; an integer literal is an int (s32) if it
+  // fits, as in C. Only scalars can be passed.
+  void c_vararg(Expr*& v) {
+    Type* t = check_rv(v, nullptr);
+    if (t->kind == TypeKind::UntypedInt && v->is_const() && v->cv.i >= INT32_MIN && v->cv.i <= INT32_MAX) {
+      coerce(v, T.s32);
+      t = T.s32;
+    } else if (t->kind == TypeKind::UntypedFloat) {
+      coerce(v, T.f64);
+      t = T.f64;
+    } else {
+      default_untyped(v);
+      t = v->type;
+    }
+    Type* to = t;
+    Type* u = const_cast<Type*>(t->underlying());
+    if (u->kind == TypeKind::Enum) u = u->elem ? u->elem : T.s64;
+    switch (u->kind) {
+      case TypeKind::Bool: to = T.s32; break;
+      case TypeKind::Int: if (u->bits < 32) to = T.s32; else to = u; break;
+      case TypeKind::Float: to = T.f64; break;
+      case TypeKind::Pointer: case TypeKind::Proc: case TypeKind::Null: break;
+      default:
+        fail(v->loc, "cannot pass ", type_name(t), " as a C variadic argument (only integers, floats, bools, enums and "
+             "pointers", t == T.string_t ? "; for a string pass to_c_string(s) or s.data" : "", ")");
+    }
+    if (u->kind == TypeKind::Null) to = T.void_ptr;
+    if (to != t) v = ast_.make<ImplicitConv>(v->loc, v, to);
+  }
+
   void bind_args(Call* c, Type* pt, ProcLit* lit) {
     size_t n = pt->params.size();
     int va = pt->vararg;
@@ -5438,7 +5721,11 @@ class Checker : public InterpHost {
              "be passed by name, which a call through a procedure value cannot do");
       fail(c->loc, "missing argument for parameter ", pname);
     }
-    if (spread) {
+    if (va >= 0 && pt->c_call) {  // C varargs: each argument separately, with C's default promotions
+      if (spread) fail(spread->loc, "cannot pass '..' an array as C variadic arguments; pass the values one by one");
+      for (Expr*& v : var_args) c_vararg(v);
+      c->c_varargs = std::move(var_args);
+    } else if (spread) {
       check_spread_value(spread, pt->params[va]);
       out[va] = spread;
     } else if (va >= 0) {

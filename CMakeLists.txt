@@ -24,10 +24,11 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_SOURCE_DI
 file(READ ${CMAKE_SOURCE_DIR}/src/modules/Basic.jai OJAY_BASIC)
 file(READ ${CMAKE_SOURCE_DIR}/src/modules/Math.jai OJAY_MATH)
 file(READ ${CMAKE_SOURCE_DIR}/src/core.jai OJAY_CORE)
+file(READ ${CMAKE_SOURCE_DIR}/src/modules/Hash_Table.jai OJAY_HASH_TABLE)
 configure_file(src/modules.cpp.in ${CMAKE_BINARY_DIR}/generated/modules.cpp @ONLY)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
   ${CMAKE_SOURCE_DIR}/src/modules/Basic.jai ${CMAKE_SOURCE_DIR}/src/modules/Math.jai
-  ${CMAKE_SOURCE_DIR}/src/core.jai)
+  ${CMAKE_SOURCE_DIR}/src/modules/Hash_Table.jai ${CMAKE_SOURCE_DIR}/src/core.jai)
 
 add_library(ojay_core STATIC
   ${CMAKE_BINARY_DIR}/generated/preload.cpp

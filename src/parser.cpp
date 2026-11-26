@@ -112,6 +112,10 @@ class Parser {
         if (!p) fail(loc, "a struct parameter cannot be variadic");
         d->is_vararg = true;
         p->variadic = true;
+        if (at(Tok::RParen) || at(Tok::Comma)) {  // `args: ..`: C varargs (#foreign), of any type
+          d->type_expr = ast_.make<Ident>(cur().loc, "Any");
+          return d;
+        }
       }
       d->type_expr = parse_type();
       if (accept(Tok::Eq)) d->values.push_back(parse_expr());
@@ -214,9 +218,10 @@ class Parser {
         return ast_.make<Defer>(loc, body);
       }
       case Tok::KwUsing: {
-        if (top_level) fail(loc, "'using' is not supported at top level yet");
         advance();
         if (at(Tok::Ident) && (peek().kind == Tok::Colon || peek().kind == Tok::ColonEq)) {
+          if (top_level)
+            fail(loc, "'using' on a global declaration is not supported; declare it, then write `using name;`");
           Stmt* s = parse_simple_stmt(false);  // using x := ...; / using x: T;
           auto* d = static_cast<Decl*>(s);
           if (d->is_const) fail(loc, "'using' needs a variable, not a constant");
@@ -264,8 +269,13 @@ class Parser {
           st->loc = loc;
           return st;
         }
-        if (peek().kind == Tok::KwBreak || peek().kind == Tok::KwContinue)
-          fail(loc, "`", peek().kind == Tok::KwBreak ? "break" : "continue", " is not supported yet");
+        if (peek().kind == Tok::KwBreak || peek().kind == Tok::KwContinue) {  // of the macro caller's loop
+          advance();
+          auto* bc = static_cast<BreakContinue*>(parse_stmt(false));
+          bc->backtick = true;
+          bc->loc = loc;
+          return bc;
+        }
         if (peek().kind == Tok::Ident &&
             (peek(2).kind == Tok::Colon || peek(2).kind == Tok::ColonColon || peek(2).kind == Tok::ColonEq)) {
           advance();  // `x := ...; declares x in the macro caller's scope
@@ -337,8 +347,14 @@ class Parser {
         }
         expect(Tok::RParen);
       }
-      Expr* e = parse_expr();
-      expect(Tok::Semi, "after #insert statement");
+      Expr* e;
+      if (at(Tok::Arrow)) {
+        e = parse_insert_generator(loc);
+        accept(Tok::Semi);
+      } else {
+        e = parse_expr();
+        expect(Tok::Semi, "after #insert statement");
+      }
       auto* ins = ast_.make<Insert>(loc, e);
       ins->remove_code = remove_code;
       return ins;
@@ -370,7 +386,68 @@ class Parser {
   void reject_insert_modifiers() {
     if (at(Tok::Comma))
       fail(cur().loc, "#insert,", peek().kind == Tok::Ident ? peek().text : "...", " is not supported yet");
-    if (at(Tok::Arrow)) fail(cur().loc, "#insert -> string { ... } is not supported yet; use #insert #run");
+  }
+
+  // The operand of `#code` that is not a block: an expression, or one bare
+  // statement (`#code x += 1`, `#code if a b();`, `#code n := 3`). The `;` that
+  // ends a statement is left for the construct the #code is in.
+  void parse_code_operand(CodeLit* c) {
+    SourceLoc loc = cur().loc;
+    bool decl = at(Tok::Ident) && (peek().kind == Tok::Colon || peek().kind == Tok::ColonEq ||
+                                   peek().kind == Tok::ColonColon || peek().kind == Tok::Comma);
+    switch (cur().kind) {
+      case Tok::KwIf: case Tok::KwWhile: case Tok::KwFor: case Tok::KwReturn: case Tok::KwDefer:
+      case Tok::KwBreak: case Tok::KwContinue: case Tok::KwUsing: case Tok::KwRemove:
+        decl = true;
+        break;
+      default:
+        break;
+    }
+    if (decl && !(at(Tok::Ident) && peek().kind == Tok::Comma && !looks_like_decl_names())) {
+      Stmt* s = parse_stmt(false);
+      if (p_ > 0 && toks_[p_ - 1].kind == Tok::Semi) --p_;
+      c->code_block = ast_.make<Block>(loc);
+      c->code_block->stmts.push_back(s);
+      return;
+    }
+    std::vector<Expr*> lhs = parse_expr_list();
+    if (is_assign_op(cur().kind)) {
+      auto* a = ast_.make<Assign>(cur().loc, cur().kind);
+      advance();
+      a->lhs = std::move(lhs);
+      a->rhs = parse_expr_list();
+      c->code_block = ast_.make<Block>(loc);
+      c->code_block->stmts.push_back(a);
+      return;
+    }
+    if (lhs.size() != 1) fail(loc, "#code of a list of expressions (", lhs.size(), " values)");
+    c->code_expr = lhs[0];
+  }
+
+  // At `a, b, ...`: whether the names end in ':' (a declaration of several names).
+  bool looks_like_decl_names() const {
+    size_t i = 0;
+    while (peek(i).kind == Tok::Ident) {
+      Tok next = peek(i + 1).kind;
+      if (next == Tok::Colon || next == Tok::ColonColon || next == Tok::ColonEq) return true;
+      if (next != Tok::Comma) return false;
+      i += 2;
+    }
+    return false;
+  }
+
+  // `#insert -> string { body }` (the cursor is at '->'): short for
+  // `#insert #run () -> string { body }()`.
+  Expr* parse_insert_generator(SourceLoc loc) {
+    auto* p = ast_.make<ProcLit>(expect(Tok::Arrow).loc);
+    ReturnSpec r;
+    r.loc = cur().loc;
+    r.type_expr = parse_type();
+    p->returns.push_back(r);
+    p->name = "#insert";
+    if (!at(Tok::LBrace)) fail(cur().loc, "expected '{' after #insert -> ", "type, found ", describe(cur()));
+    p->body = parse_block();
+    return ast_.make<DirectiveExpr>(loc, "run", ast_.make<Call>(loc, p));
   }
 
   void skip_directive_modifiers() {
@@ -961,11 +1038,12 @@ class Parser {
       if (at(Tok::Comma)) fail(cur().loc, "#code,", peek().kind == Tok::Ident ? peek().text : "...",
                                " is not supported yet");
       if (at(Tok::LBrace)) c->code_block = parse_block();
-      else c->code_expr = parse_expr();
+      else parse_code_operand(c);
       return c;
     }
     if (d == "insert") {
       reject_insert_modifiers();
+      if (at(Tok::Arrow)) return ast_.make<DirectiveExpr>(loc, "insert", parse_insert_generator(loc));
       return ast_.make<DirectiveExpr>(loc, "insert", parse_unary());
     }
     if (d == "caller_location") return ast_.make<DirectiveExpr>(loc, d, nullptr);
@@ -1271,7 +1349,14 @@ class Parser {
              "put #align on its members");
     };
     while (at(Tok::Directive)) {
-      if (cur().text == "modify") fail(cur().loc, "#modify on structs is not supported yet");
+      if (cur().text == "modify") {
+        SourceLoc mloc = advance().loc;
+        if (s->params.empty()) fail(mloc, "#modify is only allowed on polymorphic structs");
+        if (s->modify) fail(mloc, "a struct can only have one #modify block");
+        if (!at(Tok::LBrace)) fail(cur().loc, "expected '{' after #modify, found ", describe(cur()));
+        s->modify = parse_block();
+        continue;
+      }
       reject_align();
       // #type_info_none etc. are accepted and ignored
       advance();
@@ -1290,10 +1375,15 @@ class Parser {
  public:
   // One member declaration of a struct body (or `#insert expr;`).
   Decl* parse_struct_member() {
-    if (at_directive("as")) fail(cur().loc, "#as in structs is not supported yet");
     if (at_directive("align")) fail(cur().loc, "#align must follow a member's type: name: T #align N;");
     SourceLoc loc = cur().loc;
     auto* d = ast_.make<Decl>(loc);
+    if (at_directive("as")) {  // `#as [using] name: T;`: the struct converts to T
+      advance();
+      d->is_as = true;
+      if (!at(Tok::KwUsing) && !(at(Tok::Ident) && peek().kind == Tok::Colon))
+        fail(cur().loc, "#as must be followed by a member declaration (#as [using] name: T;)");
+    }
     if (at_directive("place")) {  // `#place m;`: the next members start at m's offset
       advance();
       d->place_name = expect_ident("member name after #place");
@@ -1303,6 +1393,11 @@ class Parser {
     if (at_directive("insert")) {  // members made at compile time
       advance();
       reject_insert_modifiers();
+      if (at(Tok::Arrow)) {
+        d->insert = parse_insert_generator(d->loc);
+        accept(Tok::Semi);
+        return d;
+      }
       d->insert = parse_expr();
       expect(Tok::Semi, "after #insert");
       return d;

@@ -33,7 +33,16 @@
 #endif
 
 namespace ojay {
+
+extern const char* const kHashTableSource;  // modules/Hash_Table.jai (generated modules.cpp)
+
 namespace {
+
+// The source of a module written in Jai that comes with the compiler, or null.
+const char* embedded_module_source(const std::string& name) {
+  if (name == "Hash_Table") return kHashTableSource;
+  return nullptr;
+}
 
 enum class Emit { Object, Assembly, LLVMIR };
 
@@ -191,9 +200,20 @@ class Loader {
       modules_[name] = unit;
       return unit;
     }
+    // Modules written in Jai that come with the compiler.
+    if (const char* src = embedded_module_source(name)) {
+      prog_.modules.push_back({name, ModuleUnit::Kind::File, {}});
+      modules_[name] = unit;
+      uint32_t id = sm_.add("<" + name + ">", src);
+      std::vector<Stmt*> stmts = parse_file(ast_, sm_, id);
+      scan(stmts, "", unit);
+      auto& tl = prog_.modules[unit].top_level;
+      tl.insert(tl.end(), stmts.begin(), stmts.end());
+      return unit;
+    }
     if (name == "String" || name == "Compiler" || name == "POSIX" || name == "Random" || name == "File" ||
-        name == "Hash_Table" || name == "Thread") {
-      fail(loc, "module \"", name, "\" is not available yet (built-in modules: Basic, Math, Hardware)");
+        name == "Thread") {
+      fail(loc, "module \"", name, "\" is not available yet (built-in modules: Basic, Math, Hash_Table, Hardware)");
     }
     fail(loc, "module \"", name, "\" not found (searched ", dirs.size(), " director",
          dirs.size() == 1 ? "y" : "ies", "; use -I to add more)");

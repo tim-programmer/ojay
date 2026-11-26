@@ -5,13 +5,9 @@ What is implemented is documented in `README.md`; this file lists only what is n
 ## Language
 
 - [ ] Smaller directives and intrinsics: `#bytes`, `#asm`
-- [ ] Remaining polymorphism: `$R` introduced in a return type, polymorphic procedure values, `#modify` on structs
-- [ ] Procedures: variadic `#foreign` procedures (C varargs), `#expand` macros with several
-      return values
-- [ ] `using` on pointer members and at top level, `#as`
-- [ ] Metaprogramming: `` `break`` / `` `continue``, `continue x` of a `for_expansion` loop,
-      `#insert -> string { ... }`, `#insert (...)` options other than `remove`, `#code` of a bare
-      statement
+- [ ] Remaining polymorphism: polymorphic procedure literals as values
+      (`f: (int) -> int = (x: $T) -> T { ... };`)
+- [ ] Metaprogramming: `#insert (...)` options other than `remove`
 - [ ] Compiler integration: `#compiler` procedures, the message loop (`#run,stallable`),
       `Code_Node` introspection (`compiler_get_nodes`), `#insert,scope(...)`, `#procedure_of_call`
 - [ ] `#run` results that contain pointers, array views, dynamic arrays, `Any`, unions or
@@ -30,8 +26,8 @@ What is implemented is documented in `README.md`; this file lists only what is n
 
 ## Runtime and modules
 
-- [ ] More modules: `Hash_Table` first, then `String`, `File`, `Random`, `POSIX`, `Compiler`,
-      `Thread`
+- [ ] More modules: `String`, `File`, `Random`, `POSIX`, `Compiler`, `Thread`; `Hash_Table`'s
+      custom hash and compare procedures (struct parameters that are procedures)
 - [ ] Basic and Math: `Matrix` / `Quaternion`, Jai's chained `String_Builder` buffers, moving
       `min` / `max` / `abs` from built-ins to Jai, an allocator parameter for `builder_to_string`,
       log sections (`Log_Section`, `Log_Info.section`), format arguments for `assert`
