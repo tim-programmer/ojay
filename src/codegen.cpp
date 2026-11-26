@@ -387,6 +387,7 @@ class CodeGen {
       lower_c_arg(s.params[i], pt->params[i], rvalue(c->resolved_args[i]), args);
     auto* call = b_.CreateCall(s.fn_type, callee, args);
     call->setAttributes(c_attrs(pt));
+    if (c->force_inline) call->addFnAttr(llvm::Attribute::AlwaysInline);
     if (pt->returns.empty()) return nullptr;
     Type* rt = pt->returns[0];
     switch (s.ret.kind) {
@@ -915,6 +916,7 @@ class CodeGen {
     p->llvm_fn = llvm::Function::Create(ft, linkage, name, mod_.get());
     if (p->type->c_call) p->llvm_fn->setAttributes(c_attrs(p->type));
     p->llvm_fn->addFnAttr(llvm::Attribute::NoUnwind);
+    if (p->always_inline && !p->program_export) p->llvm_fn->addFnAttr(llvm::Attribute::AlwaysInline);
   }
 
   void declare_global(Symbol* g) {
@@ -1608,7 +1610,7 @@ class CodeGen {
   }
 
   void bounds_check(llvm::Value* idx, llvm::Value* count, SourceLoc loc) {
-    if (!opts_.bounds_checks) return;
+    if (!opts_.bounds_checks || (proc_ && proc_->no_abc)) return;
     if (auto* ci = llvm::dyn_cast<llvm::ConstantInt>(idx)) {
       if (auto* cc = llvm::dyn_cast<llvm::ConstantInt>(count))
         if (ci->getSExtValue() >= 0 && ci->getSExtValue() < cc->getSExtValue()) return;
@@ -1976,6 +1978,7 @@ class CodeGen {
     std::vector<llvm::Value*> args;
     for (Expr* a : c->resolved_args) args.push_back(rvalue(a));
     auto* call = b_.CreateCall(fn_type(c->proc_type), callee, args);
+    if (c->force_inline) call->addFnAttr(llvm::Attribute::AlwaysInline);
     if (c->proc_type->returns.empty()) return nullptr;
     return call;
   }
@@ -2092,6 +2095,8 @@ class CodeGen {
       case Builtin::TypeOf:
       case Builtin::TypeInfo:
         return type_info(c->type_arg);
+      case Builtin::InitializerOf:
+        return rvalue(a[0]);
       case Builtin::Print: {
         llvm::Value* len;
         llvm::Value* data = string_parts(a[0], &len);

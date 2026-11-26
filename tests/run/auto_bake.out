@@ -1,0 +1,9 @@
+1024 n = 10 baked
+243 n at run time
+constant 7 (s64)
+constant 2.5 (float32)
+variable hello (string)
+constant lit (string)
+41
+20
+9

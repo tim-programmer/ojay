@@ -4,13 +4,8 @@ What is implemented is documented in `README.md`; this file lists only what is n
 
 ## Language
 
-- [ ] Smaller directives and intrinsics: `#procedure_name()`, `is_constant()`, `#bytes`,
-      `#exists`, `initializer_of(T)`, `enum_highest_value` and the other enum helpers,
-      `#bake_constants`, `#asm`
-- [ ] Directives that are accepted but have no effect: `#no_abc` (bounds checks stay on),
-      `#must` (no warning for an unused result), `#deprecated` (no warning), call-site `inline`
-- [ ] Remaining polymorphism: `$$` auto-baking, `#bake_arguments`, `$T/Interface` constraints,
-      `$R` introduced in a return type, polymorphic procedure values, `#modify` on structs
+- [ ] Smaller directives and intrinsics: `#bytes`, `#asm`
+- [ ] Remaining polymorphism: `$R` introduced in a return type, polymorphic procedure values, `#modify` on structs
 - [ ] Procedures: variadic `#foreign` procedures (C varargs), `#expand` macros with several
       return values
 - [ ] `using` on pointer members and at top level, `#as`

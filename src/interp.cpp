@@ -2276,6 +2276,8 @@ class Machine {
       case Builtin::TypeOf:
       case Builtin::TypeInfo:
         return make_ptr(in_.type_id(c->type_arg));
+      case Builtin::InitializerOf:
+        return eval(c->resolved_args[0]);
       default:
         err(loc, "this built-in procedure is not available during compile-time execution");
     }

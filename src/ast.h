@@ -109,6 +109,9 @@ struct Ident : Expr {
   Symbol* sym = nullptr;
   bool poly = false;  // written `$name`: introduces a type variable of a polymorphic procedure
   bool backtick = false;  // written `` `name ``: in an #expand macro, a name of the caller's scope
+  // `$T/X` / `$T/interface X`: what the type bound to T must be (see Checker::check_constraint)
+  Expr* constraint = nullptr;
+  bool constraint_interface = false;
   Ident(SourceLoc l, std::string n) : Expr(NK::Ident, l), name(std::move(n)) {}
 };
 
@@ -145,6 +148,8 @@ enum class Builtin {
   None,
   // core
   SizeOf, TypeOf, TypeInfo,  // type_info(T)
+  IsConstant,  // is_constant(x)
+  InitializerOf,  // initializer_of(T): resolved_args[0] is the procedure (absent: null, T is all zero)
   // Basic
   Print, Sprint, WriteString, Alloc, Free, Realloc, New, NewArray, ArrayAdd, ArrayReserve, ArrayFree, ArrayReset,
   Assert, Exit, Memcpy, Memset, Min, Max, Abs, ToCString, CommandLineArguments,
@@ -170,6 +175,7 @@ struct Call : Expr {
   Expr* allocator = nullptr;
   bool no_init = false;              // New / NewArray with `initialized = false`
   bool spread_args = false;          // print / sprint: resolved_args[1] is a `..array` of Any
+  bool force_inline = false;         // `inline f(x)`: the call is inlined
   Call(SourceLoc l, Expr* c) : Expr(NK::Call, l), callee(c) {}
 };
 
@@ -245,6 +251,11 @@ struct ProcLit : Expr {
   bool no_context = false;  // #no_context: like #c_call procedures, it has no context
   bool program_export = false;  // #program_export: an external symbol (named export_name, else name) C can call
   std::string export_name;
+  bool no_abc = false;      // #no_abc: no array bounds checks in its body
+  bool always_inline = false;  // `f :: inline (...) {...}`: every call is inlined
+  bool must = false;        // `-> T #must`: a call's result must be used
+  bool deprecated = false;  // #deprecated "note": each call is warned about
+  std::string deprecated_note;
   Block* modify = nullptr;  // #modify { ... }: runs when a polymorphic procedure is instantiated
   std::string name;       // bound name, for diagnostics and symbol names
   // sema
@@ -390,6 +401,7 @@ struct Decl : Stmt {
   bool is_using = false;
   bool is_vararg = false;   // parameter declared as `..T`
   bool is_baked = false;    // compile-time parameter `$N: int` / `$T: Type`
+  bool auto_bake = false;   // `$$x: int`: baked into the instance when the argument is a constant
   bool is_global = false;
   bool backtick = false;    // `` `x := v; `` in an #expand macro: declared in the caller's scope
   bool add_context = false; // `#add_context name: T = v;`: a member added to Context

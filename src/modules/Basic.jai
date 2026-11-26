@@ -303,3 +303,60 @@ __log :: (format: string, args: [] Any, loc: Source_Code_Location, flags: Log_Fl
     if context.logger  context.logger(message, context.logger_data, info);
     free(message);
 }
+
+// ------------------------------------------------------------------ enums
+//
+// The members of enum type T, from its type information. enum_names and
+// enum_values_as_s64 return T's own tables (do not free or change them);
+// enum_values_as_enum returns a new array (context.allocator).
+
+enum_names :: ($T: Type) -> [] string {
+    info: *Type_Info_Enum = type_info(T);
+    return info.names;
+}
+
+enum_values_as_s64 :: ($T: Type) -> [] s64 {
+    info: *Type_Info_Enum = type_info(T);
+    return info.values;
+}
+
+enum_values_as_enum :: ($T: Type) -> [] T {
+    info: *Type_Info_Enum = type_info(T);
+    result := NewArray(info.values.count, T, initialized = false);
+    for info.values  result[it_index] = cast,no_check(T) it;
+    return result;
+}
+
+// The lowest and highest member values of the enum `info` describes, compared
+// as its base type (signed or unsigned); 0, 0 for an enum without members.
+enum_range_given_info :: (info: *Type_Info_Enum) -> (lowest: s64, highest: s64) {
+    if info.values.count == 0  return 0, 0;
+    lowest := info.values[0];
+    highest := lowest;
+    signed := info.internal_type.signed;
+    for info.values {
+        if signed {
+            if it < lowest   lowest = it;
+            if it > highest  highest = it;
+        } else {
+            if cast,no_check(u64) it < cast,no_check(u64) lowest   lowest = it;
+            if cast,no_check(u64) it > cast,no_check(u64) highest  highest = it;
+        }
+    }
+    return lowest, highest;
+}
+
+enum_range :: ($T: Type) -> (lowest: T, highest: T) {
+    lowest, highest := enum_range_given_info(type_info(T));
+    return cast,no_check(T) lowest, cast,no_check(T) highest;
+}
+
+enum_highest_value :: ($T: Type) -> T {
+    _, highest := enum_range(T);
+    return highest;
+}
+
+enum_lowest_value :: ($T: Type) -> T {
+    lowest := enum_range(T);
+    return lowest;
+}

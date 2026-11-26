@@ -12,6 +12,7 @@
 #include <memory>
 #include <optional>
 #include <unordered_set>
+#include <unordered_set>
 
 namespace ojay {
 
@@ -179,6 +180,8 @@ class Checker : public InterpHost {
   // Metaprogramming: the #expand macros being expanded (innermost last) and
   // the #code values (ids are index + 1).
   std::vector<MacroCtx> macros_;
+  std::unordered_map<Type*, ProcLit*> initializers_;  // initializer_of(T)
+  std::unordered_set<Symbol*> constant_macro_params_;  // macro parameters given a constant: is_constant() is true
   int next_macro_id_ = 0;
   std::vector<CodeEntry> codes_;
   static constexpr size_t kMaxMacroDepth = 100;
@@ -323,6 +326,16 @@ class Checker : public InterpHost {
 
   static bool is_proc_decl(const Decl* d, size_t i) {
     return d && d->is_const && d->values.size() == d->names.size() && d->values[i]->kind == NK::ProcLit;
+  }
+  // `name :: #bake_arguments f(...)`: a procedure once resolved (bake_proc
+  // replaces the value with the baked procedure).
+  static bool is_bake_decl(const Symbol* s) {
+    const Decl* d = s->decl;
+    if (!d || !d->is_const || d->values.size() != d->names.size()) return false;
+    const Expr* v = d->values[s->decl_index];
+    if (v->kind != NK::Directive) return false;
+    const std::string& n = static_cast<const DirectiveExpr*>(v)->name;
+    return n == "bake_arguments" || n == "bake_constants";
   }
 
   // Declares a constant from `d` (name `i`); procedures with the same name
@@ -631,6 +644,8 @@ class Checker : public InterpHost {
     add_builtin(universe_, "size_of", Builtin::SizeOf);
     add_builtin(universe_, "type_of", Builtin::TypeOf);
     add_builtin(universe_, "type_info", Builtin::TypeInfo);
+    add_builtin(universe_, "is_constant", Builtin::IsConstant);
+    add_builtin(universe_, "initializer_of", Builtin::InitializerOf);
   }
 
   // ------------------------------------------------------------------ the context (Preload)
@@ -1186,8 +1201,14 @@ class Checker : public InterpHost {
       case NK::Directive: {
         auto* de = static_cast<DirectiveExpr*>(v);
         if (de->name.rfind("import:", 0) == 0) {
+          if (de->module_id < 0) fail(de->loc, "a named #import must be at the top level of a file");
           s->kind = SymKind::Module;
           s->module_scope = prog_.modules.at(de->module_id).scope;
+          return;
+        }
+        if (de->name == "bake_arguments" || de->name == "bake_constants") {
+          bake_proc(s, de);
+          v->type = s->type;
           return;
         }
         if (de->name == "distinct" || de->name == "isa") {
@@ -1892,6 +1913,7 @@ class Checker : public InterpHost {
           return;
         }
         check_rv_allow_void(es->expr);
+        check_must_use(es->expr);
         return;
       }
       case NK::Decl: check_local_decl(static_cast<Decl*>(s)); return;
@@ -2785,14 +2807,182 @@ class Checker : public InterpHost {
           return e->type;
         }
         if (d->name == "this") return check_this(e);
+        if (d->name == "procedure_name") {
+          if (!proc_) fail(e->loc, "#procedure_name is only allowed inside a procedure");
+          e->cv = ConstValue::of_string(proc_->name);
+          return T.string_t;
+        }
+        if (d->name == "exists") {
+          e->cv = ConstValue::of_bool(name_exists(d->operand));
+          return T.bool_t;
+        }
         if (d->name == "distinct" || d->name == "isa")
           fail(e->loc, "a distinct type must be declared as a named constant: Name :: #type,", d->name, " T;");
+        if (d->name == "bake_arguments" || d->name == "bake_constants")
+          fail(e->loc, "#", d->name, " must be the value of a constant: name :: #", d->name, " f(...);");
         if (d->name.rfind("import:", 0) == 0) fail(e->loc, "named #import is only supported as `Name :: #import \"...\";`");
         fail(e->loc, "#", d->name, " is not supported here");
       }
       default:
         fail(e->loc, "unexpected node in expression");
     }
+  }
+
+  // The procedure initializer_of(t) returns: `(p: *t) { p.* = <t's default>; }`,
+  // made once per type, in a scope of its own where `__T` is t.
+  ProcLit* initializer_proc(Type* t) {
+    auto it = initializers_.find(t);
+    if (it != initializers_.end()) {
+      want_proc(it->second);
+      return it->second;
+    }
+    uint32_t file = sm_.add("<initializer_of(" + type_name(t) + ")>",
+                            "(p: *__T) #no_context { value: __T; p.* = value; }");
+    auto* p = static_cast<ProcLit*>(parse_source_expr(ast_, sm_, file));
+    p->name = "initializer_of(" + type_name(t) + ")";
+    initializers_[t] = p;
+    ContextGuard guard(*this);
+    Scope* sc = new_scope(core_, nullptr);
+    Symbol* s = declare(sc, "__T", SymKind::Type, SourceLoc{});
+    s->type = T.type_t;
+    s->cv = ConstValue::of_type(t);
+    s->state = Symbol::State::Resolved;
+    scope_ = sc;
+    proc_ = nullptr;
+    loops_.clear();
+    macros_.clear();
+    in_run_operand_ = false;
+    Expr* e = p;
+    check(e, nullptr);
+    want_proc(p);
+    return p;
+  }
+
+  // `name :: #bake_arguments f(a = v, ...)` / `#bake_constants f(N = v, T = type)`:
+  // a copy of procedure f whose named parameters (or, for $T type variables,
+  // types) are the given constants. The copy lives in a scope of its own that
+  // declares them; it is polymorphic if f still has unbound variables.
+  void bake_proc(Symbol* s, DirectiveExpr* de) {
+    auto* c = static_cast<Call*>(de->operand);
+    const std::string& what = de->name;
+    bool constants_only = what == "bake_constants";
+    Symbol* fs = nullptr;
+    if (c->callee->kind == NK::Ident) {
+      fs = find(static_cast<Ident*>(c->callee)->name, c->callee->loc).sym;
+    } else if (c->callee->kind == NK::Member && static_cast<Member*>(c->callee)->base) {
+      if (Scope* ms = module_of(static_cast<Member*>(c->callee)->base))
+        fs = module_member(ms, static_cast<Member*>(c->callee));
+    }
+    if (!fs) fail(c->callee->loc, "#", what, " needs the name of a procedure");
+    resolve(fs);
+    if (fs->kind != SymKind::Proc && fs->kind != SymKind::PolyProc)
+      fail(c->callee->loc, "#", what, ": '", fs->name, "' is not a procedure");
+    if (fs->overloads.size() > 1) fail(c->callee->loc, "#", what, ": '", fs->name, "' is overloaded");
+    ProcLit* src = fs->proc;
+    if (src->is_foreign) fail(c->callee->loc, "#", what, ": cannot bake the arguments of a #foreign procedure");
+    if (src->is_macro) fail(c->callee->loc, "#", what, ": cannot bake the arguments of an #expand macro");
+    auto* p = static_cast<ProcLit*>(clone_expr(ast_, src));
+    p->name = s->name;
+    // The values, in the scope of the declaration.
+    for (auto& a : c->args) {
+      if (a.name.empty())
+        fail(a.value->loc, "#", what, " takes named arguments: #", what, " ", fs->name, "(name = value)");
+      if (a.spread) fail(a.value->loc, "#", what, ": '..' is not allowed here");
+      check_rv(a.value, nullptr);  // untyped constants take the parameter's type
+      if (!a.value->is_const())
+        fail(a.value->loc, "#", what, ": the value of '", a.name, "' must be a compile-time constant");
+    }
+    Scope* sc = new_scope(fs->scope, fs->scope->proc);
+    ContextGuard guard(*this);
+    scope_ = sc;
+    auto bind = [&](const std::string& name, SourceLoc loc, Type* t, const ConstValue& v) {
+      if (sc->syms.count(name)) fail(loc, "#", what, ": '", name, "' is given twice");
+      bool is_type = v.kind == ConstValue::TypeV;
+      Symbol* k = declare(sc, name, is_type ? SymKind::Type : SymKind::Const, loc);
+      k->type = is_type ? T.type_t : t;
+      k->cv = v;
+      k->state = Symbol::State::Resolved;
+    };
+    auto unpoly = [&](const std::string& name) {  // `$name` in the remaining parameters is now plain `name`
+      auto f = [&](Ident* id) { if (id->name == name) id->poly = false; };
+      for (Decl* d : p->params) for_each_poly(d->type_expr, f);
+    };
+    for (auto& a : c->args) {
+      auto pi = std::find_if(p->params.begin(), p->params.end(),
+                             [&](Decl* d) { return d->names[0].name == a.name; });
+      if (pi == p->params.end()) {
+        bool type_var = false;
+        auto f = [&](Ident* id) { type_var |= id->name == a.name; };
+        for (Decl* d : p->params) for_each_poly(d->type_expr, f);
+        if (!type_var)
+          fail(a.name_loc, "#", what, ": '", fs->name, "' has no parameter or type variable named '", a.name, "'");
+        if (a.value->cv.kind != ConstValue::TypeV)
+          fail(a.value->loc, "#", what, ": type variable '", a.name, "' needs a type");
+        bind(a.name, a.name_loc, T.type_t, a.value->cv);
+        unpoly(a.name);
+        continue;
+      }
+      Decl* d = *pi;
+      if (constants_only && !d->is_baked && !d->auto_bake)
+        fail(a.name_loc, "#bake_constants: '", a.name, "' is not a compile-time parameter ($", a.name,
+             "); use #bake_arguments");
+      if (d->is_vararg) fail(a.name_loc, "#", what, ": cannot bake variadic parameter '", a.name, "'");
+      if (d->is_using) fail(a.name_loc, "#", what, ": cannot bake 'using' parameter '", a.name, "'");
+      Expr* v = a.value;
+      if (!d->type_expr) {  // `x := 3`: the default's type
+        Expr* def = d->values[0];
+        Type* t = check_value(def, nullptr);
+        if (t->is_untyped()) { default_untyped(def); t = def->type; }
+        coerce(v, t);
+      } else if (Ident* tv = find_poly(d->type_expr)) {
+        if (d->type_expr != tv)
+          fail(a.name_loc, "#", what, ": cannot bake parameter '", a.name, "' of polymorphic type ",
+               pattern_str(d->type_expr), " (only of type $T)");
+        default_untyped(v);
+        if (sc->syms.count(tv->name) == 0) bind(tv->name, tv->loc, T.type_t, ConstValue::of_type(v->type));
+        unpoly(tv->name);
+      } else {
+        Type* t = resolve_type(d->type_expr);
+        coerce(v, t);
+      }
+      if (!v->is_const())
+        fail(v->loc, "#", what, ": the value of '", a.name, "' must be a compile-time constant");
+      bind(a.name, a.name_loc, v->type, v->cv);
+      p->params.erase(pi);
+    }
+    p->is_poly = false;
+    for (Decl* d : p->params) p->is_poly |= d->is_baked || d->auto_bake || find_poly(d->type_expr);
+    p->poly_returns = false;
+    for (auto& r : p->returns) p->poly_returns |= find_poly(r.type_expr) != nullptr;
+    s->scope = sc;
+    s->proc = p;
+    s->decl->values[s->decl_index] = p;  // from now on an ordinary procedure declaration
+    if (p->is_poly || p->poly_returns) {
+      validate_poly_proc(p);
+      s->kind = SymKind::PolyProc;
+      return;
+    }
+    s->kind = SymKind::Proc;
+    define_proc(p);
+    s->type = p->type;
+  }
+
+  // `#exists(name)` / `#exists(Module.name)`: whether the name is visible here.
+  bool name_exists(Expr* e) {
+    if (e->kind == NK::Ident) {
+      Found f = find(static_cast<Ident*>(e)->name, e->loc);
+      return f.sym || f.via || f.enum_type;
+    }
+    if (e->kind == NK::Member) {
+      auto* m = static_cast<Member*>(e);
+      if (m->base && name_exists(m->base))
+        if (Scope* ms = module_of(m->base)) {
+          auto it = ms->syms.find(m->name);
+          return it != ms->syms.end() && exported_sym(it->second);
+        }
+      return false;
+    }
+    fail(e->loc, "#exists takes a name (or Module.name)");
   }
 
   // `#this`: the struct whose body it is in (in a polymorphic struct, the
@@ -3558,6 +3748,7 @@ class Checker : public InterpHost {
     SourceLoc loc;
     bool bound = false;
     bool is_value = false;  // a compile-time value ($N: int); otherwise a type
+    bool runtime = false;   // a `$$x` parameter given a value known only at run time (no binding)
     Type* type = nullptr;   // the bound type, or the type of the value
     ConstValue value;
   };
@@ -3568,6 +3759,7 @@ class Checker : public InterpHost {
     std::string desc;        // "T = int, N = 3", for diagnostics
     SourceLoc use;           // the first call that used it
     bool used = false;       // used by a call (in runtime code or only by #run)
+    std::vector<bool> baked; // per template parameter: baked into the instance (no argument at run time)
   };
   std::map<std::pair<const Node*, std::string>, Symbol*> poly_procs_;  // (template, bindings) -> instance
   std::unordered_map<ProcLit*, PolyInstance> poly_instances_;
@@ -3693,7 +3885,7 @@ class Checker : public InterpHost {
     std::string s = "(";
     for (size_t i = 0; i < p->params.size(); ++i) {
       const Decl* d = p->params[i];
-      s += (i ? ", " : "") + std::string(d->is_baked ? "$" : "") + d->names[0].name;
+      s += (i ? ", " : "") + std::string(d->auto_bake ? "$$" : d->is_baked ? "$" : "") + d->names[0].name;
       if (d->type_expr) s += ": " + std::string(d->is_vararg ? ".." : "") + pattern_str(d->type_expr);
     }
     s += ")";
@@ -3724,10 +3916,13 @@ class Checker : public InterpHost {
   }
   static std::string binding_key(const Bindings& b) {
     std::string k;
-    for (auto& x : b) k += std::to_string((uintptr_t)x.type) + (x.is_value ? "=" + const_key(x.value) : "") + ";";
+    for (auto& x : b)
+      k += x.runtime ? std::string("rt;")
+                     : std::to_string((uintptr_t)x.type) + (x.is_value ? "=" + const_key(x.value) : "") + ";";
     return k;
   }
   static std::string value_str(const PolyBinding& x) {
+    if (x.runtime) return "(not constant)";
     if (!x.is_value) return type_name(x.type);
     const ConstValue& v = x.value;
     switch (v.kind) {
@@ -3754,7 +3949,7 @@ class Checker : public InterpHost {
   Scope* bind_scope(Scope* parent, const Bindings& b) {
     Scope* sc = new_scope(parent, parent->proc);
     for (auto& x : b) {
-      if (!x.bound) continue;
+      if (!x.bound || x.runtime) continue;
       Symbol* s = declare(sc, x.name, x.is_value ? SymKind::Const : SymKind::Type, x.loc);
       s->type = x.is_value ? x.type : T.type_t;
       s->cv = x.is_value ? x.value : ConstValue::of_type(x.type);
@@ -3805,7 +4000,7 @@ class Checker : public InterpHost {
              "parameters and write plain '", id->name, "' in the return type");
     if (p->is_foreign) fail(p->loc, "a #foreign procedure cannot be polymorphic");
     for (Decl* d : p->params) {
-      if (!d->is_baked) continue;
+      if (!d->is_baked && !d->auto_bake) continue;
       const std::string& n = d->names[0].name;
       if (d->is_vararg) fail(d->loc, "compile-time parameter '$", n, "' cannot be variadic");
       if (d->is_using) fail(d->loc, "'using' is not allowed on compile-time parameter '$", n, "'");
@@ -3837,7 +4032,7 @@ class Checker : public InterpHost {
     };
     auto visit = [&](Ident* id) { add(id->name, id->loc); };
     for (Decl* d : p->params) {
-      if (d->is_baked) add(d->names[0].name, d->loc);
+      if (d->is_baked || d->auto_bake) add(d->names[0].name, d->loc);
       for_each_poly(d->type_expr, visit);
     }
     return b;
@@ -3910,11 +4105,22 @@ class Checker : public InterpHost {
 
   // A call's arguments without those of compile-time parameters (they are
   // baked into the instance).
-  std::vector<Arg> runtime_args(const std::vector<Arg>& args, ProcLit* tmpl, SourceLoc loc) {
+  std::vector<Arg> runtime_args(const std::vector<Arg>& args, ProcLit* tmpl, const std::vector<bool>& baked,
+                                SourceLoc loc) {
     ArgMap m = map_args(args, tmpl, loc);
     std::vector<Arg> out;
     for (size_t i = 0; i < args.size(); ++i)
-      if (!tmpl->params[m.param_of[i]]->is_baked) out.push_back(args[i]);
+      if (!baked[m.param_of[i]]) out.push_back(args[i]);
+    return out;
+  }
+  // Which parameters of template `p` bindings `b` bake into the instance.
+  static std::vector<bool> baked_params(ProcLit* p, const Bindings& b) {
+    std::vector<bool> out;
+    for (Decl* d : p->params) {
+      bool k = d->is_baked;
+      if (d->auto_bake) k = !b[binding_index(b, d->names[0].name)].runtime;
+      out.push_back(k);
+    }
     return out;
   }
 
@@ -4038,6 +4244,42 @@ class Checker : public InterpHost {
     for (size_t i = 0; i < p->params.size(); ++i) {
       Decl* d = p->params[i];
       const std::string& pname = d->names[0].name;
+      if (d->auto_bake) {  // `$$x`: baked if the argument is a constant, else an ordinary parameter
+        int k = binding_index(b, pname);
+        Expr* a = m.params[i];
+        if (!a) {  // the default value, baked
+          if (d->values.empty()) fail(loc, "missing argument for parameter '$$", pname, "' of '", p->name, "'");
+          Type* pt = d->type_expr ? param_type_in(tmpl, b, d->type_expr) : nullptr;
+          with_bindings(tmpl->scope, b, [&] {
+            Expr* v = clone_expr(ast_, d->values[0]);
+            if (!pt) pt = check_value(v, nullptr);
+            bind_param(b[k], v, pt, p->name);
+            return 0;
+          });
+          continue;
+        }
+        if (!a->type) {  // .{...}, xx, ...: typed by the instance's parameter, so not baked
+          b[k].bound = b[k].runtime = true;
+          continue;
+        }
+        if (a->type->is_untyped() && d->type_expr && find_poly(d->type_expr)) {
+          default_untyped(m.params[i]);
+          a = m.params[i];
+        }
+        if (d->type_expr) match_arg(d->type_expr, a, pname);
+        if (a->is_const() && a->cv.kind != ConstValue::TypeV && a->cv.kind != ConstValue::Code) {
+          Type* pt = d->type_expr ? param_type_in(tmpl, b, d->type_expr) : nullptr;
+          if (!pt) {
+            default_untyped(m.params[i]);
+            a = m.params[i];
+            pt = a->type;
+          }
+          bind_param(b[k], m.params[i], pt, p->name);
+        } else {
+          b[k].bound = b[k].runtime = true;
+        }
+        continue;
+      }
       if (d->is_baked) {
         PolyBinding& x = b[binding_index(b, pname)];
         Type* pt = baked_param_type(tmpl, b, d);
@@ -4098,8 +4340,69 @@ class Checker : public InterpHost {
       if (!x.bound)
         fail(loc, "cannot infer '$", x.name, "' of '", p->name, "' from the arguments (", p->name, " :: ",
              proc_pattern_str(p), ")");
+    check_constraints(tmpl, b, loc);
     run_modify(tmpl, b, loc);
     return b;
+  }
+
+  // `$T/X` and `$T/interface X` in the parameter types of `tmpl`: the types
+  // bound to their variables must satisfy them.
+  void check_constraints(Symbol* tmpl, const Bindings& b, SourceLoc loc) {
+    std::vector<Ident*> constrained;
+    auto f = [&](Ident* id) { if (id->constraint) constrained.push_back(id); };
+    for (Decl* d : tmpl->proc->params) for_each_poly(d->type_expr, f);
+    for (Ident* id : constrained) {
+      int k = binding_index(b, id->name);
+      if (k < 0 || !b[k].bound || b[k].is_value || b[k].runtime) continue;
+      Type* t = b[k].type;
+      std::string why = with_bindings(tmpl->scope, b, [&] { return constraint_failure(id, t); });
+      if (!why.empty())
+        fail(loc, "'", tmpl->name, "' needs '$", id->name, "/", id->constraint_interface ? "interface " : "",
+             pattern_str(id->constraint), "', but ", id->name, " = ", type_name(t), ": ", why);
+    }
+  }
+
+  // Why type `t` does not satisfy constraint `id->constraint` (empty if it does):
+  // * `$T/X`, X a polymorphic struct: t must be an instance of X;
+  // * `$T/X`, X a type: t must be X, or a struct with a `using` member that is (or `using`s) X;
+  // * `$T/interface X`, X a struct: t must be a struct with every member of X (same name and type).
+  std::string constraint_failure(Ident* id, Type* t) {
+    Expr* c = id->constraint;
+    if (!id->constraint_interface) {
+      if (Symbol* ps = poly_struct_named(c)) {
+        auto it = poly_struct_types_.find(t);
+        if (it != poly_struct_types_.end() && it->second.tmpl == ps) return "";
+        return "it is not an instance of " + ps->name;
+      }
+      Expr* ce = clone_expr(ast_, c);
+      Type* x = resolve_type(ce);
+      if (uses_type(t, x)) return "";
+      return "it is not " + type_name(x) + " and has no 'using' member of that type";
+    }
+    Expr* ce = clone_expr(ast_, c);
+    Type* x = resolve_type(ce);
+    if (x->kind != TypeKind::Struct) fail(c->loc, "an interface must be a struct, not ", type_name(x));
+    complete_type(x, c->loc);
+    if (t->kind != TypeKind::Struct) return "it is not a struct";
+    complete_type(t, c->loc);
+    for (const std::string& name : member_names(x)) {
+      std::vector<int> p1, p2;
+      Type* want = find_field(x, name, p1);
+      Type* have = find_field(t, name, p2);
+      if (!have) return "it has no member '" + name + "'";
+      if (have != want) return "its member '" + name + "' is " + type_name(have) + ", not " + type_name(want);
+    }
+    return "";
+  }
+
+  // Whether t is x, or a struct with a `using` member whose type is (or uses) x.
+  bool uses_type(Type* t, Type* x) {
+    if (t == x) return true;
+    if (t->kind != TypeKind::Struct) return false;
+    complete_type(t, SourceLoc{});
+    for (auto& f : t->fields)
+      if ((f.is_using || f.anonymous) && uses_type(f.type, x)) return true;
+    return false;
   }
 
   // The instance of polymorphic procedure `tmpl` for bindings `b`, with its
@@ -4110,16 +4413,17 @@ class Checker : public InterpHost {
     if (it != poly_procs_.end()) return it->second;
     auto* p = static_cast<ProcLit*>(clone_expr(ast_, tmpl->proc));
     p->is_poly = false;
+    std::vector<bool> baked = baked_params(tmpl->proc, b);
     std::vector<Decl*> params;
-    for (Decl* d : p->params)
-      if (!d->is_baked) params.push_back(d);
+    for (size_t i = 0; i < p->params.size(); ++i)
+      if (!baked[i]) params.push_back(p->params[i]);
     p->params = params;
     Symbol* s = new_symbol(tmpl->name, SymKind::Proc, tmpl->loc);
     s->scope = tmpl->scope;
     s->is_global = tmpl->is_global;
     s->proc = p;
     s->state = Symbol::State::Resolved;
-    poly_instances_[p] = PolyInstance{tmpl, bindings_desc(b), use, false};
+    poly_instances_[p] = PolyInstance{tmpl, bindings_desc(b), use, false, baked};
     poly_procs_[key] = s;  // before the signature: it may mention the procedure itself
     try {
       with_bindings(tmpl->scope, b, [&] {
@@ -4151,10 +4455,11 @@ class Checker : public InterpHost {
     ArgMap m = map_args(c->args, p, c->loc);
     Bindings b = infer_poly(tmpl, m, c->loc);
     Symbol* inst = instantiate_proc(tmpl, b, c->loc);
+    const std::vector<bool>& baked = poly_instances_.at(inst->proc).baked;
     size_t j = 0;
     for (size_t i = 0; i < p->params.size(); ++i) {
       Decl* d = p->params[i];
-      if (d->is_baked) continue;
+      if (baked[i]) continue;
       Type* pt = inst->type->params[j++];
       auto fits = [&](Expr* a, Type* want) {
         if (arg_cost(a, want) < 0)
@@ -4169,7 +4474,7 @@ class Checker : public InterpHost {
       }
     }
     Call runtime(c->loc, c->callee);
-    runtime.args = runtime_args(c->args, p, c->loc);
+    runtime.args = runtime_args(c->args, p, baked, c->loc);
     cost = call_cost(&runtime, inst->type, inst->proc);
     if (cost < 0) fail(c->loc, "the arguments do not fit '", p->name, "' with ", bindings_desc(b));
     return inst;
@@ -4476,7 +4781,9 @@ class Checker : public InterpHost {
         d->values.push_back(a);
         d->is_using = pd->is_using;
         body->stmts.push_back(d);
+        bool constant_arg = a->is_const();
         check_local_decl(d);
+        if (constant_arg && !d->syms.empty()) constant_macro_params_.insert(d->syms[0]);  // is_constant(x)
       }
       auto* copy = static_cast<Block*>(clone_stmt(ast_, m->body));
       for (Stmt* st : copy->stmts) {
@@ -4553,8 +4860,8 @@ class Checker : public InterpHost {
     std::vector<Expr*> args;
     std::vector<std::string> vars;
     for (auto& x : b) {
-      if (x.is_value) {
-        values.push_back(x);
+      if (x.is_value || x.runtime) {
+        if (!x.runtime) values.push_back(x);
         continue;
       }
       rt->fields.push_back(StructField{x.name, T.type_t});
@@ -4624,7 +4931,7 @@ class Checker : public InterpHost {
       fail(loc, "#modify of '", p->name, "' rejected ", bindings_desc(b), r.message.empty() ? "" : ": ", r.message);
     size_t k = 0;
     for (auto& x : b)
-      if (!x.is_value) x.type = r.types[k++];
+      if (!x.is_value && !x.runtime) x.type = r.types[k++];
   }
 
   // ------------------------------------------------------------------ calls
@@ -4650,6 +4957,7 @@ class Checker : public InterpHost {
         !static_cast<Ident*>(c->callee)->backtick) {
       auto* id = static_cast<Ident*>(c->callee);
       Symbol* s = qualified ? qualified : find(id->name, id->loc).sym;
+      if (s && is_bake_decl(s)) resolve(s);
       if (s && is_poly_struct_decl(s)) {  // Vector(float, 3): an instance of a polymorphic struct
         resolve(s);
         c->cv = ConstValue::of_type(instantiate_struct(s, c->args, c->loc));
@@ -4683,7 +4991,8 @@ class Checker : public InterpHost {
           id->type = pick->type;
           // A polymorphic instance: its compile-time arguments are baked in.
           auto inst = poly_instances_.find(pick->proc);
-          if (inst != poly_instances_.end()) c->args = runtime_args(c->args, inst->second.tmpl->proc, c->loc);
+          if (inst != poly_instances_.end())
+            c->args = runtime_args(c->args, inst->second.tmpl->proc, inst->second.baked, c->loc);
         } else if (qualified) {
           id->sym = s;
         }
@@ -4700,6 +5009,7 @@ class Checker : public InterpHost {
         if (s->kind == SymKind::Proc && s->proc && s->proc->is_macro) {
           id->sym = s;
           id->type = s->type;
+          note_call(c, s->proc);
           c->expansion = expand_macro(c, s, hint);
           return c->expansion->type;
         }
@@ -4713,12 +5023,38 @@ class Checker : public InterpHost {
     if (c->callee->kind == NK::Ident && static_cast<Ident*>(c->callee)->sym->kind == SymKind::Proc)
       lit = static_cast<Ident*>(c->callee)->sym->proc;
     c->proc_type = ct;
+    if (lit) note_call(c, lit);
     if (!ct->c_call)
       require_context(c->loc, lit ? "calling " + proc_desc(lit) : std::string("calling a procedure value"));
     bind_args(c, ct, lit);
     if (ct->returns.empty()) return T.void_t;
     if (ct->returns.size() == 1) return ct->returns[0];
     return T.tuple(ct->returns);
+  }
+
+  void warn(SourceLoc loc, std::string message) {
+    for (auto& w : prog_.warnings)
+      if (w.loc.file == loc.file && w.loc.line == loc.line && w.loc.col == loc.col && w.message == message) return;
+    prog_.warnings.push_back({loc, std::move(message)});
+  }
+
+  // Checks a call of procedure `p` (once its overload is picked): #deprecated.
+  void note_call(Call* c, ProcLit* p) {
+    if (p->deprecated)
+      warn(c->loc, cat("'", p->name, "' is deprecated", p->deprecated_note.empty() ? "" : ": ", p->deprecated_note));
+  }
+
+  // An expression statement: the result of a #must procedure cannot be dropped.
+  void check_must_use(Expr* e) {
+    if (e->kind != NK::Call) return;
+    auto* c = static_cast<Call*>(e);
+    ProcLit* p = nullptr;
+    if (c->expansion) p = static_cast<MacroExpansion*>(c->expansion)->macro;
+    else if (c->callee->kind == NK::Ident && static_cast<Ident*>(c->callee)->sym &&
+             static_cast<Ident*>(c->callee)->sym->kind == SymKind::Proc)
+      p = static_cast<Ident*>(c->callee)->sym->proc;
+    if (p && p->must)
+      fail(c->loc, "the result of '", p->name, "' must be used (it is marked #must)");
   }
 
   // ---- overload resolution
@@ -4946,7 +5282,7 @@ class Checker : public InterpHost {
       if (s->kind == SymKind::PolyProc) {
         ProcLit* p = s->proc;
         bool baked = false;
-        for (Decl* d : p->params) baked |= d->is_baked;
+        for (Decl* d : p->params) baked |= d->is_baked || d->auto_bake;
         if (p->variadic || baked || p->params.size() != args.size()) continue;
         for (int swap = 0; swap < (p->symmetric && args.size() == 2 ? 2 : 1); ++swap) {
           ArgMap m;
@@ -5222,6 +5558,29 @@ class Checker : public InterpHost {
         complete_type(t, c->loc);
         c->type_arg = t;
         return T.pointer_to(type_info_struct_for(t));
+      }
+      case Builtin::IsConstant: {  // is_constant(x): whether x is a compile-time constant (never evaluated)
+        auto& a = positional(c, 1, 1, "is_constant");
+        check_value(a[0], nullptr);
+        bool k = a[0]->is_const();
+        if (!k && a[0]->kind == NK::Ident) k = constant_macro_params_.count(static_cast<Ident*>(a[0])->sym) > 0;
+        c->cv = ConstValue::of_bool(k);
+        return T.bool_t;
+      }
+      case Builtin::InitializerOf: {  // a procedure that sets *p to T's default value, or null if that is zero
+        auto& a = positional(c, 1, 1, "initializer_of");
+        Type* t = resolve_type(a[0]);
+        if (t->is_untyped()) fail(a[0]->loc, "initializer_of needs a type, not an untyped constant");
+        complete_type(t, c->loc);
+        c->type_arg = t;
+        Type* pt = T.proc({T.pointer_to(t)}, {}, false, -1);
+        c->resolved_args.clear();
+        if (!type_has_default(t)) {
+          c->cv = ConstValue::null();
+          return pt;
+        }
+        c->resolved_args.push_back(initializer_proc(t));
+        return pt;
       }
       case Builtin::TypeOf: {
         auto& a = positional(c, 1, 1, "type_of");

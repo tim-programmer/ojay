@@ -82,18 +82,24 @@ bool read_file(const std::string& path, std::string& out) {
   return true;
 }
 
-void print_error(const SourceManager& sm, const CompileError& e) {
-  if (e.loc.line == 0) {
-    std::cerr << "error: " << e.what() << "\n";
+void print_diagnostic(const SourceManager& sm, SourceLoc loc, const char* kind, const std::string& msg) {
+  if (loc.line == 0) {
+    std::cerr << kind << ": " << msg << "\n";
     return;
   }
-  std::cerr << sm.describe(e.loc) << ": error: " << e.what() << "\n";
-  std::string line = sm.line_text(e.loc);
+  std::cerr << sm.describe(loc) << ": " << kind << ": " << msg << "\n";
+  std::string line = sm.line_text(loc);
   if (!line.empty()) {
     std::cerr << "    " << line << "\n    ";
-    for (uint32_t i = 1; i < e.loc.col && i - 1 < line.size(); ++i) std::cerr << (line[i - 1] == '\t' ? '\t' : ' ');
+    for (uint32_t i = 1; i < loc.col && i - 1 < line.size(); ++i) std::cerr << (line[i - 1] == '\t' ? '\t' : ' ');
     std::cerr << "^\n";
   }
+}
+
+void print_error(const SourceManager& sm, const CompileError& e) { print_diagnostic(sm, e.loc, "error", e.what()); }
+
+void print_warnings(const SourceManager& sm, const Program& prog) {
+  for (auto& w : prog.warnings) print_diagnostic(sm, w.loc, "warning", w.message);
 }
 
 // Loads the main file and everything it #loads / #imports. Each imported
@@ -282,9 +288,11 @@ int driver_main(int argc, char** argv, const TargetDesc& target) {
     loader.load_main(o.input);
     analyze(ast, sm, types, prog, SemaOptions{});
   } catch (const CompileError& e) {
+    print_warnings(sm, prog);
     print_error(sm, e);
     return 1;
   }
+  print_warnings(sm, prog);
 
   // ---------------------------------------------------------------- backend
   llvm::InitializeAllTargetInfos();

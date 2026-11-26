@@ -19,6 +19,9 @@ tests/run/*.jai     compiled, linked and executed; stdout must equal the .out
                     itself must print on stdout (compile-time `print` in
                     `#run`), one line each, for every target; without them
                     the compiler must print nothing.
+                    `// WARNING: text` lines give substrings the compiler's
+                    stderr must contain (its warnings); without them it must
+                    print no warnings.
 tests/errors/*.jai  must fail to compile; the first line `// ERROR: text`
                     gives a substring expected in the compiler's stderr (more
                     `// ERROR:` lines right after it give more substrings).
@@ -212,7 +215,8 @@ def main():
     not_run = 0
     tmp = tempfile.mkdtemp(prefix="ojay-tests-")
 
-    def check_program(name, src, want_out, want_code, want_compile_out="", c_src=None, skip=(), prog_args=()):
+    def check_program(name, src, want_out, want_code, want_compile_out="", c_src=None, skip=(), prog_args=(),
+                      want_warnings=()):
         nonlocal passed, not_run
         for cfg in configs:
             if any(s in cfg.label for s in skip):
@@ -222,6 +226,11 @@ def main():
             r = run(cfg.compile_cmd + [src, "-o", obj])
             if r.returncode != 0:
                 failures.append((name, cfg.label, "compile failed:\n" + r.stderr.decode()))
+                continue
+            err = r.stderr.decode()
+            missing = [w for w in want_warnings if w not in err]
+            if missing or (not want_warnings and "warning:" in err):
+                failures.append((name, cfg.label, f"compiler warnings differ (want {list(want_warnings)!r})\n{err}"))
                 continue
             if r.stdout.decode() != want_compile_out:
                 failures.append((name, cfg.label, f"compiler output differs\n--- got\n{r.stdout.decode()}"
@@ -269,8 +278,9 @@ def main():
         skip = [s.strip() for s in re.findall(r"^// SKIP:(.*)$", text, re.M)]
         c_src = src[:-4] + ".c"
         prog_args = shlex.split(" ".join(re.findall(r"^// ARGS:(.*)$", text, re.M)))
+        warnings = [w.strip() for w in re.findall(r"^// WARNING:(.*)$", text, re.M)]
         check_program(name, src, want_out, int(m.group(1)) if m else 0, compile_out,
-                      c_src if os.path.exists(c_src) else None, skip, prog_args)
+                      c_src if os.path.exists(c_src) else None, skip, prog_args, warnings)
 
     # tools/regs2jai.py: X_svd_test.jai #loads the conversion of X.svd (X_h_test.jai: of X.h)
     # as X_svd.jai. An optional `// REGS2JAI: args` line gives extra converter arguments.

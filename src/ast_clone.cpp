@@ -32,6 +32,8 @@ class Cloner {
         auto* n = ast_.make<Ident>(e->loc, id->name);
         n->poly = id->poly;
         n->backtick = id->backtick;
+        n->constraint = expr(id->constraint);
+        n->constraint_interface = id->constraint_interface;
         return n;
       }
       case NK::Unary: {
@@ -46,6 +48,7 @@ class Cloner {
         auto* c = as<Call>(e);
         auto* n = ast_.make<Call>(e->loc, expr(c->callee));
         n->args = args(c->args);
+        n->force_inline = c->force_inline;
         return n;
       }
       case NK::Index: {
@@ -268,6 +271,7 @@ class Cloner {
     n->is_using = d->is_using;
     n->is_vararg = d->is_vararg;
     n->is_baked = d->is_baked;
+    n->auto_bake = d->auto_bake;
     n->is_global = d->is_global;
     n->backtick = d->backtick;
     n->add_context = d->add_context;
@@ -293,6 +297,11 @@ class Cloner {
     n->poly_returns = p->poly_returns;
     n->is_macro = p->is_macro;
     n->no_context = p->no_context;
+    n->no_abc = p->no_abc;
+    n->always_inline = p->always_inline;
+    n->must = p->must;
+    n->deprecated = p->deprecated;
+    n->deprecated_note = p->deprecated_note;
     n->modify = block(p->modify);
     n->name = p->name;
     return n;

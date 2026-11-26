@@ -79,6 +79,11 @@ struct Program {
   std::vector<ProcLit*> procs;        // every procedure literal, in discovery order
   std::vector<Symbol*> global_vars;
   std::vector<std::string> system_libraries;
+  struct Warning {
+    SourceLoc loc;
+    std::string message;
+  };
+  std::vector<Warning> warnings;  // printed by the driver (also when an error follows)
   ProcLit* main_proc = nullptr;
   // The context (Preload): set once the program uses it, or anything else of
   // the Preload (Allocator, temporary_allocator, ...). Programs that never do

@@ -1,0 +1,16 @@
+where_am_i
+poly
+main main
+true true
+NOT_THERE is missing
+true false
+true false
+true false true true
+10 is constant
+3 is not constant
+[RED, GREEN, BLUE]
+[3, 1, 7]
+[RED, GREEN, BLUE]
+GREEN BLUE GREEN BLUE
+A B
+LOW HIGH

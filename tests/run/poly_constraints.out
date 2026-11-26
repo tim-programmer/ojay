@@ -1,0 +1,5 @@
+crate #1 (Entity)
+hero #2 (Player)
+{2, 3} {tree.png, 5.5, 6.5, 1}
+6.5 30
+entity entity positioned

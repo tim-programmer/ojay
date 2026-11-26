@@ -30,8 +30,7 @@ namespace {
 
 // Directives that may follow a procedure header and that we accept but ignore.
 bool is_ignored_proc_directive(const std::string& d) {
-  return d == "must" || d == "no_context" || d == "no_debug" || d == "no_abc" || d == "symmetric" ||
-         d == "deprecated" || d == "cpp_method" || d == "no_aoc" || d == "dump" || d == "intrinsic" ||
+  return d == "no_debug" || d == "cpp_method" || d == "no_aoc" || d == "dump" || d == "intrinsic" ||
          d == "runtime_support";
 }
 
@@ -80,7 +79,7 @@ class Parser {
   // `$T` (the cursor is at '$'): an identifier that introduces a type variable.
   Ident* parse_poly_ident() {
     SourceLoc loc = expect(Tok::Dollar).loc;
-    if (at(Tok::Dollar)) fail(loc, "'$$' (auto-baking) is not supported yet");
+    if (at(Tok::Dollar)) fail(loc, "'$$' is only allowed before a parameter name ($$x: int)");
     auto* id = ast_.make<Ident>(loc, expect_ident("type variable name after '$'"));
     id->poly = true;
     ++poly_idents_;
@@ -96,8 +95,12 @@ class Parser {
     if (accept(Tok::KwUsing)) d->is_using = true;
     if (at(Tok::Dollar)) {
       advance();
-      if (at(Tok::Dollar)) fail(loc, "'$$' (auto-baking) is not supported yet");
-      d->is_baked = true;
+      if (accept(Tok::Dollar)) {  // `$$x`: baked when the argument is a constant
+        if (!p) fail(loc, "'$$' is only allowed on procedure parameters");
+        d->auto_bake = true;
+      } else {
+        d->is_baked = true;
+      }
     }
     d->names.push_back({expect_ident("parameter name"), loc});
     if (untyped_ok && (at(Tok::Comma) || at(Tok::RParen))) return d;
@@ -716,9 +719,14 @@ class Parser {
         c->no_check = no_check;
         return c;
       }
-      case Tok::KwInline:
-        advance();  // call-site `inline` is a hint we ignore
-        return parse_unary();
+      case Tok::KwInline: {  // `inline f(x)`: inline this call
+        advance();
+        Expr* e = parse_unary();
+        if (e->kind == NK::ProcLit) static_cast<ProcLit*>(e)->always_inline = true;
+        else if (e->kind == NK::Call) static_cast<Call*>(e)->force_inline = true;
+        else fail(loc, "'inline' must be followed by a procedure call or a procedure");
+        return e;
+      }
       default:
         return parse_postfix(parse_primary());
     }
@@ -961,13 +969,28 @@ class Parser {
       return ast_.make<DirectiveExpr>(loc, "insert", parse_unary());
     }
     if (d == "caller_location") return ast_.make<DirectiveExpr>(loc, d, nullptr);
+    if (d == "procedure_name") {  // `#procedure_name()`: the name of the enclosing procedure
+      if (accept(Tok::LParen)) expect(Tok::RParen, "#procedure_name takes no arguments");
+      return ast_.make<DirectiveExpr>(loc, d, nullptr);
+    }
+    if (d == "exists") {  // `#exists(name)`: whether `name` (or `Module.name`) is declared
+      expect(Tok::LParen, "after #exists");
+      Expr* x = parse_expr();
+      expect(Tok::RParen, "after #exists's operand");
+      return ast_.make<DirectiveExpr>(loc, d, x);
+    }
     if (d == "location") {
       expect(Tok::LParen, "after #location");
       Expr* x = parse_expr();
       expect(Tok::RParen, "after #location's operand");
       return ast_.make<DirectiveExpr>(loc, d, x);
     }
-    if (d == "procedure_of_call" || d == "bake_arguments" || d == "compiler") {
+    if (d == "bake_arguments" || d == "bake_constants") {  // `#bake_arguments f(a = 1)`: a new procedure
+      Expr* x = parse_postfix(parse_primary());
+      if (x->kind != NK::Call) fail(x->loc, "#", d, " expects a call-like list of arguments: #", d, " f(name = value)");
+      return ast_.make<DirectiveExpr>(loc, d, x);
+    }
+    if (d == "procedure_of_call" || d == "compiler") {
       fail(loc, "#", d, " is not supported yet");
     }
     if (d == "modify" || d == "expand") fail(loc, "#", d, " must follow a procedure's parameter list");
@@ -1008,8 +1031,13 @@ class Parser {
         fail(loc, "unexpected directive '#", cur().text, "' in type");
       case Tok::Dollar: {
         Ident* id = parse_poly_ident();
-        if (at(Tok::Slash))
-          fail(cur().loc, "type constraints ($", id->name, "/Interface) are not supported yet");
+        if (accept(Tok::Slash)) {  // `$T/X` or `$T/interface X`
+          if (at(Tok::Ident) && cur().text == "interface" && peek().kind == Tok::Ident) {
+            advance();
+            id->constraint_interface = true;
+          }
+          id->constraint = parse_type();
+        }
         return id;
       }
       case Tok::KwStruct:
@@ -1129,7 +1157,7 @@ class Parser {
     int polys = poly_idents_;
     while (!at(Tok::RParen)) {
       Decl* d = parse_param(p, short_lambda);
-      if (d->is_baked) p->is_poly = true;
+      if (d->is_baked || d->auto_bake) p->is_poly = true;
       p->params.push_back(d);
       if (!accept(Tok::Comma)) break;
     }
@@ -1157,7 +1185,13 @@ class Parser {
       } else if (d == "symmetric") {
         p->symmetric = true;
       } else if (d == "deprecated") {
-        if (at(Tok::String)) advance();
+        p->deprecated = true;
+        if (at(Tok::String)) p->deprecated_note = advance().text;
+      } else if (d == "no_abc") {
+        p->no_abc = true;
+      } else if (d == "must") {
+        if (p->returns.empty()) fail(loc, "#must is only allowed on a procedure that returns a value");
+        p->must = true;
       } else if (d == "expand") {
         p->is_macro = true;
       } else if (d == "modify") {

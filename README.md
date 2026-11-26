@@ -297,6 +297,24 @@ Implemented:
   in overloading (an equally good non-polymorphic overload wins) and work as
   operators and across modules; an instance is checked in the template's
   scope, and only when a call actually uses it.
+* Type constraints: in `(e: *$T/Entity)` the type bound to `T` must be
+  `Entity` or a struct with a `using` member that is (or `using`s) an
+  `Entity`; `$T/Vec` with a polymorphic struct `Vec` accepts its instances;
+  `$T/interface Has_Position` accepts any struct with all of
+  `Has_Position`'s members (same names and types). A constraint that does
+  not hold rules the procedure out of overloading.
+* Auto-baking: a parameter `$$n: int` is baked into the instance (like
+  `$n`) when the call passes a constant, and is an ordinary parameter
+  otherwise, so `#if is_constant(n)` can choose code for each case. A
+  default value is baked.
+* Baking: `add_ten :: #bake_arguments add(b = 10);` is a copy of `add`
+  without parameter `b`, which is the constant 10 in its body;
+  `#bake_constants f(N = 3, T = float)` does the same for compile-time
+  parameters (`$N`) and type variables (`$T`). Baking a `x: $T` parameter
+  binds `T` to the value's type. If variables remain unbound the result is
+  polymorphic (`show_any :: #bake_arguments show(label = "any");`). The
+  values must be constants, the procedure must not be overloaded, and the
+  result must be declared as a constant (`name :: #bake_...`).
 * Polymorphic structs: `Vector :: struct ($T: Type, $N: int) { data: [N]T; }`,
   used as `Vector(float, 3)` in types and literals (`Vector(float, 3).{...}`),
   with default and named parameters (`Buffer(int, FILL = 7)`). Instances are
@@ -321,7 +339,18 @@ Implemented:
   literals `T.{...}` / `.{...}`, array literals `T.[...]` / `.[...]`, inferred
   enum members `.NAME`, `size_of`, `type_of`, `#char`, `#string`, `#file`,
   `#line`, `#if`, `#assert`, `#load`, `#location(x)` and `#caller_location`
-  (see *Metaprogramming* below)
+  (see *Metaprogramming* below), `#procedure_name()` (the enclosing
+  procedure's name; in a polymorphic instance the template's), `#exists(name)`
+  / `#exists(Module.name)` (whether the name is visible there, a constant
+  `bool` for `#if`), `is_constant(x)` (whether `x` is a compile-time constant;
+  `x` is not evaluated; in an `#expand` macro also true for a parameter given
+  a constant), `initializer_of(T)` (a procedure `(*T) -> ()` that sets a
+  `T` to its default value, or null when that is all zeros)
+* Procedure directives: `#deprecated` / `#deprecated "note"` (each call gets
+  a compiler warning), `-> T #must` (dropping the result of a call is an
+  error), `#no_abc` (no array bounds checks in the procedure's body), and
+  `inline`: `f :: inline (x: int) {...}` inlines every call of `f`,
+  `inline f(x)` that one call (also at `-O0`)
 * Modules: `#import "Name"` finds `Name.jai` or `Name/module.jai` in a
   `modules` directory next to the importing file or in a `-I` directory. Each
   module has its own scope: its declarations are visible where it is
@@ -374,7 +403,10 @@ Implemented:
     `is_digit`, `is_alpha`, `is_alnum`, `is_space`),
     `String_Builder` (`init_string_builder`, `append` of a string or byte,
     `print_to_builder`, `builder_string_length`, `builder_to_string`,
-    `reset`, `free_buffers`), and `log` / `log_error`, which format like
+    `reset`, `free_buffers`), enums (`enum_names`, `enum_values_as_s64`
+    (both T's own tables), `enum_values_as_enum` (a new array),
+    `enum_range`, `enum_lowest_value`, `enum_highest_value`,
+    `enum_range_given_info`), and `log` / `log_error`, which format like
     `sprint` and call `context.logger` with a `Log_Info` (`location`, the
     caller's unless `loc` is given, `common_flags` from `flags`, and
     `user_flags`; `log_error` sets `Log_Flags.ERROR`, which the default logger
@@ -400,9 +432,7 @@ Implemented:
   runtime (do not free them). Bare-metal programs, and `#run` code, get an
   empty array.
 
-What is not implemented yet is listed in [`TODO.md`](TODO.md). Some
-directives are accepted and have no effect: `#no_abc`, `#must`,
-`#deprecated` and call-site `inline`.
+What is not implemented yet is listed in [`TODO.md`](TODO.md).
 
 ### Struct layout, constants and distinct types
 
