@@ -1,7 +1,5 @@
-// get_command_line_arguments() on hosted / freestanding Linux.
+// get_command_line_arguments(): on Linux from argv, on the boards from semihosting (SYS_GET_CMDLINE).
 // ARGS: one "two words" 3 ""
-// SKIP: arm32
-// SKIP: riscv
 #import "Basic";
 
 main :: () {

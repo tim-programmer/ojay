@@ -1,17 +1,22 @@
 // Module Hash_Table: a hash table with open addressing and linear probing,
 // after Jai's module of the same name. Keys can be integers, enums, bools,
-// floats, pointers and strings (each has a get_hash overload here); the keys
-// are compared with ==. Iterate with `for table`: `it` is the value
+// floats, pointers and strings (each has a get_hash overload here; they are
+// compared with ==), or anything with a given_hash_function and a
+// given_compare_function: `Table(Point, int, hash_point, points_equal)`. Iterate with `for table`: `it` is the value
 // (`for * table`: a pointer to it), `it_index` the key; `remove it` removes
 // the entry.
 
 #import "Basic";
 
-Table :: struct ($Key_Type: Type, $Value_Type: Type, $LOAD_FACTOR_PERCENT: int = 70)
+Table :: struct ($Key_Type: Type, $Value_Type: Type,
+                 $given_hash_function: (Key_Type) -> u32 = null,
+                 $given_compare_function: (Key_Type, Key_Type) -> bool = null,
+                 $LOAD_FACTOR_PERCENT: int = 70)
 #modify {
+    if given_hash_function != null && given_compare_function != null  return true;
     tag := (cast(*Type_Info) Key_Type).type;
     return tag == .INTEGER || tag == .ENUM || tag == .BOOL || tag == .FLOAT || tag == .POINTER || tag == .STRING,
-           "keys must be integers, enums, bools, floats, pointers or strings";
+           "keys must be integers, enums, bools, floats, pointers or strings (or give a given_hash_function and a given_compare_function)";
 }
 {
     count:        int;  // entries in the table
@@ -64,7 +69,7 @@ table_reset :: (table: *Table($K, $V)) {
 // to replace) and returns a pointer to its value.
 table_add :: (table: *Table($K, $V), key: K, value: V) -> *V {
     ensure_space_for_one_more(table);
-    hash := get_valid_hash(key);
+    hash := get_valid_hash(table, key);
     index := cast(s64) hash & (table.allocated - 1);
     while table.entries[index].hash >= FIRST_VALID_HASH  index = (index + 1) & (table.allocated - 1);
     entry := *table.entries[index];
@@ -196,21 +201,28 @@ mix64 :: (x: u64) -> u32 {
     return cast,trunc(u32) x;
 }
 
-// The key's hash, kept clear of the two values that mark free slots.
-get_valid_hash :: (key: $K) -> u32 {
-    h := get_hash(key);
+// The key's hash (given_hash_function's or get_hash's), kept clear of the
+// two values that mark free slots.
+get_valid_hash :: (table: *Table($K, $V), key: K) -> u32 {
+    #if table.given_hash_function  h := table.given_hash_function(key);
+    else                           h := get_hash(key);
     if h < FIRST_VALID_HASH  h += FIRST_VALID_HASH;
     return h;
 }
 
+keys_equal :: (table: *Table($K, $V), a: K, b: K) -> bool {
+    #if table.given_compare_function  return table.given_compare_function(a, b);
+    else                              return a == b;
+}
+
 find_index :: (table: *Table($K, $V), key: K) -> s64 {
     if !table.allocated  return -1;
-    hash := get_valid_hash(key);
+    hash := get_valid_hash(table, key);
     index := cast(s64) hash & (table.allocated - 1);
     while true {
         entry := *table.entries[index];
         if entry.hash == NEVER_OCCUPIED_HASH  return -1;
-        if entry.hash == hash && entry.key == key  return index;
+        if entry.hash == hash && keys_equal(table, entry.key, key)  return index;
         index = (index + 1) & (table.allocated - 1);
     }
     return -1;

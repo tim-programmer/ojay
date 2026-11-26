@@ -324,9 +324,10 @@ class Parser {
     if (d == "assert") {
       advance();
       Expr* c = parse_expr();
-      if (accept(Tok::Comma)) parse_expr();  // optional message
+      auto* d = ast_.make<DirectiveExpr>(loc, "assert", c);
+      if (accept(Tok::Comma)) d->message = parse_expr();  // shown when it fails
       expect(Tok::Semi);
-      return ast_.make<ExprStmt>(loc, ast_.make<DirectiveExpr>(loc, "assert", c));
+      return ast_.make<ExprStmt>(loc, d);
     }
     if (d == "run") {
       // `#run expr;`: executed during compilation for its side effects.

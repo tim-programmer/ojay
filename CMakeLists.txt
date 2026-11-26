@@ -27,11 +27,13 @@ file(READ ${CMAKE_SOURCE_DIR}/src/core.jai OJAY_CORE)
 file(READ ${CMAKE_SOURCE_DIR}/src/modules/Hash_Table.jai OJAY_HASH_TABLE)
 file(READ ${CMAKE_SOURCE_DIR}/src/modules/String.jai OJAY_STRING)
 file(READ ${CMAKE_SOURCE_DIR}/src/modules/Random.jai OJAY_RANDOM)
+file(READ ${CMAKE_SOURCE_DIR}/src/modules/File.jai OJAY_FILE)
 configure_file(src/modules.cpp.in ${CMAKE_BINARY_DIR}/generated/modules.cpp @ONLY)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
   ${CMAKE_SOURCE_DIR}/src/modules/Basic.jai ${CMAKE_SOURCE_DIR}/src/modules/Math.jai
   ${CMAKE_SOURCE_DIR}/src/modules/Hash_Table.jai ${CMAKE_SOURCE_DIR}/src/modules/String.jai
-  ${CMAKE_SOURCE_DIR}/src/modules/Random.jai ${CMAKE_SOURCE_DIR}/src/core.jai)
+  ${CMAKE_SOURCE_DIR}/src/modules/Random.jai ${CMAKE_SOURCE_DIR}/src/modules/File.jai
+  ${CMAKE_SOURCE_DIR}/src/core.jai)
 
 add_library(ojay_core STATIC
   ${CMAKE_BINARY_DIR}/generated/preload.cpp

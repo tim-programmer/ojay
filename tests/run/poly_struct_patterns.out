@@ -1,0 +1,4 @@
+2 entries of Table(string, s64, null, null, 70)
+1 entries of Table(Point, s64, hash_point, points_equal, 70)
+3 40
+first (string)

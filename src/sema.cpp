@@ -370,6 +370,12 @@ class Checker : public InterpHost {
   }
 
   Symbol* declare(Scope* sc, const std::string& name, SymKind k, SourceLoc loc) {
+    if (name == "_") {  // `_, b := f();`: the value is dropped; `_` names nothing
+      Symbol* s = new_symbol(name, k, loc);
+      s->scope = sc;
+      s->owner = proc_;
+      return s;
+    }
     auto it = sc->syms.find(name);
     if (it != sc->syms.end()) {
       fail(loc, "redeclaration of '", name, "' (previous declaration at ", sm_.describe(it->second->loc), ")");
@@ -1094,6 +1100,11 @@ class Checker : public InterpHost {
   // A #if condition: a constant bool, or a number or enum (`#if flags & .REVERSE`) that is not zero.
   bool eval_static_cond(Expr*& cond) {
     Type* t = check_value(cond, nullptr);
+    // A constant procedure (`#if table.given_hash_function`): true; null: false.
+    if ((t->is_proc() || t->is_pointer() || t->kind == TypeKind::Null) && cond->is_const()) {
+      if (cond->cv.kind == ConstValue::Null) return false;
+      if (cond->cv.kind == ConstValue::Proc || cond->cv.kind == ConstValue::Address) return cond->cv.i != 0 || cond->cv.proc;
+    }
     if (t->is_untyped() || t->kind == TypeKind::Int || t->kind == TypeKind::Enum) {
       if (cond->is_const() && cond->cv.kind == ConstValue::Int) return cond->cv.i != 0;
     } else {
@@ -1114,7 +1125,14 @@ class Checker : public InterpHost {
     if (d->name != "assert") fail(d->loc, "#", d->name, " is not supported as a statement yet");
     check_value(d->operand, T.bool_t);
     if (!d->operand->is_const()) fail(d->loc, "#assert condition must be a compile-time constant");
-    if (!d->operand->cv.b) fail(d->loc, "#assert failed");
+    if (!d->operand->cv.b) {
+      std::string msg;
+      if (d->message) {
+        check_value(d->message, T.string_t);
+        if (d->message->is_const() && d->message->cv.kind == ConstValue::String) msg = d->message->cv.s;
+      }
+      fail(d->loc, "#assert failed", msg.empty() ? "" : ": ", msg);
+    }
   }
 
   // `#run expr`: checks `expr` for compile-time execution and evaluates it.
@@ -1190,6 +1208,9 @@ class Checker : public InterpHost {
       case NK::ProcLit: {
         auto* p = static_cast<ProcLit*>(v);
         if (p->name.empty()) p->name = s->name;
+        if (!p->is_foreign)  // `t: *Table`: any instance of polymorphic struct Table
+          for (Decl* d : p->params)
+            if (complete_struct_patterns(d->type_expr)) p->is_poly = true;
         if (p->is_poly || p->poly_returns) {
           validate_poly_proc(p);
           s->kind = SymKind::PolyProc;
@@ -1488,6 +1509,22 @@ class Checker : public InterpHost {
       params.push_back(t);
     }
     std::vector<Type*> rets;
+    // The return types can name the parameters' type constants: `(t: *Table) -> t.Value_Type`.
+    Scope* saved_scope = scope_;
+    if (!p->returns.empty() && !p->params.empty()) {
+      scope_ = new_scope(scope_, proc_);
+      for (size_t i = 0; i < p->params.size(); ++i) {
+        Symbol* ps = declare(scope_, p->params[i]->names[0].name, SymKind::Var, p->params[i]->loc);
+        ps->type = params[i];
+        ps->owner = proc_;
+        ps->state = Symbol::State::Resolved;
+      }
+    }
+    struct RestoreScope {
+      Scope*& s;
+      Scope* v;
+      ~RestoreScope() { s = v; }
+    } restore_scope{scope_, saved_scope};
     for (auto& r : p->returns) {
       Type* t = resolve_type(r.type_expr);
       if (t->kind == TypeKind::Void) {
@@ -3997,7 +4034,63 @@ class Checker : public InterpHost {
       check_value(a.value, t->fields[idx].type);
       s->field_values[idx] = a.value;
     }
+    // All values constant: the literal is a constant (`K :: S.{name = "x"};`).
+    if (!t->is_union && !t->has_place) {
+      std::vector<ConstValue> es;
+      bool all = true;
+      for (size_t i = 0; i < t->fields.size() && all; ++i) {
+        const StructField& f = t->fields[i];
+        if (f.type->kind == TypeKind::Void) { es.push_back(ConstValue{}); continue; }
+        Expr* v = s->field_values[i] ? s->field_values[i] : f.default_value;
+        if (v) {
+          all = v->is_const();
+          if (all) es.push_back(v->cv);
+        } else {
+          ConstValue z;
+          all = default_const(f.type, z);
+          es.push_back(z);
+        }
+      }
+      if (all) s->cv = ConstValue::aggregate(std::move(es));
+    }
     return t;
+  }
+
+  // The default value of type t as a constant (false if it has none).
+  bool default_const(Type* t, ConstValue& out) {
+    Type* u = const_cast<Type*>(t->underlying());
+    if (!type_has_default(u)) {
+      switch (u->kind) {
+        case TypeKind::Int: case TypeKind::Enum: out = ConstValue::of_int(0); return true;
+        case TypeKind::Float: out = ConstValue::of_float(0); return true;
+        case TypeKind::Bool: out = ConstValue::of_bool(false); return true;
+        case TypeKind::String: out = ConstValue::of_string(""); return true;
+        case TypeKind::Pointer: case TypeKind::Proc: case TypeKind::TypeT: out = ConstValue::null(); return true;
+        case TypeKind::Struct: case TypeKind::Array: case TypeKind::Any: out = ConstValue::aggregate({}); return true;
+        default: return false;
+      }
+    }
+    if (u->is_fixed_array()) {
+      ConstValue e;
+      if (!default_const(u->elem, e)) return false;
+      out = ConstValue::aggregate(std::vector<ConstValue>((size_t)u->count, e));
+      return true;
+    }
+    if (u->kind != TypeKind::Struct || u->is_union || u->has_place) return false;
+    std::vector<ConstValue> es;
+    for (auto& f : u->fields) {
+      if (f.type->kind == TypeKind::Void) { es.push_back(ConstValue{}); continue; }
+      if (f.default_value) {
+        if (!f.default_value->is_const()) return false;
+        es.push_back(f.default_value->cv);
+        continue;
+      }
+      ConstValue z;
+      if (!default_const(f.type, z)) return false;
+      es.push_back(z);
+    }
+    out = ConstValue::aggregate(std::move(es));
+    return true;
   }
 
   Type* check_array_lit(ArrayLit* a, Type* hint) {
@@ -4015,6 +4108,14 @@ class Checker : public InterpHost {
     for (Expr*& x : a->elems) check_value(x, elem);
     Type* t = T.array_of(elem, ArrayKind::Fixed, (int64_t)a->elems.size());
     complete_type(t, a->loc);
+    // All elements constant: the literal is a constant (`TABLE :: int.[1, 2, 3];`).
+    bool all = !a->elems.empty();
+    for (Expr* x : a->elems) all = all && x->is_const();
+    if (all) {
+      std::vector<ConstValue> es;
+      for (Expr* x : a->elems) es.push_back(x->cv);
+      a->cv = ConstValue::aggregate(std::move(es));
+    }
     return t;
   }
 
@@ -4230,6 +4331,7 @@ class Checker : public InterpHost {
       case ConstValue::TypeV: return "type " + std::to_string((uintptr_t)v.t);
       case ConstValue::Null: return "null";
       case ConstValue::Code: return "code " + i128_str(v.i);
+      case ConstValue::Proc: return "proc " + std::to_string((uintptr_t)v.proc);
       case ConstValue::Aggregate: {
         std::string k = "{";
         for (const ConstValue& e : *v.elems) k += const_key(e) + ",";
@@ -4260,6 +4362,7 @@ class Checker : public InterpHost {
       case ConstValue::String: return "\"" + v.s + "\"";
       case ConstValue::Aggregate: return "{...}";
       case ConstValue::Code: return "(Code)";
+      case ConstValue::Proc: return v.proc->name.empty() ? std::string("(procedure)") : v.proc->name;
       default: return const_key(v);
     }
   }
@@ -4315,6 +4418,56 @@ class Checker : public InterpHost {
       Expr* v = clone_expr(ast_, d->values[0]);
       return check_value(v, nullptr);
     });
+  }
+
+  // In parameter type patterns, `Table($K, $V)` for a polymorphic struct with
+  // more parameters: the missing ones get hidden variables (`$__Table_3`), so
+  // the pattern matches any instance, whatever its other parameters are. A
+  // bare `Table` is `Table` with all of them hidden.
+  // Returns whether the pattern is (now) polymorphic.
+  bool complete_struct_patterns(Expr*& e) {
+    if (!e) return false;
+    switch (e->kind) {
+      case NK::Ident: {
+        auto* id = static_cast<Ident*>(e);
+        if (id->poly) return true;
+        Symbol* s = find(id->name, id->loc).sym;
+        if (!s || !is_poly_struct_decl(s)) return false;
+        e = ast_.make<Call>(id->loc, id);
+        complete_struct_patterns(e);
+        return true;
+      }
+      case NK::PtrType: return complete_struct_patterns(static_cast<PtrType*>(e)->elem);
+      case NK::ArrType: return complete_struct_patterns(static_cast<ArrType*>(e)->elem);
+      case NK::Call: {
+        auto* c = static_cast<Call*>(e);
+        bool poly = c->args.empty();
+        for (auto& a : c->args) poly |= complete_struct_patterns(a.value);
+        for (auto& a : c->args) poly |= find_poly(a.value) != nullptr;
+        Symbol* ps = poly ? poly_struct_named(c->callee) : nullptr;
+        if (!ps) return false;
+        StructDef* sd = poly_struct_def(ps);
+        std::vector<bool> given(sd->params.size(), false);
+        size_t pos = 0;
+        for (auto& a : c->args) {
+          if (a.name.empty()) {
+            if (pos < given.size()) given[pos++] = true;
+          } else {
+            for (size_t k = 0; k < sd->params.size(); ++k)
+              if (sd->params[k]->names[0].name == a.name) given[k] = true;
+          }
+        }
+        for (size_t k = 0; k < given.size(); ++k) {
+          if (given[k]) continue;
+          auto* id = ast_.make<Ident>(c->loc, cat("__", ps->name, "_", k));
+          id->poly = true;
+          c->args.push_back(Arg{sd->params[k]->names[0].name, c->loc, id});
+        }
+        return true;
+      }
+      default:
+        return find_poly(e) != nullptr;
+    }
   }
 
   void validate_poly_proc(ProcLit* p) {
@@ -4373,6 +4526,20 @@ class Checker : public InterpHost {
     } else {
       if (a->is_const() && a->cv.kind == ConstValue::TypeV)
         fail(a->loc, "parameter '", x.name, "' of '", owner, "' needs a value of type ", type_name(pt), ", not a type");
+      if (pt->is_proc() && !a->is_const()) {  // a procedure (by name, or a literal) is a constant here
+        ProcLit* p = nullptr;
+        if (a->kind == NK::Ident && static_cast<Ident*>(a)->sym && static_cast<Ident*>(a)->sym->kind == SymKind::Proc)
+          p = static_cast<Ident*>(a)->sym->proc;
+        else if (a->kind == NK::ProcLit)
+          p = static_cast<ProcLit*>(a);
+        if (p) {
+          if (arg_cost(a, pt) < 0)
+            fail(a->loc, "parameter '", x.name, "' of '", owner, "' needs a ", type_name(pt), ", not ", type_name(a->type));
+          if (p->is_macro) fail(a->loc, "an #expand macro cannot be a compile-time parameter");
+          want_proc(p);
+          a->cv = ConstValue::procedure(p);
+        }
+      }
       if (!a->is_const())
         fail(a->loc, "parameter '", x.name, "' of '", owner, "' is a compile-time parameter; its argument must be a constant");
       if (arg_cost(a, pt) < 0)

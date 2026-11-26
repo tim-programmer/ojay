@@ -51,6 +51,19 @@ def elf_entry_and_range(path):
     return entry, min(a for a, _ in addrs), max(b for _, b in addrs)
 
 
+
+def semihosting_cmdline(elf, args):
+    """The Tcl words of `arm semihosting_cmdline` for the program's arguments:
+    OpenOCD joins them with spaces, and the runtime splits the line at spaces
+    outside "double quotes", so arguments with spaces (or empty ones) are quoted."""
+    words = [os.path.basename(elf)] + list(args)
+    out = []
+    for w in words:
+        if w == "" or any(c in w for c in " \t"):
+            w = '"' + w + '"'
+        out.append("{" + w + "}")
+    return " ".join(out)
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("elf", nargs="?")
@@ -61,6 +74,8 @@ def main():
                     help="USB location (bus-port[.port...], e.g. 5-4) of the board to use when several "
                          "are connected; default $OJAY_ESP_USB_LOCATION or the first one found")
     ap.add_argument("-v", "--verbose", action="store_true", help="show OpenOCD's log")
+    ap.add_argument("--arg", action="append", default=[],
+                    help="an argument for the program (repeatable; semihosting SYS_GET_CMDLINE)")
     args = ap.parse_args()
 
     openocd = args.openocd or find_openocd()
@@ -95,7 +110,8 @@ def main():
     script = (
         "init; reset halt; "
         f"load_image {{{elf}}}; reg pc {entry:#x}; "
-        "arm semihosting enable; resume; "
+        "arm semihosting enable; "
+        f"arm semihosting_cmdline {semihosting_cmdline(args.elf, args.arg)}; resume; "
         # A semihosting exit makes OpenOCD exit with the program's status, so
         # reaching the lines below means something went wrong.
         f"if {{[catch {{wait_halt {ms}}}]}} {{ echo OJAY-RUN-TIMEOUT; halt; shutdown error }}; "

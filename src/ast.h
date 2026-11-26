@@ -362,6 +362,7 @@ struct DirectiveExpr : Expr {
   std::string name;
   Expr* operand = nullptr;
   int module_id = -1;  // `#import` (named import): driver's index into Program::modules
+  Expr* message = nullptr;  // `#assert cond, "message";`
   DirectiveExpr(SourceLoc l, std::string n, Expr* e) : Expr(NK::Directive, l), name(std::move(n)), operand(e) {}
 };
 

@@ -289,22 +289,25 @@ free_buffers :: (builder: *String_Builder) {
 
 // Formats a message (as sprint does) and hands it to context.logger, with
 // the caller's location and the flags in the Log_Info.
-log :: (format: string, args: .. Any, loc := #caller_location, flags := Log_Flags.NONE, user_flags: u32 = 0) {
-    __log(format, args, loc, flags, user_flags);
+log :: (format: string, args: .. Any, loc := #caller_location, flags := Log_Flags.NONE, user_flags: u32 = 0,
+        section: *Log_Section = null) {
+    __log(format, args, loc, flags, user_flags, section);
 }
 
 // log with Log_Flags.ERROR: the default logger writes it to stderr.
-log_error :: (format: string, args: .. Any, loc := #caller_location, user_flags: u32 = 0) {
-    __log(format, args, loc, .ERROR, user_flags);
+log_error :: (format: string, args: .. Any, loc := #caller_location, user_flags: u32 = 0, section: *Log_Section = null) {
+    __log(format, args, loc, .ERROR, user_flags, section);
 }
 
-__log :: (format: string, args: [] Any, loc: Source_Code_Location, flags: Log_Flags, user_flags: u32) {
+__log :: (format: string, args: [] Any, loc: Source_Code_Location, flags: Log_Flags, user_flags: u32,
+          section: *Log_Section) {
     message := sprint(format, ..args);
     info: Log_Info;
     info.source_identifier = context.log_source_identifier;
     info.location = loc;
     info.common_flags = flags;
     info.user_flags = user_flags;
+    info.section = ifx section then section else context.log_section;
     if context.logger  context.logger(message, context.logger_data, info);
     free(message);
 }

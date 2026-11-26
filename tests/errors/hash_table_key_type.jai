@@ -1,4 +1,4 @@
-// ERROR: #modify of 'Table' rejected Key_Type = P, Value_Type = s64, LOAD_FACTOR_PERCENT = 70: keys must be integers, enums, bools, floats, pointers or strings
+// ERROR: keys must be integers, enums, bools, floats, pointers or strings (or give a given_hash_function and a given_compare_function)
 #import "Hash_Table";
 P :: struct { x: int; }
 main :: () { t: Table(P, int); }

@@ -24,13 +24,11 @@ What is implemented is documented in `README.md`; this file lists only what is n
 
 ## Runtime and modules
 
-- [ ] More modules: `File`, `POSIX`, `Compiler`, `Thread`; `Hash_Table`'s
-      custom hash and compare procedures (struct parameters that are procedures)
+- [ ] More modules: `POSIX`, `Compiler`, `Thread`; `File` on bare metal (semihosting file calls)
 - [ ] Basic and Math: `Matrix2`, Jai's chained `String_Builder` buffers, moving
-      `min` / `max` / `abs` from built-ins to Jai, log sections (`Log_Section`, `Log_Info.section`)
+      `min` / `max` / `abs` from built-ins to Jai
 - [ ] Allocator: size-class bins for faster allocation with many free blocks
-- [ ] Command-line arguments: `__command_line_arguments`, arguments for bare-metal programs (e.g.
-      from semihosting `SYS_GET_CMDLINE`)
+- [ ] Command-line arguments: Jai's `__command_line_arguments` global (`get_command_line_arguments()` works)
 - [ ] Cortex-M console: input, a UART for the MPS2 / QEMU board, separate stdout and stderr
 
 ## Targets and boards

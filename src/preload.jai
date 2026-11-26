@@ -32,11 +32,18 @@ Log_Flags :: enum_flags u32 {
     VERY_VERBOSE_ONLY :: 0x10;
 }
 
+// A part of the program its log messages can be told apart by:
+// `RENDER :: Log_Section.{name = "render"};` then `log("...", section = *RENDER);`.
+Log_Section :: struct {
+    name: string;
+}
+
 Log_Info :: struct {
     source_identifier: string;
     location: Source_Code_Location;  // where log / log_error was called
     common_flags: Log_Flags;
     user_flags: u32;
+    section: *Log_Section;           // the `section` given to log, or context.log_section
 }
 
 Logger :: #type (message: string, data: *void, info: Log_Info);
@@ -62,6 +69,7 @@ Context :: struct {
     logger: Logger;
     logger_data: *void;
     log_source_identifier: string;
+    log_section: *Log_Section;  // the section of log messages that give none
     temporary_storage: *Temporary_Storage;
     thread_index: u32;
     user_index: u32;

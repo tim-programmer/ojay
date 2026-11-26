@@ -128,6 +128,7 @@ class Cloner {
         auto* d = as<DirectiveExpr>(e);
         auto* n = ast_.make<DirectiveExpr>(e->loc, d->name, expr(d->operand));
         n->module_id = d->module_id;
+        n->message = expr(d->message);
         return n;
       }
       case NK::CodeLit: {

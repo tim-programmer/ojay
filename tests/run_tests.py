@@ -7,7 +7,8 @@ tests/run/*.jai     compiled, linked and executed; stdout must equal the .out
                     contains text (e.g. `// SKIP: static` for a test that
                     needs libc, which the static x86-64 runtime does not have).
                     `// ARGS: words` gives command-line arguments (shell
-                    quoting) for native runs; embedded programs get none.
+                    quoting); embedded programs get them through semihosting
+                    (SYS_GET_CMDLINE), and none when run without it.
                     A C file next to the test (foo.jai + foo.c) is compiled
                     with the target's C compiler (cc, arm-none-eabi-gcc,
                     riscv32-esp-elf-gcc; -O0 for -O0 configurations, else
@@ -192,6 +193,22 @@ def make_configs(build_dir, arm_mode, riscv_mode):
     ] + configs_rv, where, rv_where
 
 
+def runner_cmd(runner, exe, args):
+    """The command that runs `exe` with arguments `args`: natively, under QEMU
+    (semihosting `arg=`), or with a board runner (`--arg`, semihosting)."""
+    if runner is None:
+        return [exe] + list(args)
+    if runner and runner[0] and os.path.basename(runner[0]).startswith("qemu"):
+        cmd = list(runner)
+        i = cmd.index("-semihosting-config") + 1
+        for a in [os.path.basename(exe)] + list(args):
+            if a == "" or " " in a:
+                a = '"' + a + '"'
+            cmd[i] += ",arg=" + a.replace(",", ",,")
+        return cmd + [exe]
+    return list(runner) + [f"--arg={a}" for a in args] + [exe]
+
+
 def run(cmd, timeout=120):
     return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
 
@@ -248,11 +265,11 @@ def main():
             if r.returncode != 0:
                 failures.append((name, cfg.label, "link failed:\n" + r.stderr.decode()))
                 continue
-            if cfg.runner is False:
-                not_run += 1
+            if cfg.runner is False or (prog_args and cfg.runner and "--uart" in cfg.runner):
+                not_run += 1  # (without semihosting a board program gets no arguments)
                 passed += 1
                 continue
-            r = run((cfg.runner or []) + [exe] + (list(prog_args) if cfg.runner is None else []))
+            r = run(runner_cmd(cfg.runner, exe, prog_args))
             out = r.stdout.decode()
             if out != want_out or r.returncode != want_code:
                 msg = f"exit {r.returncode} (want {want_code})\n--- got\n{out}--- want\n{want_out}"

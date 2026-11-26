@@ -251,8 +251,10 @@ names in the source.
 Implemented:
 
 * Declarations: `x := 1;`, `x: int = 1;`, `x: int;` (zero/default init),
-  `= ---` (uninitialized), constants `N :: 10;`, typed constants
-  `N : s32 : 10;`, multiple declarations `a, b := 1, 2;`
+  `= ---` (uninitialized), constants `N :: 10;` (also struct and array
+  literals of constants: `RED :: Color.{255, 0, 0};`, `T :: int.[1, 2];`), typed constants
+  `N : s32 : 10;`, multiple declarations `a, b := 1, 2;` (`_` drops a
+  value: `_, found := table_find(*t, key);`)
 * Types: `s8..s64`, `u8..u64`, `int`, `float`/`float32`, `float64`, `bool`,
   `string`, `*T`, `[N]T`, `[]T`, `[..]T`, `Any`, `Type`, procedure types,
   `struct` (member defaults, anonymous `struct { }` / `union { }` members,
@@ -288,7 +290,10 @@ Implemented:
 * Polymorphic procedures: `$T` in a parameter type introduces a type
   variable (later uses are plain `T`), inferred from the arguments through
   `$T`, `*$T`, `[]$T`, `[..]$T`, `[$N]$T`, procedure types (`f: (T) -> $R`)
-  and polymorphic struct instances (`Vector($T, $N)`). Untyped constants take
+  and polymorphic struct instances (`Vector($T, $N)`; a pattern with fewer
+  arguments than the struct has parameters, `Table($K, $V)`, accepts any
+  values for the others, and a bare `*Table` any instance; the return types
+  can use the parameters' constants: `(t: *Table) -> t.Value_Type`). Untyped constants take
   their default type (`max_of(1, 2)` has `T = int`). Compile-time parameters
   are baked into the instance: `make :: ($T: Type) -> *T` is called as
   `make(int)`, and `$N: int` (or `$N := 10`) as `f(3, ...)`. In the body `T` is
@@ -325,7 +330,11 @@ Implemented:
   polymorphic (`show_any :: #bake_arguments show(label = "any");`). The
   values must be constants, the procedure must not be overloaded, and the
   result must be declared as a constant (`name :: #bake_...`).
-* Polymorphic structs: `Vector :: struct ($T: Type, $N: int) { data: [N]T; }`,
+* Polymorphic structs: `Vector :: struct ($T: Type, $N: int) { data: [N]T; }`
+  (parameters can also be procedures: `Sorter :: struct ($T: Type, $less:
+  (T, T) -> bool)`, used as `Sorter(int, ascending)` or with a literal; so
+  can a procedure's compile-time parameters, `$f: (int) -> int`; `#if` of
+  such a parameter is false when it is null),
   used as `Vector(float, 3)` in types and literals (`Vector(float, 3).{...}`),
   with default and named parameters (`Buffer(int, FILL = 7)`). Instances are
   cached by their parameter values, so `Vector(float32, 1 + 2)` is the same
@@ -356,7 +365,7 @@ Implemented:
   `.*` / `<<` dereference, `cast(T)`, `cast,trunc(T)`, `xx`, `ifx`, struct
   literals `T.{...}` / `.{...}`, array literals `T.[...]` / `.[...]`, inferred
   enum members `.NAME`, `size_of`, `type_of`, `#char`, `#string`, `#file`,
-  `#line`, `#if`, `#assert`, `#load`, `#location(x)` and `#caller_location`
+  `#line`, `#if`, `#assert` (`#assert cond, "message";`), `#load`, `#location(x)` and `#caller_location`
   (see *Metaprogramming* below), `#procedure_name()` (the enclosing
   procedure's name; in a polymorphic instance the template's), `#exists(name)`
   / `#exists(Module.name)` (whether the name is visible there, a constant
@@ -428,8 +437,9 @@ Implemented:
     `enum_range_given_info`), and `log` / `log_error`, which format like
     `sprint` and call `context.logger` with a `Log_Info` (`location`, the
     caller's unless `loc` is given, `common_flags` from `flags`, and
-    `user_flags`; `log_error` sets `Log_Flags.ERROR`, which the default logger
-    writes to stderr).
+    `user_flags`, and `section`: the `section` argument, else
+    `context.log_section`, a `*Log_Section` with a `name`; `log_error` sets
+    `Log_Flags.ERROR`, which the default logger writes to stderr).
   * Math: `clamp` (polymorphic), `lerp`, `PI64`, `TAU64`, `Vector2`,
     `Vector3`, `Vector4` (`x`, `y`, ... and `component[i]`), `make_vector2/3/4`,
     the operators `+ - * /` (per component, and `*` / `/` by a scalar),
@@ -456,10 +466,11 @@ Implemented:
     `find_or_add`, `table_reset`, `table_ensure_space`, `get_hash`
     overloads and `fnv1a_hash`; `for table` gives the values as `it` (`for
     *` pointers to them) and the keys as `it_index`, and `remove it` works.
-    Keys can be integers, enums, bools, floats, pointers and strings (Jai's
-    custom hash and compare procedure parameters are not supported); a table
-    allocates from `context.allocator` (or the `allocator` set before the
-    first add).
+    Keys can be integers, enums, bools, floats, pointers and strings, or
+    anything when the table is given procedures to hash and compare them:
+    `Table(Point, string, hash_point, points_equal)` (parameters
+    `given_hash_function` and `given_compare_function`). A table allocates
+    from `context.allocator` (or the `allocator` set before the first add).
   * String (all Jai, `src/modules/String.jai`): `equal`, `equal_nocase`,
     `compare_nocase`, `starts_with` / `begins_with`, `ends_with`,
     `find_index_from_left` / `_from_right` (of a string or a byte),
@@ -475,11 +486,16 @@ Implemented:
     in the context (`#add_context random_state`): `random_seed`,
     `random_get` (64 bits), `random_get_zero_to_one`, `_open`, `_float64`,
     and `random_get_within_range` (floats, or integers inclusive).
+  * File (all Jai, `src/modules/File.jai`; Linux only, through the C
+    library): `File`, `file_open` (`for_writing`, `keep_existing_content`,
+    `log_errors`), `file_close`, `file_write`, `file_read`, `file_length`,
+    `file_seek` (`File_Seek_Type`), `file_tell`, `read_entire_file`
+    (`zero_terminated`), `write_entire_file`, `file_exists`, `file_delete`,
+    `make_directory_if_it_does_not_exist`.
   Differences from Jai's modules: `array_reserve` and `String_Builder`
   memory come from the array's allocator (`context.allocator` when it first
   grows), `String_Builder` is one growing buffer rather than a chain of
-  buffers, and there are no log
-  sections (`Log_Info` has no `section`, `log` no `section` parameter).
+  buffers, and a `Log_Section` only has a `name`.
   `print` shows anonymous struct and union members inline, so a `Vector3`
   prints as `{1, 2, 3}`.
   The allocating ones use `context.allocator`; `alloc`, `free`, `realloc`,
@@ -487,7 +503,11 @@ Implemented:
   `New(T, allocator = a)`), and `New` / `NewArray` take `initialized = false`.
   `get_command_line_arguments()` returns the program's arguments as a
   `[] string`, the program name first; the array and strings belong to the
-  runtime (do not free them). Bare-metal programs, and `#run` code, get an
+  runtime (do not free them). Bare-metal programs get theirs from the
+  debugger or simulator through semihosting (`SYS_GET_CMDLINE`: the line is
+  split at spaces, `"double quotes"` group words; `tools/run_mcxn947.py
+  --arg=x`, `tools/run_esp32c6.py --arg=x`, QEMU's `-semihosting-config
+  ...,arg=x`), and an empty array without semihosting; `#run` code gets an
   empty array.
 
 What is not implemented yet is listed in [`TODO.md`](TODO.md).

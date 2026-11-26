@@ -318,7 +318,7 @@ static int semihost(int op, void *arg) {
   return r0;
 }
 
-enum { SH_OPEN = 0x01, SH_WRITE = 0x05, SH_EXIT = 0x18, SH_EXIT_EXTENDED = 0x20 };
+enum { SH_OPEN = 0x01, SH_WRITE = 0x05, SH_GET_CMDLINE = 0x15, SH_EXIT = 0x18, SH_EXIT_EXTENDED = 0x20 };
 
 static int sh_handles[3] = {-1, -1, -1};
 
@@ -405,7 +405,7 @@ static int semihost(int op, void *arg) {
   return a0;
 }
 
-enum { SH_WRITE = 0x05, SH_EXIT = 0x18, SH_EXIT_EXTENDED = 0x20 };
+enum { SH_WRITE = 0x05, SH_GET_CMDLINE = 0x15, SH_EXIT = 0x18, SH_EXIT_EXTENDED = 0x20 };
 
 /* Espressif's OpenOCD does not map the ":tt" console name (it would create a
  * file of that name), but passes write handles through as host descriptors:
@@ -1184,6 +1184,39 @@ const OString *__ojay_command_line_arguments(int64_t *count) {
   return args;
 }
 
+/* Bare metal: the program's arguments from a semihosting SYS_GET_CMDLINE
+ * string (the program name first), split at spaces; "double quotes" group
+ * words (and "" is an empty argument). The buffers are static. */
+#if defined(OJAY_PLATFORM_CORTEXM) || defined(OJAY_PLATFORM_ESP32C6)
+#define OJAY_CMDLINE_MAX 512
+#define OJAY_ARGS_MAX 32
+static char cmdline_buf[OJAY_CMDLINE_MAX];
+static char *cmdline_argv[OJAY_ARGS_MAX + 1];
+
+static int split_cmdline(char *s, int64_t len, char ***argv_out) {
+  int argc = 0;
+  char *out = s; /* words are rewritten in place (quotes removed) */
+  int64_t i = 0;
+  while (i < len && argc < OJAY_ARGS_MAX) {
+    while (i < len && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r')) i++;
+    if (i >= len) break;
+    char *word = out;
+    int quoted = 0;
+    while (i < len && (quoted || !(s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r'))) {
+      if (s[i] == '"') quoted = !quoted;
+      else *out++ = s[i];
+      i++;
+    }
+    if (i < len) i++; /* the separator (out never passes i, so the 0 below cannot overwrite unread text) */
+    *out++ = 0;
+    cmdline_argv[argc++] = word;
+  }
+  cmdline_argv[argc] = 0;
+  *argv_out = cmdline_argv;
+  return argc;
+}
+#endif
+
 void __ojay_runtime_init(int argc, char **argv) {
   __ojay_argc = argc;
   __ojay_argv = argv;
@@ -1430,7 +1463,14 @@ __attribute__((noreturn, used)) void Reset_Handler(uint32_t r0, uint32_t r1) {
   /* Drive the console's TX line from the start when it will carry the output. */
   if (!semihost_available() && !__ojay_console_write && (uintptr_t)&__ojay_console_mcxn947 != 0)
     mcx_uart_init();
-  plat_exit(main(0, 0));
+  int argc = 0;
+  char **argv = 0;
+  if (semihost_available()) {  /* the arguments the debugger (or simulator) was given */
+    uintptr_t args[2] = {(uintptr_t)cmdline_buf, OJAY_CMDLINE_MAX - 1};
+    if (semihost(SH_GET_CMDLINE, args) == 0 && args[1] < OJAY_CMDLINE_MAX)
+      argc = split_cmdline(cmdline_buf, (int64_t)args[1], &argv);
+  }
+  plat_exit(main(argc, argv));
 }
 
 static void fault(const char *what) {
@@ -1544,7 +1584,15 @@ __attribute__((noreturn, used)) void __ojay_reset(void) {
     for (uint8_t *d = __data_start, *s = __data_load; d < __data_end;) *d++ = *s++;
   }
   for (uint8_t *d = __bss_start; d < __bss_end;) *d++ = 0;
-  plat_exit(main(0, 0));
+  int argc = 0;
+  char **argv = 0;
+  {  /* the arguments the debugger was given (skipped without one: see __ojay_semihost_dead) */
+    uintptr_t args[2] = {(uintptr_t)cmdline_buf, OJAY_CMDLINE_MAX - 1};
+    int r = semihost(SH_GET_CMDLINE, args);
+    if (!__ojay_semihost_dead && r == 0 && args[1] < OJAY_CMDLINE_MAX)
+      argc = split_cmdline(cmdline_buf, (int64_t)args[1], &argv);
+  }
+  plat_exit(main(argc, argv));
 }
 
 static uint32_t read_csr_mcause(void) { uint32_t v; __asm__ volatile("csrr %0, mcause" : "=r"(v)); return v; }
