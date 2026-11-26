@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <filesystem>
 #include <map>
 #include <memory>
 #include <optional>
@@ -185,6 +186,8 @@ class Checker : public InterpHost {
   Scope* preload_ = nullptr;
   Scope* core_ = nullptr;           // core.jai: For_Flags, Type_Info and the Type_Info_* structs
   Type* for_flags_t_ = nullptr;     // For_Flags
+  Type* source_loc_t_ = nullptr;    // Source_Code_Location
+  bool in_param_default_ = false;   // checking a parameter's default value (#caller_location is allowed)
   // Backtick declarations nested inside a macro body (e.g. `it in a
   // for_expansion's loop): Code from the caller inserted where they are
   // visible sees them.
@@ -499,6 +502,71 @@ class Checker : public InterpHost {
     fail(loc, "undeclared identifier '", name, "'");
   }
 
+  // ------------------------------------------------------------------ #location / #caller_location
+
+  // `loc` as a Source_Code_Location constant. Text made by #insert has no file
+  // of its own: it reports where it was inserted. Files report an absolute
+  // path; the embedded sources keep their names (<Basic>, <core>, ...).
+  ConstValue location_value(SourceLoc loc) {
+    while (loc.file < sm_.count() && sm_.get(loc.file).origin.line != 0) loc = sm_.get(loc.file).origin;
+    std::string path = loc.file < sm_.count() ? sm_.get(loc.file).path : std::string();
+    if (!path.empty() && path[0] != '<') {
+      std::error_code ec;
+      std::filesystem::path abs = std::filesystem::absolute(path, ec);
+      if (!ec) path = abs.lexically_normal().string();
+    }
+    return ConstValue::aggregate({ConstValue::of_string(path), ConstValue::of_int(loc.line), ConstValue::of_int(loc.col)});
+  }
+
+  static bool is_caller_location(const Expr* e) {
+    return e && e->kind == NK::Directive && static_cast<const DirectiveExpr*>(e)->name == "caller_location";
+  }
+
+  // The argument a call at `loc` passes for a `#caller_location` default.
+  Expr* caller_location_at(SourceLoc loc) {
+    auto* e = ast_.make<DirectiveExpr>(loc, "caller_location", nullptr);
+    e->type = source_loc_t_;
+    e->cv = location_value(loc);
+    return e;
+  }
+
+  // `#location(x)`: where the declaration `x` names is (a procedure, variable,
+  // constant, type or module member); any other expression gives its own location.
+  Type* check_location(DirectiveExpr* d) {
+    Expr* x = d->operand;
+    Symbol* sym = nullptr;
+    std::string name;
+    if (x->kind == NK::Ident) {
+      name = static_cast<Ident*>(x)->name;
+      Found f = find(name, x->loc);
+      if (f.via || f.enum_type) fail(x->loc, "#location: '", name, "' (brought in by 'using') is not a declaration");
+      sym = f.sym ? f.sym : lookup(name, x->loc);
+    } else if (x->kind == NK::Member && static_cast<Member*>(x)->base) {
+      auto* m = static_cast<Member*>(x);
+      if (Scope* ms = module_of(m->base)) {
+        name = m->name;
+        sym = module_member(ms, m);
+      }
+    }
+    // An expression: where it starts (a Binary's own location is its operator).
+    Expr* first = x;
+    for (;;) {
+      if (first->kind == NK::Binary) first = static_cast<Binary*>(first)->lhs;
+      else if (first->kind == NK::Index) first = static_cast<Index*>(first)->base;
+      else if (first->kind == NK::Call) first = static_cast<Call*>(first)->callee;
+      else if (first->kind == NK::Member && static_cast<Member*>(first)->base) first = static_cast<Member*>(first)->base;
+      else break;
+    }
+    SourceLoc at = first->loc;
+    if (sym) {
+      if (sym->loc.line == 0) fail(x->loc, "#location: '", name, "' is built in and has no source location");
+      at = sym->loc;
+    }
+    d->type = source_loc_t_;
+    d->cv = location_value(at);
+    return d->type;
+  }
+
   // ------------------------------------------------------------------ setup
 
   void add_type(Scope* sc, const char* name, Type* t) {
@@ -627,6 +695,7 @@ class Checker : public InterpHost {
     ti.enum_ = get("Type_Info_Enum");
     ti.procedure = get("Type_Info_Procedure");
     for_flags_t_ = get("For_Flags");
+    source_loc_t_ = get("Source_Code_Location");
     scope_ = saved;
   }
 
@@ -1180,7 +1249,14 @@ class Checker : public InterpHost {
         if (d->is_vararg) t = T.array_of(t, ArrayKind::View);
       }
       if (!d->values.empty()) {
+        bool caller_loc = is_caller_location(d->values[0]);
+        if (caller_loc && t && t != source_loc_t_)
+          fail(d->values[0]->loc, "#caller_location is a Source_Code_Location, but parameter '", d->names[0].name,
+               "' has type ", type_name(t));
+        bool saved = in_param_default_;
+        in_param_default_ = caller_loc;
         check_value(d->values[0], t);
+        in_param_default_ = saved;
         if (!t) t = d->values[0]->type;
       }
       if (t->kind == TypeKind::Void) fail(d->loc, "parameter cannot have type void");
@@ -2349,6 +2425,16 @@ class Checker : public InterpHost {
         auto* d = static_cast<DirectiveExpr*>(e);
         if (d->name == "run") return check_run(d, hint, /*statement=*/false);
         if (d->name == "insert") return check_insert_expr(e, hint);
+        if (d->name == "location") return check_location(d);
+        if (d->name == "caller_location") {
+          if (!in_param_default_)
+            fail(e->loc, "#caller_location is only allowed as a parameter's default value (loc := #caller_location)");
+          // Never used: every call that leaves the argument out passes its own
+          // location instead (caller_location_at).
+          e->type = source_loc_t_;
+          e->cv = location_value(e->loc);
+          return e->type;
+        }
         if (d->name.rfind("import:", 0) == 0) fail(e->loc, "named #import is only supported as `Name :: #import \"...\";`");
         fail(e->loc, "#", d->name, " is not supported here");
       }
@@ -3731,7 +3817,7 @@ class Checker : public InterpHost {
 
   // Registers inserted text as a source file, so errors in it point into it.
   uint32_t insert_source(const std::string& text, SourceLoc at) {
-    return sm_.add(cat("<inserted at ", sm_.get(at.file).path, ":", at.line, ">"), text);
+    return sm_.add(cat("<inserted at ", sm_.get(at.file).path, ":", at.line, ">"), text, at);
   }
 
   // The constant an #insert operand evaluates to: Code or a string.
@@ -4542,7 +4628,8 @@ class Checker : public InterpHost {
         continue;
       }
       if (lit && !lit->params[i]->values.empty()) {
-        out[i] = lit->params[i]->values[0];  // default value (already checked)
+        Expr* dv = lit->params[i]->values[0];  // default value (already checked)
+        out[i] = is_caller_location(dv) ? caller_location_at(c->loc) : dv;
         continue;
       }
       std::string pname = lit ? "'" + lit->params[i]->names[0].name + "'" : std::to_string(i + 1);

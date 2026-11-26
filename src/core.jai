@@ -128,3 +128,14 @@ Type_Info_Procedure :: struct {
     return_types: [] *Type_Info;
     procedure_flags: Type_Info_Procedure_Flags;
 }
+
+// ------------------------------------------------------------------ source locations
+
+// What #location(x) and #caller_location give. Files have an absolute path;
+// code in the embedded modules reports their names (<Basic>, <Math>, ...),
+// and text made by #insert reports where it was inserted.
+Source_Code_Location :: struct {
+    fully_pathed_filename: string;
+    line_number: s64;
+    character_number: s64;
+}

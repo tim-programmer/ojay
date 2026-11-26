@@ -925,8 +925,14 @@ class Parser {
       reject_insert_modifiers();
       return ast_.make<DirectiveExpr>(loc, "insert", parse_unary());
     }
-    if (d == "procedure_of_call" || d == "bake_arguments" || d == "caller_location" || d == "location" ||
-        d == "compiler") {
+    if (d == "caller_location") return ast_.make<DirectiveExpr>(loc, d, nullptr);
+    if (d == "location") {
+      expect(Tok::LParen, "after #location");
+      Expr* x = parse_expr();
+      expect(Tok::RParen, "after #location's operand");
+      return ast_.make<DirectiveExpr>(loc, d, x);
+    }
+    if (d == "procedure_of_call" || d == "bake_arguments" || d == "compiler") {
       fail(loc, "#", d, " is not supported yet");
     }
     if (d == "modify" || d == "expand") fail(loc, "#", d, " must follow a procedure's parameter list");

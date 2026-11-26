@@ -304,7 +304,8 @@ Implemented:
   `.*` / `<<` dereference, `cast(T)`, `cast,trunc(T)`, `xx`, `ifx`, struct
   literals `T.{...}` / `.{...}`, array literals `T.[...]` / `.[...]`, inferred
   enum members `.NAME`, `size_of`, `type_of`, `#char`, `#string`, `#file`,
-  `#line`, `#if`, `#assert`, `#load`
+  `#line`, `#if`, `#assert`, `#load`, `#location(x)` and `#caller_location`
+  (see *Metaprogramming* below)
 * Modules: `#import "Name"` finds `Name.jai` or `Name/module.jai` in a
   `modules` directory next to the importing file or in a `-I` directory. Each
   module has its own scope: its declarations are visible where it is
@@ -374,8 +375,7 @@ Implemented:
 
 Not yet implemented: `#compiler` procedures and the compiler message loop
 (`#run,stallable`), `Code_Node` introspection (`compiler_get_nodes`),
-`#insert,scope(...)`, `#caller_location` / `#location`,
-`#procedure_of_call`, variadic `#foreign` procedures (C varargs), parameters after a
+`#insert,scope(...)`, `#procedure_of_call`, `#procedure_name()`, variadic `#foreign` procedures (C varargs), parameters after a
 variadic one (Jai's `join(..strings, separator = ", ")`; Basic has no `join`), `using` on pointer members
 and at top level, `#as`, threads and thread contexts. Polymorphism does not yet cover `$$` auto-baking,
 `#bake_arguments`, `$T/Interface` constraints, `$R` introduced in a return
@@ -690,6 +690,26 @@ add :: (a: $T, b: T) -> T #modify { if T == s16  T = s64; return true; } { retur
   resolution tries the others, and the message appears in the error.
   Assigning a type variable (`T = s64;`) changes the instance. Compile-time
   values (`$N`) are constants in it.
+* Source locations: `Source_Code_Location` (`fully_pathed_filename`,
+  `line_number`, `character_number`) is visible everywhere.
+  `#location(x)` is a constant for where `x` is declared: a procedure (the
+  first of an overload set), variable, constant, type or module member
+  (`Math.clamp`); any other expression gives where that expression starts.
+  Built-ins (`int`, `print`, `array_add`) have no location and are an error.
+  `loc := #caller_location` is only allowed as a parameter's default value
+  (of type `Source_Code_Location`): each call that leaves the argument out
+  passes the location of the call (the callee's first character), which
+  works with named arguments, overloads, `#run` and macros. The location is
+  an ordinary argument, so a polymorphic procedure gets no instance per call
+  site. A call through a procedure value has no defaults and must pass the
+  location (`p(#location(x))` or any `Source_Code_Location`). Locations are
+  where the call is written: a call in a macro body or a `for_expansion`
+  reports the macro's line, a call in a body or `#code` the caller wrote
+  reports that line, and text inserted from a string (which has no file of
+  its own) reports the `#insert`. Files have an absolute path (diagnostics
+  and `#file` keep the path as given); the embedded modules report their
+  names, `<Basic>`, `<Math>`, `<preload>` and `<core>`. Both are constants,
+  usable in `#run` code and as `#run` results.
 * `for` over a value that is not an array or range calls the `#expand`
   macro `for_expansion(value, body, flags)`, as in Jai:
 
@@ -724,9 +744,13 @@ add :: (a: $T, b: T) -> T #modify { if T == s16  T = s64; return true; } { retur
   data again on every iteration.
 * `#if` takes a constant bool, number or enum (`#if flags & .REVERSE`).
 * Differences from Jai: `#insert,scope()`, `#insert -> string { ... }`,
-  `Code_Node` introspection, `#caller_location`, `` `break`` / `` `continue``,
+  `Code_Node` introspection, `#procedure_of_call`, `` `break`` / `` `continue``,
   `continue x` of a `for_expansion` loop and `#modify` on structs are not
-  supported. `#insert (...)` only takes `remove = { ... }`. `#code` takes an expression or
+  supported. `#insert (...)` only takes `remove = { ... }`. `assert` (a
+  built-in) reports its call site but takes no `loc` argument, and `log`
+  cannot take `loc := #caller_location` until parameters after a variadic one
+  exist, so `Log_Info` has no `location`; the embedded modules report names
+  rather than paths. `#code` takes an expression or
   a `{ }` block, not a bare statement. Macros return at most one value. A
   string inserted inside a macro resolves names in the macro's scope (the
   insertion point), while inserted `Code` follows the rules above.

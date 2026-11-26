@@ -1,0 +1,23 @@
+procedure source_location.jai:24:1 absolute
+struct source_location.jai:9:1 absolute
+global source_location.jai:11:1 absolute
+constant source_location.jai:13:1 absolute
+local source_location.jai:73:5 absolute
+expression source_location.jai:75:48 absolute
+is #file: true
+direct source_location.jai:78:34 absolute
+explicit 9
+explicit value 1234
+a 1 line 83
+b 2 line 84
+c 3 line 85
+int 7 line 86
+string x line 87
+poly 1 88 2 89
+macro body line 49
+macro call line 92
+for_expansion line 62
+body line 93
+procedure value 9
+inserted string source_location.jai:100:5 absolute
+inserted code 104

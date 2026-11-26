@@ -18,12 +18,13 @@ struct SourceLoc {
 struct SourceFile {
   std::string path;
   std::string text;
+  SourceLoc origin;  // text made by #insert: where it was inserted (line 0 otherwise)
 };
 
 class SourceManager {
  public:
-  uint32_t add(std::string path, std::string text) {
-    files_.push_back({std::move(path), std::move(text)});
+  uint32_t add(std::string path, std::string text, SourceLoc origin = {}) {
+    files_.push_back({std::move(path), std::move(text), origin});
     return static_cast<uint32_t>(files_.size() - 1);
   }
   const SourceFile& get(uint32_t id) const { return files_.at(id); }

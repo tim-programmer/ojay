@@ -15,7 +15,7 @@
 - [x] Procedure overloading
 - [x] Operator overloading
 - [x] Metaprogramming: `#insert`, `#code`, `#modify`, `#expand` (not yet: `#insert,scope()`,
-      `Code_Node` introspection / `compiler_get_nodes`, `#caller_location`, `` `break``/`` `continue``,
+      `Code_Node` introspection / `compiler_get_nodes`, `` `break``/`` `continue``,
       `#modify` on structs, macros with several return values)
 - [x] The context and custom allocators (not yet: Basic's `log`, threads and thread contexts,
       the `STARTUP` / `CAPS` / ... allocator modes, alignment requests)
@@ -33,7 +33,9 @@
 - [x] `for_expansion` (custom iteration with `For_Flags`) and `remove it` in `for` loops, with
       `#insert (remove = { ... }) body;`, backtick declarations nested in a macro body, and `#if`
       on numbers and enums (not yet: `continue x` of a `for_expansion` loop)
-- [ ] `#caller_location` / `#location`
+- [x] `#caller_location` / `#location` and `Source_Code_Location` (not yet: `log` with
+      `loc := #caller_location` and `Log_Info.location` (needs parameters after a variadic
+      one), a `loc` argument for `assert`, `#procedure_of_call`)
 - [ ] Struct layout and members: constants inside structs (`S :: struct { N :: 3; }`), `#place`,
       `#align`, `#this`
 - [ ] Distinct types (`#type,distinct`)
