@@ -15,6 +15,8 @@
 namespace ojay {
 
 extern const char* const kPreloadSource;  // preload.jai (generated preload.cpp)
+extern const char* const kBasicSource;    // modules/Basic.jai (generated modules.cpp)
+extern const char* const kMathSource;     // modules/Math.jai
 
 namespace {
 
@@ -113,6 +115,8 @@ class Checker : public InterpHost {
       m.scope->is_module = true;
       if (m.kind == ModuleUnit::Kind::Builtin) add_module_builtins(m.scope, m.name);
     }
+    for (auto& m : prog_.modules)
+      if (m.kind == ModuleUnit::Kind::Builtin) add_module_source(m.scope, m.name);
     global_ = prog_.modules[0].scope;
     // Imported modules first (they come later in the list), so #if conditions
     // can use the constants of the modules a unit imports.
@@ -540,6 +544,22 @@ class Checker : public InterpHost {
     context_sym_->state = Symbol::State::Resolved;
   }
 
+  // The part of built-in module `module` that is written in Jai, collected
+  // like the Preload: its declarations are only resolved when used. It sees
+  // the module's built-ins and the Preload.
+  void add_module_source(Scope* sc, const std::string& module) {
+    const char* src = module == "Basic" ? kBasicSource : module == "Math" ? kMathSource : nullptr;
+    if (!src) return;
+    std::vector<Stmt*> stmts = parse_source_stmts(ast_, sm_, sm_.add("<" + module + ">", src), true);
+    Scope* saved = scope_;
+    scope_ = sc;
+    lazy_collect_ = true;
+    collect(stmts, true);
+    lazy_collect_ = false;
+    scope_ = saved;
+    sc->imports.push_back(preload_);
+  }
+
   Symbol* preload_sym(const char* name) { return preload_->syms.at(name); }
 
   // The program uses the context (or something else of the Preload): from now
@@ -619,14 +639,21 @@ class Checker : public InterpHost {
     static const std::unordered_set<std::string> names = {
         "print", "sprint", "tprint", "write_string", "alloc", "free", "realloc", "New", "NewArray",
         "array_add", "array_free", "array_reset", "assert", "exit", "memcpy", "memset", "min", "max",
-        "to_c_string", "get_command_line_arguments"};
+        "to_c_string", "get_command_line_arguments", "array_reserve", "array_resize", "array_copy", "array_find",
+        "array_add_if_unique", "array_insert_at", "array_ordered_remove_by_index", "array_unordered_remove_by_index",
+        "array_ordered_remove_by_value", "array_unordered_remove_by_value", "array_view", "peek", "peek_pointer",
+        "pop", "swap", "c_style_strlen", "to_string", "alloc_string", "copy_string", "compare", "is_digit",
+        "is_alpha", "is_alnum", "is_space", "String_Builder", "init_string_builder", "append", "print_to_builder",
+        "builder_string_length", "builder_to_string", "free_buffers", "log_error"};
     return names.count(n) > 0;
   }
   static bool is_math_name(const std::string& n) {
     static const std::unordered_set<std::string> names = {
         "sqrt", "sin", "cos", "tan", "atan2", "pow", "floor", "ceil", "round", "exp", "log", "abs",
         "PI", "TAU", "S8_MIN", "S8_MAX", "S16_MIN", "S16_MAX", "S32_MIN", "S32_MAX", "S64_MIN",
-        "S64_MAX", "U8_MAX", "U16_MAX", "U32_MAX", "U64_MAX", "FLOAT32_MAX", "FLOAT64_MAX"};
+        "S64_MAX", "U8_MAX", "U16_MAX", "U32_MAX", "U64_MAX", "FLOAT32_MAX", "FLOAT64_MAX", "PI64", "TAU64",
+        "clamp", "lerp", "Vector2", "Vector3", "Vector4", "make_vector2", "make_vector3", "make_vector4", "dot",
+        "cross", "length", "length_squared", "distance", "normalize"};
     return names.count(n) > 0;
   }
 
@@ -656,6 +683,7 @@ class Checker : public InterpHost {
       add_builtin(sc, "New", Builtin::New);
       add_builtin(sc, "NewArray", Builtin::NewArray);
       add_builtin(sc, "array_add", Builtin::ArrayAdd);
+      add_builtin(sc, "array_reserve", Builtin::ArrayReserve);
       add_builtin(sc, "array_free", Builtin::ArrayFree);
       add_builtin(sc, "array_reset", Builtin::ArrayReset);
       add_builtin(sc, "assert", Builtin::Assert);
@@ -2833,6 +2861,7 @@ class Checker : public InterpHost {
   struct ArgMap {
     std::vector<Expr*> params;  // per parameter; null when not given
     std::vector<Expr*> extra;   // arguments of the variadic parameter
+    Expr* spread = nullptr;     // `..array` given for the variadic parameter instead
     std::vector<int> param_of;  // per call argument: its parameter
   };
 
@@ -3121,6 +3150,12 @@ class Checker : public InterpHost {
         continue;
       }
       if (named_seen) fail(a.value->loc, "positional arguments must come before named ones");
+      if (a.spread) {
+        check_spread(a, pos, fixed, p->variadic, args.size(), m.extra.size());
+        m.spread = a.value;
+        m.param_of.push_back((int)n - 1);
+        continue;
+      }
       if (pos < fixed) {
         m.param_of.push_back((int)pos);
         m.params[pos++] = a.value;
@@ -3273,6 +3308,12 @@ class Checker : public InterpHost {
       if (!d->type_expr) continue;
       if (d->is_vararg) {
         for (Expr* a : m.extra) match_arg(d->type_expr, a, pname);
+        if (m.spread && m.spread->type) {
+          Type* st = m.spread->type;
+          if (st->kind != TypeKind::Array)
+            fail(m.spread->loc, "'..' needs an array, not ", type_name(st));
+          match_type(tmpl, d->type_expr, st->elem, m.spread, pname, b);
+        }
       } else if (m.params[i]) {
         match_arg(d->type_expr, m.params[i], pname);
       }
@@ -3355,6 +3396,7 @@ class Checker : public InterpHost {
       };
       if (d->is_vararg) {
         for (Expr* a : m.extra) fits(a, pt->elem);
+        if (m.spread) fits(m.spread, pt);
       } else if (m.params[i]) {
         fits(m.params[i], pt);
       }
@@ -3380,6 +3422,7 @@ class Checker : public InterpHost {
     std::vector<Expr**> given(n, nullptr);
     size_t pos = 0;
     for (auto& a : args) {
+      if (a.spread) fail(a.value->loc, "'..' is not allowed in the parameters of polymorphic struct '", tmpl->name, "'");
       size_t idx = pos;
       if (!a.name.empty()) {
         for (idx = 0; idx < n && sd->params[idx]->names[0].name != a.name; ++idx) {}
@@ -3917,6 +3960,11 @@ class Checker : public InterpHost {
           if (lit->params[i]->names[0].name == a.name) idx = i;
         if (idx == n || out[idx] || (pt->variadic && idx == n - 1)) return -1;
         out[idx] = a.value;
+      } else if (a.spread) {
+        if (!pt->variadic || pos < fixed) return -1;
+        int k = arg_cost(a.value, pt->params[n - 1]);
+        if (k < 0) return -1;
+        cost += k + 1;
       } else if (pos < fixed) {
         out[pos++] = a.value;
       } else if (pt->variadic) {
@@ -4043,9 +4091,12 @@ class Checker : public InterpHost {
   // `*T` accepts an lvalue of type T (its address is passed).
   Expr* operator_call(const std::string& op, std::vector<Expr*> args, SourceLoc loc) {
     std::string name = "operator" + op;
-    Found f = find(name, loc);
-    if (!f.sym) return nullptr;
-    std::vector<Symbol*> cands = f.sym->overloads.empty() ? std::vector<Symbol*>{f.sym} : f.sym->overloads;
+    // The operators of every enclosing scope and imported module (e.g. the
+    // program's own and Math's vector operators).
+    std::vector<Symbol*> cands;
+    Builtin no_builtin = Builtin::None;
+    gather_procs(name, cands, no_builtin);
+    if (cands.empty()) return nullptr;
     for (Expr*& a : args)
       if (!needs_hint(a)) check_rv(a, nullptr);
     struct Choice { Symbol* sym; bool swap; bool addr; int cost; bool poly; };
@@ -4134,11 +4185,36 @@ class Checker : public InterpHost {
     return e;
   }
 
+  // `..array` as argument `a`: only for the variadic parameter, and as its only argument.
+  void check_spread(const Arg& a, size_t pos, size_t fixed, bool variadic, size_t n_args, size_t n_extra) {
+    if (!variadic) fail(a.value->loc, "'..' passes an array to a variadic parameter, but this procedure has none");
+    if (pos < fixed) fail(a.value->loc, "'..' passes an array to the variadic parameter; arguments for the ",
+                          fixed - pos, " parameter", fixed - pos == 1 ? "" : "s", " before it are missing");
+    if (n_extra > 0 || pos + 1 != n_args)
+      fail(a.value->loc, "an array passed with '..' must be the only argument of the variadic parameter");
+  }
+
+  void check_spread_value(Expr*& e, Type* view) {
+    Type* t = check_value(e, nullptr);
+    if (t->kind != TypeKind::Array)
+      fail(e->loc, "'..' needs an array, not ", type_name(t));
+    if (t->elem != view->elem)
+      fail(e->loc, "'..' passes ", type_name(t), " to a variadic parameter of type ..", type_name(view->elem));
+    coerce(e, view);
+  }
+
+  // Built-ins take no `..array` (print and sprint check theirs themselves).
+  static void reject_spread(Call* c, const char* name) {
+    for (auto& a : c->args)
+      if (a.spread) fail(a.value->loc, "'", name, "' has no variadic parameter to pass '..' to");
+  }
+
   void bind_args(Call* c, Type* pt, ProcLit* lit) {
     size_t n = pt->params.size();
     size_t fixed = pt->variadic ? n - 1 : n;
     std::vector<Expr*> out(n, nullptr);
     std::vector<Expr*> var_args;
+    Expr* spread = nullptr;
     size_t pos = 0;
     bool named_seen = false;
     for (auto& a : c->args) {
@@ -4155,6 +4231,11 @@ class Checker : public InterpHost {
         continue;
       }
       if (named_seen) fail(a.value->loc, "positional arguments must come before named ones");
+      if (a.spread) {
+        check_spread(a, pos, fixed, pt->variadic, c->args.size(), var_args.size());
+        spread = a.value;
+        continue;
+      }
       if (pos < fixed) {
         out[pos++] = a.value;
       } else if (pt->variadic) {
@@ -4175,7 +4256,10 @@ class Checker : public InterpHost {
       std::string pname = lit ? "'" + lit->params[i]->names[0].name + "'" : std::to_string(i + 1);
       fail(c->loc, "missing argument for parameter ", pname);
     }
-    if (pt->variadic) {
+    if (spread) {
+      check_spread_value(spread, pt->params[n - 1]);
+      out[n - 1] = spread;
+    } else if (pt->variadic) {
       Type* elem = pt->params[n - 1]->elem;
       auto* pack = ast_.make<ArrayLit>(c->loc, nullptr);
       for (Expr* v : var_args) {
@@ -4191,6 +4275,7 @@ class Checker : public InterpHost {
 
   // Positional-only argument helper for built-ins.
   std::vector<Expr*>& positional(Call* c, size_t min, size_t max, const char* name) {
+    reject_spread(c, name);
     for (auto& a : c->args)
       if (!a.name.empty()) fail(a.name_loc, "'", name, "' does not take named arguments");
     if (c->args.size() < min || c->args.size() > max) {
@@ -4206,6 +4291,7 @@ class Checker : public InterpHost {
   // then by name. The first `required` must be given; others may be null.
   std::vector<Expr*> builtin_args(Call* c, std::initializer_list<const char*> names, size_t required,
                                   const char* what) {
+    reject_spread(c, what);
     std::vector<const char*> ns(names);
     std::vector<Expr*> out(ns.size(), nullptr);
     size_t pos = 0;
@@ -4295,7 +4381,16 @@ class Checker : public InterpHost {
         const char* name = c->builtin == Builtin::Print ? "print" : "sprint";
         Expr* to_stderr = nullptr;
         std::vector<Expr*> args;
+        Expr* spread = nullptr;
         for (auto& a : c->args) {
+          if (a.spread) {
+            if (args.size() != 1 || spread)
+              fail(a.value->loc, "'", name, "' takes '..' only right after the format string, as its only argument");
+            spread = a.value;
+            continue;
+          }
+          if (spread && a.name.empty())
+            fail(a.value->loc, "an array passed with '..' must be the only argument after the format string");
           if (!a.name.empty()) {
             if (a.name == "to_standard_error" && c->builtin == Builtin::Print) {
               to_stderr = a.value;
@@ -4307,13 +4402,17 @@ class Checker : public InterpHost {
         }
         if (args.empty()) fail(c->loc, "'", name, "' needs a format string");
         check_value(args[0], T.string_t);
-        if (args[0]->is_const()) {
+        if (spread) {
+          check_spread_value(spread, T.array_of(T.any_t, ArrayKind::View));
+          c->spread_args = true;
+          args.push_back(spread);
+        } else if (args[0]->is_const()) {
           int specs = count_format_specs(args[0]->cv.s);
           if (specs != (int)args.size() - 1)
             fail(c->loc, "format string has ", specs, " '%' placeholder", specs == 1 ? "" : "s", " but ",
                  args.size() - 1, " argument", args.size() == 2 ? " was" : "s were", " given");
         }
-        for (size_t i = 1; i < args.size(); ++i) {
+        for (size_t i = spread ? args.size() : 1; i < args.size(); ++i) {
           check_rv(args[i], nullptr);
           if (args[i]->type->kind == TypeKind::Proc && args[i]->kind == NK::Ident) {
             // fine: printed as an address
@@ -4437,6 +4536,17 @@ class Checker : public InterpHost {
         c->type_arg = elem;
         if (a.size() == 1) return T.pointer_to(elem);
         check_value(a[1], elem);
+        return T.void_t;
+      }
+      case Builtin::ArrayReserve: {
+        require_context(c->loc, "'array_reserve'");
+        auto& a = positional(c, 2, 2, "array_reserve");
+        Type* t = check_value(a[0], nullptr);
+        if (!t->is_pointer() || !t->elem->is_dynamic())
+          fail(a[0]->loc, "'array_reserve' needs a pointer to a dynamic array ([..]T), e.g. array_reserve(*arr, 100)");
+        c->type_arg = t->elem->elem;
+        complete_type(c->type_arg, c->loc);
+        check_value(a[1], T.s64);
         return T.void_t;
       }
       case Builtin::ArrayFree: {

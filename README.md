@@ -259,7 +259,8 @@ Implemented:
   `using` members), `union`, `enum` / `enum_flags` with explicit base types and
   values, type aliases
 * Procedures: default and named arguments, multiple return values,
-  variadic `..T` parameters, procedure values, nested (non-capturing)
+  variadic `..T` parameters (an array is passed to one as `f(..array)`, also
+  to `print` / `sprint`: `print(format, ..args)`), procedure values, nested (non-capturing)
   procedures, order-independent top-level declarations, `#foreign` /
   `#c_call` with `#system_library`, structs and unions by value across the
   C boundary, `#program_export` (see *C interop* below)
@@ -327,10 +328,39 @@ Implemented:
   (`temporary_allocator`, `tprint`, `talloc`, `reset_temporary_storage`),
   `push_allocator`, and an allocator for each dynamic array
 * Built-in modules: `Basic` (`print`, `sprint`/`tprint`, `write_string`,
-  `alloc`, `free`, `realloc`, `New`, `NewArray`, `array_add`, `array_free`,
+  `alloc`, `free`, `realloc`, `New`, `NewArray`, `array_add`, `array_reserve`, `array_free`,
   `array_reset`, `assert`, `exit`, `memcpy`, `memset`, `min`, `max`,
   `to_c_string`, `get_command_line_arguments`, integer limits) and `Math` (`sqrt`, `sin`, `cos`, `tan`,
   `atan2`, `pow`, `floor`, `ceil`, `round`, `exp`, `log`, `abs`, `PI`, `TAU`).
+  These are built into the compiler. Both modules also have a part written
+  in Jai (`src/modules/Basic.jai`, `src/modules/Math.jai`, compiled into the
+  compiler like the Preload; only what a program uses is checked and
+  compiled, so the others cost nothing):
+  * Basic: polymorphic array procedures (`array_resize`, `array_copy`,
+    `array_find`, `array_add_if_unique`, `array_insert_at`,
+    `array_ordered_remove_by_index` / `_by_value`,
+    `array_unordered_remove_by_index` / `_by_value`, `array_view`, `peek`,
+    `peek_pointer`, `pop`), `swap`, strings (`to_string` of a C string or of
+    data and count, `c_style_strlen`, `alloc_string`, `copy_string`,
+    `compare`, `is_digit`, `is_alpha`, `is_alnum`, `is_space`),
+    `String_Builder` (`init_string_builder`, `append` of a string or byte,
+    `print_to_builder`, `builder_string_length`, `builder_to_string`,
+    `reset`, `free_buffers`), and `log` / `log_error`, which format like
+    `sprint` and call `context.logger` (`log_error` sets `Log_Flags.ERROR`,
+    which the default logger writes to stderr).
+  * Math: `clamp` (polymorphic), `lerp`, `PI64`, `TAU64`, `Vector2`,
+    `Vector3`, `Vector4` (`x`, `y`, ... and `component[i]`), `make_vector2/3/4`,
+    the operators `+ - * /` (per component, and `*` / `/` by a scalar),
+    unary `-` and `==`, `dot`, `cross`, `length`, `length_squared`,
+    `distance`, `normalize` (leaves vectors shorter than `epsilon`
+    unchanged) and `lerp` of vectors.
+  Differences from Jai's modules: `array_reserve` and `String_Builder`
+  memory come from the array's allocator (`context.allocator` when it first
+  grows), `String_Builder` is one growing buffer rather than a chain of
+  buffers, and `builder_to_string`, `log` and `log_error` take no optional
+  parameters (no allocator, `#caller_location`, flags or log sections).
+  `print` shows anonymous struct and union members inline, so a `Vector3`
+  prints as `{1, 2, 3}`.
   The allocating ones use `context.allocator`; `alloc`, `free`, `realloc`,
   `New` and `NewArray` also take an explicit allocator (`alloc(n, a)`,
   `New(T, allocator = a)`), and `New` / `NewArray` take `initialized = false`.
@@ -342,9 +372,9 @@ Implemented:
 Not yet implemented: `#compiler` procedures and the compiler message loop
 (`#run,stallable`), `Code_Node` introspection (`compiler_get_nodes`),
 `#insert,scope(...)`, `#caller_location` / `#location`,
-`#procedure_of_call`, variadic `#foreign` procedures (C varargs), `using` on pointer members
-and at top level, `#as`, Basic's `log` (the context has a logger; call
-`context.logger` directly), threads and thread contexts. Polymorphism does not yet cover `$$` auto-baking,
+`#procedure_of_call`, variadic `#foreign` procedures (C varargs), parameters after a
+variadic one (Jai's `join(..strings, separator = ", ")`; Basic has no `join`), `using` on pointer members
+and at top level, `#as`, threads and thread contexts. Polymorphism does not yet cover `$$` auto-baking,
 `#bake_arguments`, `$T/Interface` constraints, `$R` introduced in a return
 type, `#modify` on structs, or polymorphic procedure values (using a template
 without calling it).

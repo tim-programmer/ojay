@@ -823,6 +823,23 @@ static void print_enum(Out *o, const OTypeInfo *t, const void *v) {
   }
 }
 
+/* The members of a struct, or the first of a union. Anonymous struct and
+   union members (no name) are shown inline, as members of the enclosing one. */
+static void print_members(Out *o, const OTypeInfo *t, const void *v, int depth, int *first) {
+  int64_t n = (t->flags & 1) && t->count > 0 ? 1 : t->count; /* unions: first member */
+  for (int64_t i = 0; i < n; ++i) {
+    const OMember *m = &t->members[i];
+    const uint8_t *p = (const uint8_t *)v + m->value;
+    if (m->name_len == 0 && m->type->kind == TI_STRUCT) {
+      print_members(o, m->type, p, depth, first);
+      continue;
+    }
+    if (!*first) out_cstr(o, ", ");
+    *first = 0;
+    print_value(o, m->type, p, depth + 1);
+  }
+}
+
 static void print_value(Out *o, const OTypeInfo *t, const void *v, int depth) {
   if (depth > 32) {
     out_cstr(o, "...");
@@ -872,11 +889,8 @@ static void print_value(Out *o, const OTypeInfo *t, const void *v, int depth) {
     }
     case TI_STRUCT: {
       out_bytes(o, "{", 1);
-      int64_t n = (t->flags & 1) && t->count > 0 ? 1 : t->count; /* unions: first member */
-      for (int64_t i = 0; i < n; ++i) {
-        if (i) out_cstr(o, ", ");
-        print_value(o, t->members[i].type, (const uint8_t *)v + t->members[i].value, depth + 1);
-      }
+      int first = 1;
+      print_members(o, t, v, depth, &first);
       out_bytes(o, "}", 1);
       return;
     }
@@ -1034,12 +1048,17 @@ int __ojay_string_equal(const uint8_t *a, int64_t alen, const uint8_t *b, int64_
 
 /* `context_allocator` is the context's Allocator (with `allocate`), which the
  * array adopts when it first grows. */
-void __ojay_array_reserve(ODynArray *a, int64_t elem_size, int64_t needed, OAllocateFn allocate,
+// Makes room for `needed` items: exactly that many (array_reserve) or, when
+// growing for array_add (`exact` = 0), at least twice as many as before.
+void __ojay_array_reserve(ODynArray *a, int64_t elem_size, int64_t needed, int32_t exact, OAllocateFn allocate,
                           const OAllocator *context_allocator) {
   if (a->allocated >= needed) return;
-  int64_t cap = a->allocated * 2;
-  if (cap < 8) cap = 8;
-  if (cap < needed) cap = needed;
+  int64_t cap = needed;
+  if (!exact) {
+    cap = a->allocated * 2;
+    if (cap < 8) cap = 8;
+    if (cap < needed) cap = needed;
+  }
   uint8_t *data;
   if (allocate) {
     if (!a->allocator.proc) a->allocator = *context_allocator;
@@ -1048,7 +1067,7 @@ void __ojay_array_reserve(ODynArray *a, int64_t elem_size, int64_t needed, OAllo
     data = (uint8_t *)plat_realloc(a->data, cap * elem_size);
   }
   if (!data) {
-    static const char msg[] = "array_add: out of memory\n";
+    static const char msg[] = "array_add / array_reserve: out of memory\n";
     plat_write(2, msg, sizeof(msg) - 1);
     plat_exit(1);
   }
@@ -1125,6 +1144,14 @@ void *memset(void *dst, int c, size_t n) {
   uint8_t *d = (uint8_t *)dst;
   for (size_t i = 0; i < n; ++i) d[i] = (uint8_t)c;
   return dst;
+}
+
+/* LLVM may turn a loop that looks for a zero byte (e.g. Basic's
+   c_style_strlen) into a call of strlen. */
+size_t strlen(const char *s) {
+  size_t n = 0;
+  while (s[n]) ++n;
+  return n;
 }
 
 int memcmp(const void *a, const void *b, size_t n) {

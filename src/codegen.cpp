@@ -401,7 +401,7 @@ class CodeGen {
     rt_streq_ = rt("__ojay_string_equal", i32_, {ptr_, i64_, ptr_, i64_});
     rt_exit_ = rt("__ojay_exit", void_, {i32_}, true);
     rt_args_ = rt("__ojay_command_line_arguments", ptr_, {ptr_});
-    rt_array_reserve_ = rt("__ojay_array_reserve", void_, {ptr_, i64_, i64_, ptr_, ptr_});
+    rt_array_reserve_ = rt("__ojay_array_reserve", void_, {ptr_, i64_, i64_, i32_, ptr_, ptr_});
     rt_init_ = rt("__ojay_runtime_init", void_, {i32_, ptr_});
     rt_cstring_ = rt("__ojay_to_c_string", ptr_, {ptr_, i64_, ptr_, ptr_});
   }
@@ -1674,6 +1674,17 @@ class CodeGen {
     return arr;
   }
 
+  // The Any values of a print / sprint call: its arguments, or the `..array` given.
+  std::pair<llvm::Value*, llvm::Value*> print_args(Call* c) {
+    auto& a = c->resolved_args;
+    if (c->spread_args) {
+      llvm::Value* view = rvalue(a[1]);
+      return {b_.CreateExtractValue(view, 1), b_.CreateExtractValue(view, 0)};
+    }
+    size_t n_args = a.size() - 1;  // the last entry is to_standard_error
+    return {any_array(a, 1, n_args), llvm::ConstantInt::get(i64_, n_args - 1)};
+  }
+
   llvm::Value* emit_math1(llvm::Intrinsic::ID id, llvm::Value* x) { return b_.CreateUnaryIntrinsic(id, x); }
 
   llvm::Value* libm_call(const char* name64, const char* name32, Type* t, std::vector<llvm::Value*> args) {
@@ -1743,20 +1754,18 @@ class CodeGen {
       case Builtin::Print: {
         llvm::Value* len;
         llvm::Value* data = string_parts(a[0], &len);
-        size_t n_args = a.size() - 1;  // last entry is to_standard_error
-        llvm::Value* anys = any_array(a, 1, n_args);
+        auto [anys, count] = print_args(c);
         llvm::Value* fd = llvm::ConstantInt::get(i32_, 1);
         if (a.back()) fd = b_.CreateSelect(cond(a.back()), llvm::ConstantInt::get(i32_, 2), fd);
-        return b_.CreateCall(rt_print_, {data, len, anys, llvm::ConstantInt::get(i64_, n_args - 1), fd});
+        return b_.CreateCall(rt_print_, {data, len, anys, count, fd});
       }
       case Builtin::Sprint: {
         llvm::Value* len;
         llvm::Value* data = string_parts(a[0], &len);
-        size_t n_args = a.size() - 1;
-        llvm::Value* anys = any_array(a, 1, n_args);
+        auto [anys, count] = print_args(c);
         auto* out = make_alloca(T.string_t, "sprint.out");
         auto [alloc_fn, allocator] = runtime_allocator(allocator_arg(c));
-        b_.CreateCall(rt_sprint_, {out, data, len, anys, llvm::ConstantInt::get(i64_, n_args - 1), alloc_fn, allocator});
+        b_.CreateCall(rt_sprint_, {out, data, len, anys, count, alloc_fn, allocator});
         return b_.CreateLoad(lt(T.string_t), out);
       }
       case Builtin::WriteString: {
@@ -1836,14 +1845,20 @@ class CodeGen {
         llvm::Value* new_count = b_.CreateAdd(count, llvm::ConstantInt::get(i64_, 1));
         // A dynamic array keeps the allocator it first grew with (context.allocator then).
         auto [alloc_fn, ctx_allocator] = runtime_allocator(prog_.uses_context ? context_addr() : nullptr);
-        b_.CreateCall(rt_array_reserve_,
-                      {arr, llvm::ConstantInt::get(i64_, size_of(et)), new_count, alloc_fn, ctx_allocator});
+        b_.CreateCall(rt_array_reserve_, {arr, llvm::ConstantInt::get(i64_, size_of(et)), new_count,
+                                          llvm::ConstantInt::get(i32_, 0), alloc_fn, ctx_allocator});
         llvm::Value* data = b_.CreateLoad(ptr_, b_.CreateStructGEP(dyn_t, arr, 1));
         llvm::Value* slot = b_.CreateInBoundsGEP(lt(et), data, {count});
         if (value) b_.CreateStore(value, slot);
         else store_default(slot, et);
         b_.CreateStore(new_count, count_p);
         return value ? nullptr : slot;
+      }
+      case Builtin::ArrayReserve: {
+        auto [alloc_fn, ctx_allocator] = runtime_allocator(prog_.uses_context ? context_addr() : nullptr);
+        b_.CreateCall(rt_array_reserve_, {rvalue(a[0]), llvm::ConstantInt::get(i64_, size_of(c->type_arg)), rvalue(a[1]),
+                                          llvm::ConstantInt::get(i32_, 1), alloc_fn, ctx_allocator});
+        return nullptr;
       }
       case Builtin::ArrayFree: {
         Type* t = a[0]->type;

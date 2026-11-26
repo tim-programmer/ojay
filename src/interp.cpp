@@ -1506,9 +1506,17 @@ class Machine {
     auto& a = c->resolved_args;
     std::string fmt = read_string(eval(a[0]), a[0]->loc);
     std::vector<std::pair<Type*, u64>> args;  // the Any values
-    for (size_t i = 1; i + 1 < a.size(); ++i) {
-      Val any = eval(a[i]);
-      args.push_back({in_.type_of_id(get_ptr(any, 0)), get_ptr(any, ps_)});
+    if (c->spread_args) {  // `..array`: Any values in memory
+      auto [count, data] = view_parts(eval(a[1]));
+      for (i64 i = 0; i < (i64)count; ++i) {
+        u64 any = data + (u64)(i * 2 * ps_);
+        args.push_back({in_.type_of_id(load_ptr(any, c->loc)), load_ptr(any + (u64)ps_, c->loc)});
+      }
+    } else {
+      for (size_t i = 1; i + 1 < a.size(); ++i) {
+        Val any = eval(a[i]);
+        args.push_back({in_.type_of_id(get_ptr(any, 0)), get_ptr(any, ps_)});
+      }
     }
     std::string out;
     size_t next = 0, start = 0;
@@ -1617,6 +1625,21 @@ class Machine {
   }
 
   // Matches print_value in the runtime.
+  // As print_members in the runtime: anonymous members are shown inline.
+  void print_members(std::string& o, Type* t, u64 addr, int depth, bool& first, SourceLoc loc) {
+    size_t n = t->is_union && !t->fields.empty() ? 1 : t->fields.size();
+    for (size_t i = 0; i < n; ++i) {
+      const StructField& f = t->fields[i];
+      if (f.anonymous) {
+        print_members(o, conc(f.type), addr + (u64)f.offset, depth, first, loc);
+        continue;
+      }
+      if (!first) o += ", ";
+      first = false;
+      print_value(o, f.type, addr + (u64)f.offset, depth + 1, loc);
+    }
+  }
+
   void print_value(std::string& o, Type* t, u64 addr, int depth, SourceLoc loc) {
     if (!t) {
       o += "(unknown)";
@@ -1663,11 +1686,8 @@ class Machine {
       }
       case TypeKind::Struct: {
         o += '{';
-        size_t n = t->is_union && !t->fields.empty() ? 1 : t->fields.size();
-        for (size_t i = 0; i < n; ++i) {
-          if (i) o += ", ";
-          print_value(o, t->fields[i].type, addr + (u64)t->fields[i].offset, depth + 1, loc);
-        }
+        bool first = true;
+        print_members(o, t, addr, depth, first, loc);
         o += '}';
         return;
       }
@@ -1720,12 +1740,16 @@ class Machine {
   }
   u64 allocator_arg(Call* c) { return c->allocator ? addr_of(c->allocator) : 0; }
 
-  void reserve(u64 arr, int64_t esz, i64 needed, SourceLoc loc) {
+  // As __ojay_array_reserve in the runtime.
+  void reserve(u64 arr, int64_t esz, i64 needed, SourceLoc loc, bool exact = false) {
     i64 allocated = load_i64(arr + (u64)dyn_allocated_off(), loc);
     if (allocated >= needed) return;
-    i64 cap = allocated * 2;
-    if (cap < 8) cap = 8;
-    if (cap < needed) cap = needed;
+    i64 cap = needed;
+    if (!exact) {
+      cap = allocated * 2;
+      if (cap < 8) cap = 8;
+      if (cap < needed) cap = needed;
+    }
     u64 allocator = arr + (u64)dyn_allocator_off();
     u64 data;
     if (in_.host.allocate_proc()) {
@@ -1855,6 +1879,12 @@ class Machine {
         else if (needs_default(et)) store(slot, default_val(et, loc), loc);
         store_i64(arr, count + 1, loc);
         return has_value ? Val() : make_ptr(slot);
+      }
+      case Builtin::ArrayReserve: {
+        u64 arr = get_ptr(eval(a[0]));
+        i64 n = (i64)get_int(eval(a[1]), a[1]->type);
+        reserve(arr, sz(c->type_arg), n, loc, true);
+        return Val();
       }
       case Builtin::ArrayFree: {
         if (!conc(a[0]->type)->is_dynamic()) {  // a view: freed with context.allocator

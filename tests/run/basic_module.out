@@ -1,0 +1,36 @@
+sum: 6 30 6 0 9
+poly_sum: 6 1.75
+[info] 1 and two (9 bytes)
+[empty] nothing (7 bytes)
+insert_at: [5, 10, 15, 20, 30, 40, 50, 60]
+ordered_remove_by_index: [10, 15, 20, 30, 40, 50, 60]
+unordered_remove_by_index: [60, 15, 20, 30, 40, 50]
+find: true 3 / false -1
+add_if_unique: false 3 / true 6 -> [60, 15, 20, 30, 40, 50, 70]
+ordered_remove_by_value: 3 -> [60, 15, 30, 40, 50, 70]
+unordered_remove_by_value (first): 1 -> [60, 15, 30, 40, 50, 70, 40]
+unordered_remove_by_value: 2 -> [60, 15, 30, 70, 50]
+reserve: count 5 allocated 100
+reserve smaller: allocated 100
+resize: [60, 15, 30, 70, 50, 0, 0]
+resize smaller: [60, 15] (allocated 100)
+pop: 15, peek: 60, peek_pointer: 60
+peek_pointer of empty: true
+copy: [7, 8, 9, 10] (count 4)
+view: [8, 9] (count 2)
+copy of view: [99, 9] / [7, 8, 9, 10]
+items: [{first, 5}, {none, 1}, {none, 1}]
+names: [b, a]
+swap: 2 1 right left
+to_string: hello (5 bytes, strlen 5)
+to_string(data, count): ell
+copy_string: hello
+compare: true true true true true
+is_digit true false, is_alpha true false, is_alnum true false, is_space true false
+builder length: 16
+builder: x = 12, y = 3.5;
+long builder: 1000 bytes, ends with 789
+after reset: 0
+to the default logger: 1
+captured 2 (1 errors), last: two 2
+COMPILE_TIME: 9

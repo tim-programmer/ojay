@@ -31,7 +31,13 @@
       immediate merging (not yet: size-class bins for faster allocation with many free blocks)
 - [x] `get_command_line_arguments()` (not yet: `__command_line_arguments`, arguments for
       bare-metal programs, e.g. from semihosting `SYS_GET_CMDLINE`)
-- [ ] Write more of `Basic` and `Math` in Jai once polymorphism exists
+- [x] Write more of `Basic` and `Math` in Jai once polymorphism exists: `src/modules/Basic.jai`
+      (polymorphic array procedures, `swap`, string procedures, `String_Builder`, `log`) and
+      `src/modules/Math.jai` (`clamp`, `lerp`, `Vector2/3/4` with operators, `dot`, `cross`,
+      `length`, `normalize`), plus `f(..array)` arguments and an `array_reserve` built-in
+      (not yet: `join` and other procedures with parameters after a variadic one, `Matrix` /
+      `Quaternion`, Jai's chained `String_Builder` buffers, moving `min` / `max` / `abs` from
+      built-ins to Jai, the `String` module)
 - [x] Cortex-M: console output without a debugger (UART), and avoid halting in
       semihosting when DHCSR.C_DEBUGEN was left set by a detached debugger: LPUART4 on the
       FRDM-MCXN947 or a program-defined `__ojay_console_write`; semihosting only when the

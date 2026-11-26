@@ -1,0 +1,16 @@
+clamp: 3 7 0 0.25
+lerp: 2.5 25
+PI64 true, TAU64 / PI64 = 2, type float64
+Vector2: {3, 4} length 5 squared 25 normalized {0.6, 0.8}
+  p.x 3 p.component[1] 4 size 8
+Vector3: a + b = {5, 7, 9}, a - b = {-3, -3, -3}, a * b = {4, 10, 18}, b / a = {4, 2.5, 2}
+  a * 2 = {2, 4, 6}, 2 * a = {2, 4, 6}, b / 2 = {2, 2.5, 3}, -a = {-1, -2, -3}
+  dot 32 cross {-3, 6, -3} distance 5
+  a == a true a == b false
+  c = {2.5, 3.5, 10} (c.z 10)
+  lerp {2.5, 3.5, 4.5} normalize(zero) {0, 0, 0}
+  x cross y = {0, 0, 1} (unit: true)
+Vector4: {1, 2, 3, 4} dot 30 w 4 size 16
+My_Vec: {4, 6}
+Basic's log and Math's log: 0 4
+COMPILE_TIME: 13

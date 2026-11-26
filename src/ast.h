@@ -138,6 +138,7 @@ struct Arg {
   std::string name;  // empty for positional
   SourceLoc name_loc;
   Expr* value = nullptr;
+  bool spread = false;  // `..array`: the elements of an array as a procedure's variadic arguments
 };
 
 enum class Builtin {
@@ -145,7 +146,7 @@ enum class Builtin {
   // core
   SizeOf, TypeOf, TypeInfo,
   // Basic
-  Print, Sprint, WriteString, Alloc, Free, Realloc, New, NewArray, ArrayAdd, ArrayFree, ArrayReset,
+  Print, Sprint, WriteString, Alloc, Free, Realloc, New, NewArray, ArrayAdd, ArrayReserve, ArrayFree, ArrayReset,
   Assert, Exit, Memcpy, Memset, Min, Max, Abs, ToCString, CommandLineArguments,
   // Preload internals: the runtime's own heap, bypassing the context's allocator
   RawAlloc, RawFree, RawRealloc,
@@ -168,6 +169,7 @@ struct Call : Expr {
   // `New(T, allocator = a)`, or temporary_allocator for tprint); null means context.allocator.
   Expr* allocator = nullptr;
   bool no_init = false;              // New / NewArray with `initialized = false`
+  bool spread_args = false;          // print / sprint: resolved_args[1] is a `..array` of Any
   Call(SourceLoc l, Expr* c) : Expr(NK::Call, l), callee(c) {}
 };
 

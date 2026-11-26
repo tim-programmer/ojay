@@ -725,6 +725,10 @@ class Parser {
         advance();
         advance();
       }
+      if (close == Tok::RParen && at(Tok::DotDot)) {  // `f(..array)`
+        advance();
+        a.spread = true;
+      }
       a.value = parse_expr();
       args.push_back(a);
       if (!accept(Tok::Comma)) break;

@@ -20,9 +20,16 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 file(READ ${CMAKE_SOURCE_DIR}/src/preload.jai OJAY_PRELOAD)
 configure_file(src/preload.cpp.in ${CMAKE_BINARY_DIR}/generated/preload.cpp @ONLY)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/preload.jai)
+# So are the parts of the built-in modules Basic and Math that are written in Jai.
+file(READ ${CMAKE_SOURCE_DIR}/src/modules/Basic.jai OJAY_BASIC)
+file(READ ${CMAKE_SOURCE_DIR}/src/modules/Math.jai OJAY_MATH)
+configure_file(src/modules.cpp.in ${CMAKE_BINARY_DIR}/generated/modules.cpp @ONLY)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+  ${CMAKE_SOURCE_DIR}/src/modules/Basic.jai ${CMAKE_SOURCE_DIR}/src/modules/Math.jai)
 
 add_library(ojay_core STATIC
   ${CMAKE_BINARY_DIR}/generated/preload.cpp
+  ${CMAKE_BINARY_DIR}/generated/modules.cpp
   src/lexer.cpp
   src/parser.cpp
   src/ast_clone.cpp

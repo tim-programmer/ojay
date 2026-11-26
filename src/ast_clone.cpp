@@ -236,7 +236,7 @@ class Cloner {
 
   std::vector<Arg> args(const std::vector<Arg>& in) {
     std::vector<Arg> out;
-    for (auto& a : in) out.push_back(Arg{a.name, a.name_loc, expr(a.value)});
+    for (auto& a : in) out.push_back(Arg{a.name, a.name_loc, expr(a.value), a.spread});
     return out;
   }
 
