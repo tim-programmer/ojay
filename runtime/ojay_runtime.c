@@ -49,7 +49,7 @@ typedef struct {
 } ODynArray;
 
 /* Runtime type information: the layout of Type_Info and the Type_Info_*
-   structs in src/type_info.jai (the compiler emits them; keep in sync). */
+   structs in src/core.jai (the compiler emits them; keep in sync). */
 enum {
   TI_INTEGER = 0, TI_FLOAT = 1, TI_BOOL = 2, TI_STRING = 3, TI_POINTER = 4, TI_PROCEDURE = 5, TI_VOID = 6,
   TI_STRUCT = 7, TI_ARRAY = 8, TI_OVERLOAD_SET = 9, TI_ANY = 10, TI_ENUM = 11, TI_POLYMORPHIC_VARIABLE = 12,

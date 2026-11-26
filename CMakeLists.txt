@@ -23,11 +23,11 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_SOURCE_DI
 # So are the parts of the built-in modules Basic and Math that are written in Jai.
 file(READ ${CMAKE_SOURCE_DIR}/src/modules/Basic.jai OJAY_BASIC)
 file(READ ${CMAKE_SOURCE_DIR}/src/modules/Math.jai OJAY_MATH)
-file(READ ${CMAKE_SOURCE_DIR}/src/type_info.jai OJAY_TYPE_INFO)
+file(READ ${CMAKE_SOURCE_DIR}/src/core.jai OJAY_CORE)
 configure_file(src/modules.cpp.in ${CMAKE_BINARY_DIR}/generated/modules.cpp @ONLY)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
   ${CMAKE_SOURCE_DIR}/src/modules/Basic.jai ${CMAKE_SOURCE_DIR}/src/modules/Math.jai
-  ${CMAKE_SOURCE_DIR}/src/type_info.jai)
+  ${CMAKE_SOURCE_DIR}/src/core.jai)
 
 add_library(ojay_core STATIC
   ${CMAKE_BINARY_DIR}/generated/preload.cpp
