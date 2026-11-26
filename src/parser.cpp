@@ -581,8 +581,9 @@ class Parser {
 
   // `member` (a struct member): `#align N` may follow the type or the value.
   void parse_decl_rest(Decl* d, bool member = false) {
+    (void)member;
     auto align = [&] {
-      if (!member || !at_directive("align")) return;
+      if (!at_directive("align")) return;
       SourceLoc loc = advance().loc;
       if (d->align) fail(loc, "a member can only have one #align");
       d->align = parse_unary();
@@ -590,6 +591,7 @@ class Parser {
     if (accept(Tok::ColonColon)) {
       d->is_const = true;
       d->values = parse_expr_list();
+      align();  // rejected below
     } else if (accept(Tok::ColonEq)) {
       d->values = parse_expr_list();
       align();
@@ -606,9 +608,8 @@ class Parser {
       }
       if (!d->is_const && !d->uninit && !d->values.empty()) align();
     }
-    if (at_directive("align"))
-      fail(cur().loc, member ? "#align must follow the member's type or value"
-                             : "#align is only supported on struct members yet (not on variables)");
+    if (at_directive("align")) fail(cur().loc, "#align must follow the type or the value");
+    if (d->is_const && d->align) fail(d->align->loc, "#align is not allowed on a constant");
     if (!d->values.empty() && ends_with_block(d->values.back())) {
       accept(Tok::Semi);
     } else {
@@ -1022,12 +1023,11 @@ class Parser {
   Expr* parse_type_directive(SourceLoc loc) {
     if (accept(Tok::Comma)) {
       std::string m = at(Tok::Ident) ? cur().text : "";
-      if (m == "distinct") {
+      if (m == "distinct" || m == "isa") {
         advance();
-        return ast_.make<DirectiveExpr>(loc, "distinct", parse_type());
+        return ast_.make<DirectiveExpr>(loc, m, parse_type());
       }
-      if (m == "isa") fail(cur().loc, "#type,isa is not supported yet (use #type,distinct)");
-      fail(cur().loc, "unknown #type modifier ", describe(cur()), " (expected 'distinct')");
+      fail(cur().loc, "unknown #type modifier ", describe(cur()), " (expected 'distinct' or 'isa')");
     }
     return parse_type();
   }

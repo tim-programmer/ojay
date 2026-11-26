@@ -1,0 +1,11 @@
+sizes 32 16 16 16 8 8 8 8
+al16 {2, 4, 15}
+alsmall {42}
+alf {2.5, 1.5}
+ald {4, 2}
+pl2 a 4294967298 lo 2 hi 1
+plf a 4 c 2.5
+pld x 2 y 3
+plb w 42 s 9
+call back 386
+aligned local from C 1

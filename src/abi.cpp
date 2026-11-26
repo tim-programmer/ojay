@@ -50,11 +50,6 @@ bool is_scalar(const Type* t) {
 std::string member_unsupported(const Type* t) {
   switch (t->kind) {
     case TypeKind::Struct:
-      // #align and #place give layouts that the C ABI lowering here does not
-      // classify (over-aligned and overlapping members).
-      if (t->has_place || t->has_align)
-        return type_name(t) + " has #place or #align members, which are not supported by value across the C "
-               "boundary (pass a pointer to it)";
       for (auto& f : t->fields)
         if (std::string why = member_unsupported(f.type); !why.empty()) return why;
       return "";
@@ -161,13 +156,22 @@ void for_each_leaf(const Type* t, int64_t off, TypeTable& T, F&& f) {
 }
 
 // The member of a (non-union) struct-like aggregate containing byte `off`.
+// Of members that overlap there (#place, which C writes as an anonymous
+// union), the one clang takes as the union's IR type: the most aligned, then
+// the largest, then the first.
 const Child* child_at(const std::vector<Child>& cs, int64_t off) {
   const Child* found = nullptr;
   for (const Child& c : cs) {
     if (c.t->size == 0) continue;
     if (c.off <= off) found = &c;
   }
-  return found;
+  const Child* best = nullptr;
+  for (const Child& c : cs) {
+    if (c.t->size == 0 || off < c.off || off >= c.off + c.t->size) continue;
+    if (!best || c.t->align > best->t->align || (c.t->align == best->t->align && c.t->size > best->t->size))
+      best = &c;
+  }
+  return best ? best : found;
 }
 
 }  // namespace
@@ -379,6 +383,19 @@ bool CAbiLowering::homogeneous(const Type* t, const Type*& base, uint64_t& membe
     uint64_t m = 0;
     if (!homogeneous(t->elem, base, m)) return false;
     members = m * t->count;
+  } else if (t->kind == TypeKind::Struct && t->has_place && !t->is_union) {
+    // Overlapping members are an anonymous union in C: the floats count once
+    // per offset (a union counts its largest member).
+    std::vector<int64_t> offsets;
+    bool ok = true;
+    for_each_leaf(t, 0, T, [&](int64_t off, const Type* leaf) {
+      if (leaf->kind != TypeKind::Float) ok = false;
+      else if (!base) base = leaf;
+      else if (base->bits != leaf->bits) ok = false;
+      if (std::find(offsets.begin(), offsets.end(), off) == offsets.end()) offsets.push_back(off);
+    });
+    if (!ok || !base) return false;
+    members = offsets.size();
   } else if (t->kind == TypeKind::Struct) {
     for (auto& f : t->fields) {
       if (f.type->size == 0) continue;
@@ -404,7 +421,7 @@ llvm::Type* CAbiLowering::hfa_type(Type* t, const Type* base, uint64_t members) 
   std::function<bool(const Type*)> clean = [&](const Type* x) {
     if (x->kind == TypeKind::Float) return true;
     if (x->kind == TypeKind::Array && x->array_kind == ArrayKind::Fixed) return x->count > 0 && clean(x->elem);
-    if (x->kind != TypeKind::Struct || x->is_union || x->fields.empty()) return false;
+    if (x->kind != TypeKind::Struct || x->is_union || x->fields.empty() || x->has_place || x->has_align) return false;
     for (auto& f : x->fields)
       if (!clean(f.type)) return false;
     return true;

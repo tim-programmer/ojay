@@ -379,8 +379,7 @@ Not yet implemented: `#compiler` procedures and the compiler message loop
 (`#run,stallable`), `Code_Node` introspection (`compiler_get_nodes`),
 `#insert,scope(...)`, `#procedure_of_call`, `#procedure_name()`, variadic `#foreign` procedures (C varargs), parameters after a
 variadic one (Jai's `join(..strings, separator = ", ")`; Basic has no `join`), `using` on pointer members
-and at top level, `#as`, `#type,isa`, `#align` on variables (only struct members have it),
-threads and thread contexts. Polymorphism does not yet cover `$$` auto-baking,
+and at top level, `#as`, threads and thread contexts. Polymorphism does not yet cover `$$` auto-baking,
 `#bake_arguments`, `$T/Interface` constraints, `$R` introduced in a return
 type, `#modify` on structs, or polymorphic procedure values (using a template
 without calling it).
@@ -420,15 +419,28 @@ Handle  :: #type,distinct u32;                          // a type of its own
   replaces the defaults of the members it overlaps (they are not written at
   all, so the bytes outside the set member are zero). `print` shows every
   member, each read from its own offset. `#place` is not allowed in a union.
+  A member of type `void` takes no space: it marks an offset for `#place`
+  (`start: void; lo, hi: u16; #place start; whole: u32;`). It cannot have a
+  value or be set in a literal (positional values skip it), `*s.start` is its
+  address (a `*void`), `print` leaves it out, and Type_Info lists it with
+  type `void`. Unions cannot have void members.
 * `x: T #align N;` (after the type, or after `= value`): the member's offset
   is a multiple of N, a power-of-two constant, and the struct's alignment is
   at least N; it sets `Struct_Textual_Flags.ALIGNED`. Locals, globals,
   temporaries and struct members of such a type get that alignment. `New` and
   `NewArray` of a type aligned more than the heap guarantees (8 bytes on
   32-bit targets, 16 on x86-64) ask the runtime's heap for an aligned block,
-  which `free` takes as usual. Allocators other than the default one cannot be
-  asked for an alignment (Allocator_Proc has no parameter for it), so their
-  result is checked: a misaligned block stops the program with a message.
+  which `free` takes as usual; so do dynamic arrays of such a type
+  (`array_add`, `array_reserve`), which move to a new aligned block when they
+  grow instead of resizing in place. Other allocators are asked with the
+  mode `ALLOCATE_ALIGNED` (an ojay extension: `size` bytes aligned to
+  `old_size`), which `temporary_allocator` handles too; one that returns null
+  for it (as Jai allocators do for modes they do not know) is asked with
+  `ALLOCATE`, and a block that is then not aligned stops the program with a
+  message.
+* `#align N` also works on variables, local or global
+  (`buffer: [64] u8 #align 32;`, `x := 0 #align 16;`), also in `#run` code;
+  not on constants or parameters.
   `#align` on a struct (`} #align 64`) is rejected: in Jai it has no effect
   there.
 * `#this` in a struct body is the struct (`next: *#this;`, the instance in a
@@ -455,11 +467,18 @@ Handle  :: #type,distinct u32;                          // a type of its own
   another distinct type. A distinct type must be declared as a named
   constant. `type_info(Handle)` is a `*Type_Info_Variant` (see *Runtime type
   information*), and diagnostics, `type_of` and `print` use its name.
-* Differences from Jai: `#type,isa`, `#align` on variables and `void`
-  members (Jai uses them as `#place` markers) are not supported; struct
-  constants' `offset_in_bytes` is 0; an untyped constant converts to a
-  distinct numeric type implicitly (Jai's exact rules for distinct types are
-  not documented publicly).
+* `Name :: #type,isa T;` is a distinct type that also converts implicitly to
+  T (and from there as T does: an isa `u8` becomes an `s64` argument), but
+  not back, nor to other distinct types. In overloading, converting to its
+  own base is preferred to every other conversion, so `f(u32)` beats
+  `f(s64)` for an isa `u32`, and an isa of an isa picks the nearer base.
+  Mixed with its base in an operator (`i + u`), the result has the base
+  type. Its Type_Info_Variant has `variant_flags` `.ISA`.
+* Differences from Jai: struct constants' `offset_in_bytes` is 0; an untyped
+  constant converts to a distinct numeric type implicitly; `#type,isa`
+  follows the description above (Jai's exact rules for distinct and isa types
+  are not documented publicly); Type_Info_Variant has only `name`,
+  `variant_of` and `variant_flags`.
 
 ### C interop
 
@@ -491,8 +510,13 @@ on_event :: (e: Event) -> s32 #c_call #program_export "app_on_event" { ... }  //
   dynamic arrays, `Any`, `Type` and fixed arrays (C passes arrays as
   pointers; put the array in a struct). Also rejected: more than one return
   value and variadic `#foreign` procedures (C varargs).
-* Structs with `#place` or `#align` members cannot be passed or returned by
-  value (pass a pointer); distinct types are passed as their base type.
+* Structs with `#align` members are C structs with `_Alignas` members, and
+  overlapping `#place` members are an anonymous union in C
+  (`a: s64; #place a; lo, hi: u32;` is
+  `struct { union { int64_t a; struct { uint32_t lo, hi; }; }; }`); both pass
+  by value as clang and GCC pass those (`tests/run/c_abi_layout.c` checks the
+  layout with `_Static_assert`). `void` members take no space. Distinct types
+  are passed as their base type.
 * Empty structs (`struct {}`) are what GNU C makes of `struct {}`: size 0,
   and as a parameter or result they take no register or stack slot (as with
   clang and GCC; C++ would give them size 1).
@@ -617,7 +641,10 @@ reset_temporary_storage();
   `Allocator_Proc :: #type (mode: Allocator_Mode, size: s64, old_size: s64,
   old_memory: *void, allocator_data: *void) -> *void`, with modes
   `ALLOCATE`, `RESIZE` (move to a block of `size` bytes, keeping `old_size`
-  bytes; `old_memory` may be null), `FREE` and `FREE_ALL`.
+  bytes; `old_memory` may be null), `FREE`, `FREE_ALL` and (an ojay
+  extension) `ALLOCATE_ALIGNED` (see *Struct layout*). An allocator returns
+  null for a mode it does not handle; one that switches on the mode with
+  `#complete` must now list `ALLOCATE_ALIGNED` too.
   `default_allocator_proc` is the runtime's heap. An allocator whose `proc`
   is null means `context.allocator`.
 * A dynamic array (`[..]T`) has an `allocator` member, as in Jai: it takes
@@ -654,11 +681,8 @@ reset_temporary_storage();
   directly when the allocator is the default one and makes an indirect call
   otherwise.
 * Differences from Jai: `push_context` always pushes a copy; `log` has no
-  optional parameters (see *Built-in modules*); there are no threads; `Allocator_Mode` has only the four modes
-  above (no `STARTUP`, `CAPS`, ...), and allocators are not asked for
-  alignment (`New` of an over-aligned type checks what they return; see
-  *Struct layout*); a dynamic array of an over-aligned type is only as
-  aligned as the heap's blocks; `print` (which does not allocate) is allowed without a
+  optional parameters (see *Built-in modules*); there are no threads; `Allocator_Mode` has only the modes
+  above (no `STARTUP`, `CAPS`, ...), and `ALLOCATE_ALIGNED` is ojay's own; `print` (which does not allocate) is allowed without a
   context.
 
 ### Runtime type information
@@ -701,7 +725,8 @@ for e.names  print("% = %\n", it, e.values[it_index]);
   `internal_type`, `enum_type_flags` (`.FLAGS`), `names` and `values` for
   enums; `argument_types`, `return_types` and `procedure_flags`
   (`IS_C_CALL`, `HAS_VARARGS`) for procedure types; `name` and `variant_of`
-  (the base type's Type_Info) for distinct types (`Type_Info_Variant`, tag
+  (the base type's Type_Info) and `variant_flags` (`.ISA` for `#type,isa`)
+  for distinct types (`Type_Info_Variant`, tag
   `VARIANT`, with the base's `runtime_size`). Generic code follows
   `variant_of` to reach the base's kind; `print` does, and prints the name as
   the type. The declarations are in `src/core.jai`.
@@ -718,8 +743,9 @@ for e.names  print("% = %\n", it, e.values[it_index]);
   `Enum_Type_Flags`, `Type_Info_Procedure_Flags`); members have no `notes`,
   structs no `initializer`, `polymorph_source_struct` or parameters; there
   are no `Type_Info_Overload_Set` or `_Polymorphic_Variable`; a distinct
-  type is a `Type_Info_Variant` with only `name` and `variant_of` (Jai's has
-  more); `ANONYMOUS` (0x100) marks anonymous struct
+  type is a `Type_Info_Variant` with `name` and `variant_of` (as Jai code
+  uses them) and ojay's own `variant_flags`: Jai's full declaration is not
+  public, so any further members it has are not reproduced; `ANONYMOUS` (0x100) marks anonymous struct
   and union members; and `Any.type` has type `Type`, which converts to
   `*Type_Info` as needed.
 

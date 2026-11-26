@@ -1012,7 +1012,7 @@ static void print_members(Out *o, const OTypeInfo *ti, const void *v, int depth,
   int union_ = (t->textual_flags & TI_STRUCT_UNION) != 0; /* unions: first member */
   for (int64_t i = 0; i < n; ++i) {
     const OTypeInfoMember *m = &t->members.data[i];
-    if (m->flags & TI_MEMBER_CONSTANT) continue;
+    if ((m->flags & TI_MEMBER_CONSTANT) || m->type->type == TI_VOID) continue; /* constants, void markers */
     const uint8_t *p = (const uint8_t *)v + m->offset_in_bytes;
     if (m->name.count == 0 && m->type->type == TI_STRUCT) {
       print_members(o, m->type, p, depth, first);
@@ -1235,8 +1235,14 @@ int __ojay_string_equal(const uint8_t *a, int64_t alen, const uint8_t *b, int64_
  * array adopts when it first grows. */
 // Makes room for `needed` items: exactly that many (array_reserve) or, when
 // growing for array_add (`exact` = 0), at least twice as many as before.
+/* `align`: 0, or the elements' alignment when it is more than the heap's
+ * (#align); the array then moves to a new aligned block each time it grows,
+ * from the heap or (with a context) from __allocate_aligned, the compiler's
+ * aligned allocation through the array's allocator. */
+typedef void *(*OAllocateAlignedFn)(int64_t size, int64_t align, const OAllocator *allocator);
+
 void __ojay_array_reserve(ODynArray *a, int64_t elem_size, int64_t needed, int32_t exact, OAllocateFn allocate,
-                          const OAllocator *context_allocator) {
+                          const OAllocator *context_allocator, int64_t align, OAllocateAlignedFn allocate_aligned) {
   if (a->allocated >= needed) return;
   int64_t cap = needed;
   if (!exact) {
@@ -1245,8 +1251,16 @@ void __ojay_array_reserve(ODynArray *a, int64_t elem_size, int64_t needed, int32
     if (cap < needed) cap = needed;
   }
   uint8_t *data;
-  if (allocate) {
-    if (!a->allocator.proc) a->allocator = *context_allocator;
+  if (allocate && !a->allocator.proc) a->allocator = *context_allocator;
+  if (align > (int64_t)(2 * sizeof(void *))) {
+    data = (uint8_t *)(allocate_aligned ? allocate_aligned(cap * elem_size, align, &a->allocator)
+                                        : plat_alloc_aligned(cap * elem_size, align));
+    if (data && a->data) {
+      for (int64_t i = 0; i < a->count * elem_size; ++i) data[i] = a->data[i];
+      if (allocate) allocate(MODE_FREE, 0, 0, a->data, &a->allocator);
+      else plat_free(a->data);
+    }
+  } else if (allocate) {
     data = (uint8_t *)allocate(MODE_RESIZE, cap * elem_size, a->allocated * elem_size, a->data, &a->allocator);
   } else {
     data = (uint8_t *)plat_realloc(a->data, cap * elem_size);

@@ -17,6 +17,10 @@ Handle 8 VARIANT u32
 Point 16 VARIANT Vec2
 not a variant
 summary: Handle 8 VARIANT u32 Handle Meters 3.5 Point {1, 2} Code_A 1
+isa: 40 5 u32 Index
+isa overloads: Index u32, Sub: 20 Index
+Index 8 VARIANT u32
+ISA flag: true false
 C: next_handle 8 (Handle)
 C: swap_point {2, 1}
 C: pair_sum 3.5

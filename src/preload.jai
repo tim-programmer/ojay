@@ -9,6 +9,11 @@ Allocator_Mode :: enum {
     RESIZE;
     FREE;
     FREE_ALL;
+    // ojay extension: `size` bytes aligned to `old_size` (a power of two),
+    // for New / NewArray / dynamic arrays of #align types. An allocator that
+    // returns null for it (as for any mode it does not handle) is asked with
+    // ALLOCATE instead, and that block's alignment is checked.
+    ALLOCATE_ALIGNED;
 }
 
 Allocator_Proc :: #type (mode: Allocator_Mode, size: s64, old_size: s64, old_memory: *void, allocator_data: *void) -> *void;
@@ -67,6 +72,7 @@ Context :: struct {
 default_allocator_proc :: (mode: Allocator_Mode, size: s64, old_size: s64, old_memory: *void, allocator_data: *void) -> *void {
     if mode == {
         case .ALLOCATE; return __ojay_raw_alloc(size);
+        case .ALLOCATE_ALIGNED; return __ojay_raw_alloc_aligned(size, old_size);
         case .RESIZE;   return __ojay_raw_realloc(old_memory, size, old_size);
         case .FREE;     __ojay_raw_free(old_memory);
     }
@@ -79,6 +85,11 @@ temporary_allocator_proc :: (mode: Allocator_Mode, size: s64, old_size: s64, old
     if mode == {
         case .ALLOCATE;
             return __temporary_alloc(ts, size);
+        case .ALLOCATE_ALIGNED;
+            // Room for the alignment, then the first aligned address in it.
+            p := cast(*u8) __temporary_alloc(ts, size + old_size - 1);
+            if !p  return null;
+            return cast(*void) ((cast(u64) p + cast(u64) (old_size - 1)) & ~cast(u64) (old_size - 1));
         case .RESIZE;
             if old_memory && ts.page && cast(*u8) old_memory == ts.last {
                 // The latest allocation grows (or shrinks) in place when the page has room.
@@ -175,15 +186,17 @@ __allocate :: (mode: Allocator_Mode, size: s64, old_size: s64, old_memory: *void
     return allocator.proc(mode, size, old_size, old_memory, allocator.data);
 }
 
-// New / NewArray of a type aligned more than the heap guarantees (#align
-// members): the runtime's heap is asked for an aligned block (which free
-// accepts as usual). Other allocators are not asked for an alignment (their
-// procedures have no parameter for it): what they return is checked.
+// New / NewArray / dynamic arrays of a type aligned more than the heap
+// guarantees (#align members): the allocator is asked with ALLOCATE_ALIGNED
+// (the runtime's heap gives an aligned block, which free accepts as usual).
+// An allocator that does not handle it is asked with ALLOCATE, and what it
+// returns is checked.
 __allocate_aligned :: (size: s64, alignment: s64, a: *Allocator) -> *void {
     allocator := a;
     if !allocator || !allocator.proc  allocator = *context.allocator;
     if allocator.proc == default_allocator_proc  return __ojay_raw_alloc_aligned(size, alignment);
-    p := allocator.proc(.ALLOCATE, size, 0, null, allocator.data);
+    p := allocator.proc(.ALLOCATE_ALIGNED, size, alignment, null, allocator.data);
+    if !p  p = allocator.proc(.ALLOCATE, size, 0, null, allocator.data);
     if (cast(u64) p) & cast(u64) (alignment - 1) {
         write_string("New: the allocator returned memory that is not aligned as the type needs (#align)\n", true);
         exit(1);

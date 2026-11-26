@@ -18,7 +18,8 @@
       `Code_Node` introspection / `compiler_get_nodes`, `` `break``/`` `continue``,
       `#modify` on structs, macros with several return values)
 - [x] The context and custom allocators (not yet: Basic's `log`, threads and thread contexts,
-      the `STARTUP` / `CAPS` / ... allocator modes, alignment requests)
+      the `STARTUP` / `CAPS` / ... allocator modes; alignment requests are ojay's own
+      `ALLOCATE_ALIGNED` mode)
 - [x] Named module imports (`Name :: #import "..."`) with a real namespace
 - [x] `#foreign` procedures that pass or return structs by value (C ABI lowering) for x86-64 SysV,
       Arm AAPCS (VFP) and RISC-V ilp32, plus `#program_export` (not yet: variadic `#foreign`
@@ -37,11 +38,10 @@
       `loc := #caller_location` and `Log_Info.location` (needs parameters after a variadic
       one), a `loc` argument for `assert`, `#procedure_of_call`)
 - [x] Struct layout and members: constants inside structs (`S :: struct { N :: 3; }`), `#place`,
-      `#align`, `#this` (not yet: `#align` on variables, `void` members as `#place` markers,
-      `#place` / `#align` structs by value across the C ABI, alignment requests to custom
-      allocators and for dynamic arrays of over-aligned types)
-- [x] Distinct types (`#type,distinct`) (not yet: `#type,isa`, Jai's other Type_Info_Variant
-      members)
+      `#align` (also on variables), `#this`, `void` members as `#place` markers, such structs
+      by value across the C ABI, alignment requests to allocators (`ALLOCATE_ALIGNED`)
+- [x] Distinct types (`#type,distinct`, `#type,isa`) (Type_Info_Variant has `name`,
+      `variant_of` and ojay's `variant_flags`; Jai's full declaration is not public)
 - [ ] Short lambdas: `(x: int) => x * 2`
 - [ ] Smaller directives and intrinsics: `#procedure_name()`, `is_constant()`, `#bytes`,
       `#exists`, `initializer_of(T)`, `enum_highest_value` and the other enum helpers,

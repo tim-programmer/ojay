@@ -18,6 +18,13 @@ Row    :: #type,distinct [3] s32;
 IntPtr :: #type,distinct *int;
 Name   :: #type,distinct string;
 Alias  :: Handle;    // an alias of the distinct type, not a new one
+Index  :: #type,isa u32;   // converts to u32 implicitly, not back
+Sub    :: #type,isa Index;
+
+take_u32 :: (x: u32) -> u32 { return x * 10; }
+take_s64 :: (x: s64) -> s64 { return x + 1; }
+which :: (x: u32) -> string { return "u32"; }
+which :: (x: Index) -> string { return "Index"; }
 
 Pair :: struct { a: s32; d: float64; }
 Pair_D :: #type,distinct Pair;
@@ -113,6 +120,15 @@ main :: () {
     print("%\n", variant_info(Point));
     print("%\n", variant_info(u32));
     print("summary: %\n", summary());
+
+    // #type,isa: converts to the base (and on, as the base does), not back.
+    i: Index = 4;
+    print("isa: % % % %\n", take_u32(i), take_s64(i), type_of(i + raw), type_of(i + 1));
+    print("isa overloads: % %, Sub: % %\n", which(i), which(raw), take_u32(cast(Sub) 2), which(cast(Sub) 3));
+    print("%\n", variant_info(Index));
+    vi := cast(*Type_Info_Variant) type_info(Index);
+    print("ISA flag: % %\n", (vi.variant_flags & .ISA) != 0,
+          ((cast(*Type_Info_Variant) type_info(Handle)).variant_flags & .ISA) != 0);
 
     // The C ABI: as the base types.
     print("C: next_handle % (%)\n", next_handle(h), type_of(next_handle(h)));

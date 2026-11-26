@@ -130,12 +130,17 @@ Type_Info_Procedure :: struct {
     procedure_flags: Type_Info_Procedure_Flags;
 }
 
-// A distinct type (`Handle :: #type,distinct u32;`): its name and the
-// Type_Info of the type it was made from. runtime_size is the base's size.
+// A distinct type (`Handle :: #type,distinct u32;`, or `#type,isa`): its name
+// and the Type_Info of the type it was made from. runtime_size is the base's size.
+Type_Info_Variant_Flags :: enum_flags u32 {
+    ISA :: 0x1;  // #type,isa: converts implicitly to variant_of
+}
+
 Type_Info_Variant :: struct {
     using info: Type_Info;
     name: string;
     variant_of: *Type_Info;
+    variant_flags: Type_Info_Variant_Flags;
 }
 
 // ------------------------------------------------------------------ source locations

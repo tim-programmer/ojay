@@ -324,6 +324,7 @@ class Machine {
     return r.base + off;
   }
   u64 alloc_stack(Type* t, SourceLoc loc) { return alloc(stack_, sz(t), al(t), loc); }
+  u64 alloc_var(Symbol* s, SourceLoc loc) { return alloc(stack_, sz(s->type), std::max(al(s->type), s->align), loc); }
   u64 heap_alloc(int64_t size, SourceLoc loc, int64_t align = 16) {
     if (size < 0) err(loc, "cannot allocate a negative number of bytes (", size, ")");
     if (align < 16) align = 16;
@@ -488,6 +489,7 @@ class Machine {
       put("name", 8, name.size());
       store_u(typeinfo_.data() + off + ti_offset(st, "name") + 8, ps_, name_str);
       put("variant_of", ps_, in_.type_id(t->distinct_of));
+      put("variant_flags", 4, t->isa ? 1 : 0);
       return;
     }
     switch (t->kind) {
@@ -774,7 +776,7 @@ class Machine {
         es.reserve(t->fields.size());
         for (auto& f : t->fields) {
           std::string sub = f.name.empty() ? path : (path.empty() ? f.name : path + "." + f.name);
-          es.push_back(read_const(p + f.offset, f.type, sub, loc));
+          es.push_back(f.type->kind == TypeKind::Void ? ConstValue{} : read_const(p + f.offset, f.type, sub, loc));
         }
         return ConstValue::aggregate(std::move(es));
       }
@@ -831,7 +833,7 @@ class Machine {
     auto it = globals_.find(s);
     if (it != globals_.end()) return it->second;
     // Each evaluation starts from the initial values; writes are not kept.
-    u64 a = alloc(static_, sz(s->type), al(s->type), loc);
+    u64 a = alloc(static_, sz(s->type), std::max(al(s->type), s->align), loc);
     globals_[s] = a;
     if (s->decl && s->decl->uninit) return a;
     Val v = s->init ? eval(s->init) : default_val(s->type, loc);
@@ -1054,11 +1056,11 @@ class Machine {
       Symbol* s = d->syms[0];
       if (!d->values.empty()) {
         Val v = eval(d->values[0]);
-        u64 a = alloc_stack(s->type, d->loc);
+        u64 a = alloc_var(s, d->loc);
         bind(s, a);
         store(a, v, d->loc);
       } else {
-        u64 a = alloc_stack(s->type, d->loc);
+        u64 a = alloc_var(s, d->loc);
         bind(s, a);
         if (!d->uninit && needs_default(s->type)) store(a, default_val(s->type, d->loc), d->loc);
       }
@@ -1074,7 +1076,7 @@ class Machine {
     }
     for (size_t i = 0; i < d->syms.size(); ++i) {
       Symbol* s = d->syms[i];
-      u64 a = alloc_stack(s->type, d->loc);
+      u64 a = alloc_var(s, d->loc);
       bind(s, a);
       if (!vals.empty()) store(a, vals[i], d->loc);
       else if (!d->uninit && needs_default(s->type)) store(a, default_val(s->type, d->loc), d->loc);
@@ -1899,6 +1901,7 @@ class Machine {
         print_members(o, conc(f.type), addr + (u64)f.offset, depth, first, loc);
         continue;
       }
+      if (f.type->kind == TypeKind::Void) continue;  // a marker
       if (!first) o += ", ";
       first = false;
       print_value(o, f.type, addr + (u64)f.offset, depth + 1, loc);
@@ -2021,7 +2024,7 @@ class Machine {
   }
 
   // As __ojay_array_reserve in the runtime.
-  void reserve(u64 arr, int64_t esz, i64 needed, SourceLoc loc, bool exact = false) {
+  void reserve(u64 arr, int64_t esz, i64 needed, SourceLoc loc, bool exact = false, Type* elem = nullptr) {
     i64 allocated = load_i64(arr + (u64)dyn_allocated_off(), loc);
     if (allocated >= needed) return;
     i64 cap = needed;
@@ -2038,7 +2041,21 @@ class Machine {
         u64 ctx = context_addr(loc);  // context.allocator is the Context's first member
         std::memmove(at(allocator, 2 * ps_, loc), at(ctx, 2 * ps_, loc), (size_t)(2 * ps_));
       }
-      data = allocate(RESIZE, cap * esz, allocated * esz, load_ptr(arr + 8, loc), allocator, loc);
+      if (elem && al(elem) > T.heap_align()) {  // a new aligned block, as the runtime does
+        u64 old = load_ptr(arr + 8, loc);
+        data = allocate_for(elem, cap * esz, allocator, loc);
+        i64 n = load_i64(arr, loc) * esz;
+        if (old && n > 0) std::memmove(at(data, n, loc), at(old, n, loc), (size_t)n);
+        if (old) allocate(FREE, 0, 0, old, allocator, loc);
+      } else {
+        data = allocate(RESIZE, cap * esz, allocated * esz, load_ptr(arr + 8, loc), allocator, loc);
+      }
+    } else if (elem && al(elem) > T.heap_align()) {
+      u64 old = load_ptr(arr + 8, loc);
+      data = heap_alloc(cap * esz, loc, al(elem));
+      i64 n = load_i64(arr, loc) * esz;
+      if (old && n > 0) std::memmove(at(data, n, loc), at(old, n, loc), (size_t)n);
+      heap_free(old, loc);
     } else {
       data = heap_realloc(load_ptr(arr + 8, loc), cap * esz, loc);
     }
@@ -2157,7 +2174,7 @@ class Machine {
         bool has_value = a.size() == 2;
         if (has_value) value = eval(a[1]);  // evaluated before growing
         i64 count = load_i64(arr, loc);
-        reserve(arr, sz(et), count + 1, loc);
+        reserve(arr, sz(et), count + 1, loc, false, et);
         u64 slot = load_ptr(arr + 8, loc) + (u64)(count * sz(et));
         if (has_value) store(slot, value, loc);
         else if (needs_default(et)) store(slot, default_val(et, loc), loc);
@@ -2167,7 +2184,7 @@ class Machine {
       case Builtin::ArrayReserve: {
         u64 arr = get_ptr(eval(a[0]));
         i64 n = (i64)get_int(eval(a[1]), a[1]->type);
-        reserve(arr, sz(c->type_arg), n, loc, true);
+        reserve(arr, sz(c->type_arg), n, loc, true, c->type_arg);
         return Val();
       }
       case Builtin::ArrayFree: {

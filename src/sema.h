@@ -40,6 +40,7 @@ struct Symbol {
   enum class State { Unresolved, Resolving, Resolved } state = State::Unresolved;
   // backend
   llvm::Value* llvm_value = nullptr;
+  int64_t align = 0;         // a variable's `#align N` (0: its type's alignment)
   int interp_slot = -1;  // #run interpreter: index of a local variable in its procedure's frame
   bool is_context = false;  // `context`: the Context the running procedure was given
 };

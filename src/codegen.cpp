@@ -215,7 +215,7 @@ class CodeGen {
       size_t i = order[k];
       if (i != k) L.simple = false;
       const StructField& f = t->fields[i];
-      if ((uint64_t)f.offset < cur || (f.type->size == 0 && t->has_place)) {  // overlaps an earlier member
+      if ((uint64_t)f.offset < cur || f.type->kind == TypeKind::Void) {  // overlaps an earlier member, or a void marker
         L.simple = false;
         continue;
       }
@@ -481,7 +481,7 @@ class CodeGen {
     rt_streq_ = rt("__ojay_string_equal", i32_, {ptr_, i64_, ptr_, i64_});
     rt_exit_ = rt("__ojay_exit", void_, {i32_}, true);
     rt_args_ = rt("__ojay_command_line_arguments", ptr_, {ptr_});
-    rt_array_reserve_ = rt("__ojay_array_reserve", void_, {ptr_, i64_, i64_, i32_, ptr_, ptr_});
+    rt_array_reserve_ = rt("__ojay_array_reserve", void_, {ptr_, i64_, i64_, i32_, ptr_, ptr_, i64_, ptr_});
     rt_init_ = rt("__ojay_runtime_init", void_, {i32_, ptr_});
     rt_cstring_ = rt("__ojay_to_c_string", ptr_, {ptr_, i64_, ptr_, ptr_});
   }
@@ -538,7 +538,8 @@ class CodeGen {
         }
         if (t->kind == TypeKind::Struct && !t->is_union && es.size() == t->fields.size()) {
           std::vector<llvm::Constant*> fields;
-          for (size_t i = 0; i < es.size(); ++i) fields.push_back(const_value(es[i], t->fields[i].type));
+          for (size_t i = 0; i < es.size(); ++i)
+            fields.push_back(t->fields[i].type->kind == TypeKind::Void ? nullptr : const_value(es[i], t->fields[i].type));
           return struct_const(t, fields, /*consistent=*/true);
         }
         break;
@@ -668,7 +669,7 @@ class CodeGen {
     std::vector<llvm::Constant*> out(t->fields.size(), nullptr);
     for (size_t i = 0; i < t->fields.size(); ++i) {
       const StructField& f = t->fields[i];
-      if (f.uninit) continue;
+      if (f.uninit || f.type->kind == TypeKind::Void) continue;
       bool overridden = false;
       for (size_t j = 0; j < given.size() && t->has_place; ++j)
         overridden |= j != i && given[j] && fields_overlap(t, i, j);
@@ -781,6 +782,7 @@ class CodeGen {
       v["runtime_size"] = llvm::ConstantInt::get(i64_, size_of(t));
       v["name"] = string_const(name);
       v["variant_of"] = type_info(t->distinct_of);
+      v["variant_flags"] = llvm::ConstantInt::get(i32_, t->isa ? 1 : 0);
       gv->setInitializer(ti_const(ti.variant, v));
       return gv;
     }
@@ -917,7 +919,7 @@ class CodeGen {
 
   void declare_global(Symbol* g) {
     auto* gv = new llvm::GlobalVariable(*mod_, lt(g->type), false, llvm::GlobalValue::InternalLinkage, nullptr, g->name);
-    gv->setAlignment(llvm::Align(align_of(g->type)));
+    gv->setAlignment(llvm::Align(std::max<uint64_t>(align_of(g->type), (uint64_t)g->align)));
     g->llvm_value = gv;
   }
 
@@ -1209,6 +1211,7 @@ class CodeGen {
     for (size_t i = 0; i < d->syms.size(); ++i) {
       Symbol* s = d->syms[i];
       auto* a = make_alloca(s->type, s->name);
+      if ((uint64_t)s->align > a->getAlign().value()) a->setAlignment(llvm::Align((uint64_t)s->align));  // #align
       s->llvm_value = a;
       if (!vals.empty()) b_.CreateStore(vals[i], a);
       else if (!d->uninit) b_.CreateStore(default_value(s->type), a);
@@ -2046,6 +2049,15 @@ class CodeGen {
     return allocate(MODE_ALLOCATE, size, llvm::ConstantInt::get(i64_, 0), null_ptr(), allocator_arg(c));
   }
 
+  // __ojay_array_reserve's alignment arguments for elements of type t: 0 and
+  // null unless t is aligned more than the heap guarantees (then the array
+  // moves to aligned blocks, through __allocate_aligned with a context).
+  std::pair<llvm::Value*, llvm::Value*> reserve_alignment(Type* t) {
+    if (t->align <= T.heap_align()) return {llvm::ConstantInt::get(i64_, 0), null_ptr()};
+    llvm::Value* fn = prog_.uses_context ? (llvm::Value*)prog_.allocate_aligned_proc->llvm_fn : null_ptr();
+    return {llvm::ConstantInt::get(i64_, (uint64_t)t->align), fn};
+  }
+
   // Frees `p` with the allocator at `allocator` (null: the context's).
   void free_bytes(llvm::Value* p, llvm::Value* allocator) {
     if (!prog_.uses_context) {
@@ -2176,8 +2188,9 @@ class CodeGen {
         llvm::Value* new_count = b_.CreateAdd(count, llvm::ConstantInt::get(i64_, 1));
         // A dynamic array keeps the allocator it first grew with (context.allocator then).
         auto [alloc_fn, ctx_allocator] = runtime_allocator(prog_.uses_context ? context_addr() : nullptr);
+        auto [align, alloc_aligned] = reserve_alignment(et);
         b_.CreateCall(rt_array_reserve_, {arr, llvm::ConstantInt::get(i64_, size_of(et)), new_count,
-                                          llvm::ConstantInt::get(i32_, 0), alloc_fn, ctx_allocator});
+                                          llvm::ConstantInt::get(i32_, 0), alloc_fn, ctx_allocator, align, alloc_aligned});
         llvm::Value* data = b_.CreateLoad(ptr_, b_.CreateStructGEP(dyn_t, arr, 1));
         llvm::Value* slot = b_.CreateInBoundsGEP(lt(et), data, {count});
         if (value) b_.CreateStore(value, slot);
@@ -2187,8 +2200,9 @@ class CodeGen {
       }
       case Builtin::ArrayReserve: {
         auto [alloc_fn, ctx_allocator] = runtime_allocator(prog_.uses_context ? context_addr() : nullptr);
+        auto [align, alloc_aligned] = reserve_alignment(c->type_arg);
         b_.CreateCall(rt_array_reserve_, {rvalue(a[0]), llvm::ConstantInt::get(i64_, size_of(c->type_arg)), rvalue(a[1]),
-                                          llvm::ConstantInt::get(i32_, 1), alloc_fn, ctx_allocator});
+                                          llvm::ConstantInt::get(i32_, 1), alloc_fn, ctx_allocator, align, alloc_aligned});
         return nullptr;
       }
       case Builtin::ArrayFree: {

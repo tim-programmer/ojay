@@ -138,10 +138,11 @@ Type* TypeTable::new_enum(const std::string& name, Type* base, bool flags) {
   return t;
 }
 
-Type* TypeTable::new_distinct(const std::string& name, Type* base) {
+Type* TypeTable::new_distinct(const std::string& name, Type* base, bool isa) {
   owned_.push_back(std::make_unique<Type>(base->kind));
   Type* t = owned_.back().get();
   t->distinct_of = base;
+  t->isa = isa;
   t->name = name;
   copy_distinct(t);
   return t;

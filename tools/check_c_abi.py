@@ -76,6 +76,22 @@ TYPES = [
     ("SU", "int32_t a; UFI u;", "a: s32; u: UFI;"),
     ("SUF", "float a; UFF u;", "a: float32; u: UFF;"),
     ("STR", "int64_t count; uint8_t *data;", "s: string;"),
+    # #align members (C11 _Alignas) and #place overlaps (anonymous unions in C).
+    ("AL8", "uint8_t a; _Alignas(8) uint8_t b;", "a: u8; b: u8 #align 8;"),
+    ("ALS", "_Alignas(16) uint8_t x;", "x: u8 #align 16;"),
+    ("AL16", "uint8_t tag; _Alignas(16) uint8_t x; int32_t y;", "tag: u8; x: u8 #align 16; y: s32;"),
+    ("AL32", "_Alignas(32) int32_t x;", "x: s32 #align 32;"),
+    ("ALF", "float a; _Alignas(8) float b;", "a: float32; b: float32 #align 8;"),
+    ("ALD", "_Alignas(16) double a; double b;", "a: float64 #align 16; b: float64;"),
+    ("ALI", "int32_t a; _Alignas(8) int32_t b;", "a: s32; b: s32 #align 8;"),
+    ("PL", "union { int64_t a; double b; };", "a: s64; #place a; b: float64;"),
+    ("PL2", "union { int64_t a; struct { uint32_t lo, hi; }; };", "a: s64; #place a; lo: u32; hi: u32;"),
+    ("PLF", "union { float a; float b; }; float c;", "a: float32; #place a; b: float32; c: float32;"),
+    ("PLD", "union { double d; struct { float x, y; }; };", "d: float64; #place d; x, y: float32;"),
+    ("PLP", "union { void *p; uint64_t n; }; int32_t i;", "p: *void; #place p; n: u64; i: s32;"),
+    ("PLB", "union { int8_t c; int32_t w; }; int16_t s;", "c: s8; #place c; w: s32; s: s16;"),
+    ("VM", "int32_t a; int32_t b;", "a: s32; m: void; b: s32;"),
+    ("DS", "float a, b;", "v: Dist_F2;"),
 ]
 UNIONS = [
     ("UFI", "float f; int32_t i;", "f: float32; i: s32;"),
@@ -106,7 +122,7 @@ EXTRA = [
 
 def sources():
     c = ["#include <stdint.h>", "#include <stdbool.h>"]
-    jai = ["En8 :: enum u8 { A; B; }", "En16 :: enum s16 { A :: -1; B; }"]
+    jai = ["En8 :: enum u8 { A; B; }", "En16 :: enum s16 { A :: -1; B; }", "Dist_F2 :: #type,distinct F2;"]
     order = TYPES[:]
     # C needs definitions before use; the unions come before SU and SUF.
     for name, cm, jm in UNIONS:

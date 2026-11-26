@@ -113,6 +113,7 @@ struct Type {
   // `Name :: #type,distinct Base;`: a type of its own with Base's kind and
   // layout (a copy of Base's description), but never implicitly converted.
   Type* distinct_of = nullptr;
+  bool isa = false;  // `#type,isa Base`: also converts implicitly to Base (not back)
 
   // Backend caches.
   llvm::Type* llvm_type = nullptr;
@@ -179,7 +180,7 @@ class TypeTable {
   Type* new_enum(const std::string& name, Type* base, bool flags);
   // A distinct type: a copy of base's description under a new identity. A
   // struct base must be laid out first (copy_distinct refreshes it).
-  Type* new_distinct(const std::string& name, Type* base);
+  Type* new_distinct(const std::string& name, Type* base, bool isa = false);
   static void copy_distinct(Type* t);
 
   // Computes size/alignment for a struct whose fields are filled in.

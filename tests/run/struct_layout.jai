@@ -4,8 +4,9 @@
 // the same on every target.
 // COMPILE_OUTPUT: run: Overlay 8 [a@0 b@0 lo@0 hi@4] Aligned 32 [tag@0 x@16 y@20] ALIGNED true
 // COMPILE_OUTPUT: run: Big 64 [a@0 v@32] Outer 48 [c@0 inner@16] Al(8) 16 [c@0 x@8]
-// COMPILE_OUTPUT: run: lo 0 hi 1072693248 aligned local true heap true array true arena true
+// COMPILE_OUTPUT: run: lo 0 hi 1072693248 aligned local true heap true array true arena true bump true (4 aligned requests)
 // COMPILE_OUTPUT: run: {1069547520, 1.5, 3} {8589934593, 0, 1, 2}
+// COMPILE_OUTPUT: run: vars true true dynamic true true Marked 8 [x@0 start@4 lo@4 hi@6] {1, 2, 3, 196610}
 #import "Basic";
 
 Overlay :: struct {
@@ -69,8 +70,8 @@ checks :: () -> string {
     arr := NewArray(3, Big);
     all := true;
     for * arr  all &= aligned(*it.v, 32);
-    return sprint("lo % hi % aligned local % heap % array % arena %", o.lo, o.hi, aligned(*l.v, 32), aligned(*h.v, 32),
-                  all, from_arena());
+    return sprint("lo % hi % aligned local % heap % array % arena % %", o.lo, o.hi, aligned(*l.v, 32), aligned(*h.v, 32),
+                  all, from_arena(), from_bump());
 }
 
 make_overlay :: () -> Overlay { return .{lo = 1, hi = 2}; }
@@ -90,6 +91,49 @@ arena_proc :: (mode: Allocator_Mode, size: s64, old_size: s64, old_memory: *void
 }
 g_arena: Arena;
 
+// An allocator that honours alignment requests (ALLOCATE_ALIGNED, an ojay
+// extension) from a buffer that is only 8-aligned.
+Bump :: struct {
+    pad: u8;
+    mem: [4096] u8 #align 8;
+    used: int;
+    aligned_requests: int;
+}
+bump_proc :: (mode: Allocator_Mode, size: s64, old_size: s64, old_memory: *void, data: *void) -> *void {
+    b := cast(*Bump) data;
+    if mode == {
+        case .ALLOCATE;
+            p := *b.mem[b.used];
+            b.used += (size + 7) & ~7;
+            return p;
+        case .ALLOCATE_ALIGNED;
+            b.aligned_requests += 1;
+            start := cast(int) *b.mem[0];
+            at := ((start + b.used + old_size - 1) & ~(old_size - 1)) - start;
+            b.used = at + size;
+            return *b.mem[at];
+    }
+    return null;
+}
+
+from_bump :: () -> string {
+    b: Bump;
+    a := Allocator.{bump_proc, *b};
+    x := New(u8, allocator = a);   // misaligns the next block
+    p := New(Big, allocator = a);
+    arr := NewArray(3, Big, allocator = a);
+    ok := aligned(p, 32) && aligned(arr.data, 32);
+    {
+        push_allocator(a);   // only for this block (sprint below allocates normally)
+        dyn: [..] Big;
+        for 1..12  array_add(*dyn, .{});
+        for * dyn  ok &= aligned(it, 32);
+    }
+    t := New(Big, allocator = temporary_allocator);
+    ok &= aligned(t, 32);
+    return sprint("bump % (% aligned requests)", ok, b.aligned_requests);
+}
+
 from_arena :: () -> bool {
     p := New(Big, allocator = .{arena_proc, *g_arena});
     q := New(Big, allocator = .{arena_proc, *g_arena});
@@ -102,6 +146,49 @@ from_arena :: () -> bool {
 #run print("run: %\n", checks());
 #run print("run: % %\n", Mixed.{f = 1.5}, make_overlay());
 
+// void members take no space: markers for #place.
+Marked :: struct {
+    x: u32;
+    start: void;
+    lo: u16;
+    hi: u16;
+    #place start;
+    whole: u32;
+}
+
+layout_marked :: () -> string {
+    info := type_info(Marked);
+    b: String_Builder;
+    init_string_builder(*b);
+    print_to_builder(*b, "Marked % [", info.runtime_size);
+    for info.members {
+        if it.name == "whole"  break;
+        if it_index  append(*b, " ");
+        print_to_builder(*b, "%@%", it.name, it.offset_in_bytes);
+    }
+    append(*b, "]");
+    return builder_to_string(*b);
+}
+
+// #align on variables, and dynamic arrays of over-aligned elements.
+more_checks :: () -> string {
+    a: u8;
+    v: [4] float32 #align 64;
+    w := 7 #align 32;
+    dyn: [..] Big;
+    for 1..20  array_add(*dyn, .{a = cast(u8) it});
+    dyn_ok := true;
+    for * dyn  dyn_ok &= aligned(it, 32) && it.a == it_index + 1;
+    res: [..] Big;
+    array_reserve(*res, 3);
+    m := Marked.{1, 2, 3};
+    return sprint("vars % % dynamic % % % %", aligned(*v, 64), aligned(*w, 32), dyn_ok, aligned(res.data, 32),
+                  layout_marked(), m);
+}
+
+#run print("run: %\n", more_checks());
+
+g_aligned: [3] u8 #align 128;
 g_big: Big;
 g_over := Overlay.{lo = 1, hi = 2};
 g_mixed := Mixed.{f = 1.5};
@@ -152,4 +239,15 @@ main :: () {
     h2 := New(Big, initialized = false);
     print("New again %\n", aligned(h2, 32));
     print("checks: %\n", checks());
+
+    print("more: %\n", more_checks());
+    print("global #align 128: %\n", aligned(*g_aligned, 128));
+    mk := Marked.{x = 5, lo = 1, hi = 1};
+    print("mk = %, whole = %, *mk.start - *mk = %\n", mk, mk.whole, cast(int) (*mk.start) - cast(int) *mk);
+    dyn: [..] Big;
+    for 1..50  array_add(*dyn, .{});
+    ok := true;
+    for * dyn  ok &= aligned(it, 32);
+    print("dynamic: % (% elements)\n", ok, dyn.count);
+    array_free(dyn);
 }

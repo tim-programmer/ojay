@@ -16,4 +16,8 @@ make_overlay().a = 8589934593
 local true, global true, nested true, member x true
 New true, NewArray true
 New again true
-checks: lo 0 hi 1072693248 aligned local true heap true array true arena true
+checks: lo 0 hi 1072693248 aligned local true heap true array true arena true bump true (4 aligned requests)
+more: vars true true dynamic true true Marked 8 [x@0 start@4 lo@4 hi@6] {1, 2, 3, 196610}
+global #align 128: true
+mk = {5, 1, 1, 65537}, whole = 65537, *mk.start - *mk = 4
+dynamic: true (50 elements)

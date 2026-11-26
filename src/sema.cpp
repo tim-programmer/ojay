@@ -1124,7 +1124,7 @@ class Checker : public InterpHost {
           s->module_scope = prog_.modules.at(de->module_id).scope;
           return;
         }
-        if (de->name == "distinct") {
+        if (de->name == "distinct" || de->name == "isa") {
           s->kind = SymKind::Type;
           s->type = T.type_t;
           s->cv = ConstValue::of_type(define_distinct(de, s->name));
@@ -1173,6 +1173,7 @@ class Checker : public InterpHost {
     complete_type(declared, s->loc);
     s->kind = SymKind::Var;
     s->type = declared;
+    s->align = align_value(d->align);
     s->init = init;
     s->is_global = true;
     prog_.global_vars.push_back(s);
@@ -1279,7 +1280,7 @@ class Checker : public InterpHost {
       default:
         break;
     }
-    Type* t = T.new_distinct(name, base);
+    Type* t = T.new_distinct(name, base, de->name == "isa");
     if (t->kind == TypeKind::Struct) all_structs_.push_back(t);  // laid out as its base is
     return t;
   }
@@ -1489,18 +1490,10 @@ class Checker : public InterpHost {
         t->has_place = true;
         continue;
       }
-      int64_t align = 0;
-      if (d->align) {
-        check_value(d->align, nullptr);
-        if (!d->align->is_const() || d->align->cv.kind != ConstValue::Int || !d->align->type->is_integer())
-          fail(d->align->loc, "#align needs a compile-time integer constant");
-        i128 n = d->align->cv.i;
-        if (n <= 0 || (n & (n - 1)) != 0 || n > (i128(1) << 30))
-          fail(d->align->loc, "#align ", i128_str(n), ": the alignment must be a power of two");
-        align = (int64_t)n;
-        t->has_align = true;
-      }
+      int64_t align = align_value(d->align);
+      if (align) t->has_align = true;
       Type* ft = d->type_expr ? resolve_type(d->type_expr) : nullptr;
+      if (ft && ft->kind == TypeKind::Void && !d->values.empty()) fail(d->loc, "a void member cannot have a value");
       if (!d->values.empty() && d->values.size() != 1 && d->values.size() != d->names.size())
         fail(d->loc, "member declaration needs one value per name");
       for (size_t i = 0; i < d->names.size(); ++i) {
@@ -1530,7 +1523,10 @@ class Checker : public InterpHost {
           if (!mt) mt = v->type;
         }
         if (!mt) fail(d->loc, "member '", f.name, "' needs a type");
-        if (mt->kind == TypeKind::Void) fail(d->loc, "member cannot have type void");
+        if (mt->kind == TypeKind::Void) {  // a marker (for #place): no storage
+          if (t->is_union) fail(d->loc, "a union member cannot have type void");
+          if (!d->values.empty()) fail(d->loc, "a void member cannot have a value");
+        }
         complete_type(mt, d->loc);
         f.type = mt;
         f.align = align;
@@ -1560,6 +1556,18 @@ class Checker : public InterpHost {
       }
       if (ct) t->constants.push_back({sym->name, ct, pos});
     }
+  }
+
+  // The N of `#align N` (null: 0), a power-of-two constant.
+  int64_t align_value(Expr*& e) {
+    if (!e) return 0;
+    check_value(e, nullptr);
+    if (!e->is_const() || e->cv.kind != ConstValue::Int || !e->type->is_integer())
+      fail(e->loc, "#align needs a compile-time integer constant");
+    i128 n = e->cv.i;
+    if (n <= 0 || (n & (n - 1)) != 0 || n > (i128(1) << 30))
+      fail(e->loc, "#align ", i128_str(n), ": the alignment must be a power of two");
+    return (int64_t)n;
   }
 
   // A value other than zero initializes member f (its default, or its type's).
@@ -1910,6 +1918,7 @@ class Checker : public InterpHost {
       s->decl = d;
       s->decl_index = (int)i;
       s->state = Symbol::State::Resolved;
+      s->align = align_value(d->align);
       d->syms.push_back(s);
       if (nested_backtick) nested_backticks_.push_back({macros_.back().id, s});
       if (d->is_using) add_using_var(s, d->loc);
@@ -2276,7 +2285,14 @@ class Checker : public InterpHost {
   bool implicit_ok(Type* from, Type* to) {
     if (from == to) return true;
     if (to->kind == TypeKind::Any) return from->kind != TypeKind::Void && from->kind != TypeKind::Tuple;
-    // A distinct type converts to and from nothing implicitly (cast or xx it).
+    // A distinct type converts to and from nothing implicitly (cast or xx it);
+    // an isa type converts to its base (and so to what the base converts to).
+    if (from->isa && !to->distinct_of) return implicit_ok(from->distinct_of, to);
+    if (from->isa && to->distinct_of) {
+      for (Type* b = from->distinct_of; b; b = b->isa ? b->distinct_of : nullptr)
+        if (b == to) return true;
+      return false;
+    }
     if (from->distinct_of || to->distinct_of) return false;
     if (from->kind == TypeKind::Int && to->kind == TypeKind::Int) {
       if (from->is_signed == to->is_signed) return from->bits < to->bits;
@@ -2634,8 +2650,8 @@ class Checker : public InterpHost {
           return e->type;
         }
         if (d->name == "this") return check_this(e);
-        if (d->name == "distinct")
-          fail(e->loc, "a distinct type must be declared as a named constant: Name :: #type,distinct T;");
+        if (d->name == "distinct" || d->name == "isa")
+          fail(e->loc, "a distinct type must be declared as a named constant: Name :: #type,", d->name, " T;");
         if (d->name.rfind("import:", 0) == 0) fail(e->loc, "named #import is only supported as `Name :: #import \"...\";`");
         fail(e->loc, "#", d->name, " is not supported here");
       }
@@ -2747,7 +2763,11 @@ class Checker : public InterpHost {
   Type* check_unary(Unary* u, Type* hint) {
     switch (u->op) {
       case UnOp::AddrOf: {
-        Type* t = check_rv(u->operand, nullptr);
+        Type* t = check(u->operand, nullptr);
+        if (t->kind == TypeKind::Void && u->operand->kind == NK::Member &&
+            static_cast<Member*>(u->operand)->mkind == MemberKind::Field)
+          return T.void_ptr;  // the address of a void member (a marker): where it is
+        t = check_rv(u->operand, nullptr);
         if (u->operand->is_const() && u->operand->cv.kind == ConstValue::TypeV) {
           u->cv = ConstValue::of_type(T.pointer_to(u->operand->cv.t));
           return T.type_t;
@@ -3315,9 +3335,12 @@ class Checker : public InterpHost {
         if (idx == t->fields.size()) fail(a.name_loc, "struct ", type_name(t), " has no member '", a.name, "'");
       } else {
         if (named_seen) fail(a.value->loc, "positional values must come before named ones");
+        while (pos < t->fields.size() && t->fields[pos].type->kind == TypeKind::Void) ++pos;  // markers
         idx = pos++;
         if (idx >= t->fields.size()) fail(a.value->loc, "too many values for struct ", type_name(t));
       }
+      if (t->fields[idx].type->kind == TypeKind::Void)
+        fail(a.name_loc, "member '", a.name, "' of ", type_name(t), " has type void and cannot be set");
       if (s->field_values[idx]) fail(a.value->loc, "member '", t->fields[idx].name, "' is set twice");
       if (t->has_place)
         for (size_t j = 0; j < t->fields.size(); ++j)
@@ -4549,6 +4572,7 @@ class Checker : public InterpHost {
       case TypeKind::Null:
         return p->is_pointer() || p->is_proc() ? 1 : -1;
       default:
+        if (a->isa && a->distinct_of == p) return 1;  // an isa type to its own base: the nearest conversion
         if (implicit_ok(a, p)) return p->kind == TypeKind::Any ? 4 : 2;
         return -1;
     }
@@ -5162,6 +5186,8 @@ class Checker : public InterpHost {
           fail(a[0]->loc, "'array_add' needs a pointer to a dynamic array ([..]T), e.g. array_add(*arr, x)");
         Type* elem = t->elem->elem;
         c->type_arg = elem;
+        complete_type(elem, c->loc);
+        want_aligned_allocation(elem);
         if (a.size() == 1) return T.pointer_to(elem);
         check_value(a[1], elem);
         return T.void_t;
@@ -5174,6 +5200,7 @@ class Checker : public InterpHost {
           fail(a[0]->loc, "'array_reserve' needs a pointer to a dynamic array ([..]T), e.g. array_reserve(*arr, 100)");
         c->type_arg = t->elem->elem;
         complete_type(c->type_arg, c->loc);
+        want_aligned_allocation(c->type_arg);
         check_value(a[1], T.s64);
         return T.void_t;
       }
