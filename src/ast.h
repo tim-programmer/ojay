@@ -579,7 +579,17 @@ struct AsmStmt : Stmt {
   SourceLoc text_loc; // where it starts
   // sema
   std::string asm_text;
-  std::vector<Symbol*> operands;
+  // Operand k (`${k}`): a variable (read before the block, written back
+  // after), or a register declared in the block (`name: gpr;` / `name: vec;`:
+  // no value before or after). `pin` (`=== reg`) fixes its register.
+  struct Operand {
+    Symbol* var = nullptr;
+    std::string name;  // a declared register's name
+    bool vec = false;  // a declared `vec` (float / vector) register
+    std::string pin;
+  };
+  std::vector<Operand> operands;
+  std::vector<std::string> literal_words;  // names left as written (registers among them are clobbered)
   AsmStmt(SourceLoc l, std::string t, SourceLoc tl) : Stmt(NK::Asm, l), text(std::move(t)), text_loc(tl) {}
 };
 

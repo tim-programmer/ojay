@@ -1,3 +1,5 @@
+#include <set>
+#include <unordered_set>
 #include "codegen.h"
 
 #include "abi.h"
@@ -576,11 +578,25 @@ class CodeGen {
         if (it != baked_objects_.end()) {
           gv = it->second;
         } else {
-          llvm::Constant* init = const_value((*cv.elems)[0], cv.t);
-          gv = new llvm::GlobalVariable(*mod_, init->getType(), false, llvm::GlobalValue::PrivateLinkage, init,
-                                        "baked");
+          // The global exists before its initializer is made, so pointers
+          // back to it (a cycle) refer to it. If the initializer's LLVM type
+          // differs (a constant of the same layout), a global of that type
+          // replaces it.
+          gv = new llvm::GlobalVariable(*mod_, lt(cv.t), false, llvm::GlobalValue::PrivateLinkage, nullptr, "baked");
           gv->setAlignment(llvm::Align(align_of(cv.t)));
           baked_objects_[cv.elems.get()] = gv;
+          llvm::Constant* init = const_value((*cv.elems)[0], cv.t);
+          if (init->getType() != gv->getValueType()) {
+            auto* ng = new llvm::GlobalVariable(*mod_, init->getType(), false, llvm::GlobalValue::PrivateLinkage,
+                                                init, "baked");
+            ng->setAlignment(gv->getAlign());
+            gv->replaceAllUsesWith(ng);
+            gv->eraseFromParent();
+            gv = ng;
+            baked_objects_[cv.elems.get()] = gv;
+          } else {
+            gv->setInitializer(init);
+          }
         }
         if (cv.i == 0) return gv;
         return llvm::ConstantExpr::getInBoundsGetElementPtr(i8_, gv, llvm::ConstantInt::get(i64_, (uint64_t)cv.i));
@@ -964,6 +980,32 @@ class CodeGen {
         if (!t->is_union) {
           llvm::Constant* def = default_value(t);
           if (!def->isNullValue()) v["initializer"] = initializer_fn(t, def, name);
+        }
+        if (t->poly_source) {  // an instance of a polymorphic struct: its source and parameters
+          v["polymorph_source_struct"] = type_info(t->poly_source);
+          // The values, laid out as an LLVM struct of their types (natural alignment).
+          std::vector<llvm::Type*> vts;
+          std::vector<llvm::Constant*> vals;
+          for (auto& pp : t->poly_params) {
+            vts.push_back(lt(pp.type));
+            vals.push_back(const_value(*pp.value, pp.type));
+          }
+          auto* storage_t = llvm::StructType::get(ctx_, vts);
+          const llvm::StructLayout* sl = dl_.getStructLayout(storage_t);
+          std::vector<llvm::Constant*> ps;
+          for (size_t i = 0; i < t->poly_params.size(); ++i) {
+            TiFields pv;
+            pv["name"] = string_const(t->poly_params[i].name);
+            pv["type"] = type_info(t->poly_params[i].type);
+            pv["offset_in_bytes"] = llvm::ConstantInt::get(i64_, sl->getElementOffset((unsigned)i));
+            ps.push_back(ti_const(prog_.type_info.member, pv));
+          }
+          v["specified_parameters"] = ti_view(lt(prog_.type_info.member), ps, "__type_info_params." + name);
+          auto* storage = new llvm::GlobalVariable(*mod_, storage_t, true, llvm::GlobalValue::PrivateLinkage,
+                                                   llvm::ConstantStruct::get(storage_t, vals),
+                                                   "__type_info_constants." + name);
+          v["constant_storage"] = llvm::ConstantStruct::get(
+              llvm::StructType::get(ctx_, {i64_, ptr_}), {llvm::ConstantInt::get(i64_, sl->getSizeInBytes()), storage});
         }
         break;
       }
@@ -2200,35 +2242,139 @@ class CodeGen {
   // `#asm { ... }`: one volatile inline asm call (Intel syntax on x86-64).
   // Each variable operand is read and written: its value goes in as a tied
   // input of an output register, and the output is stored back.
+  // The register family of `name` on this target (the name LLVM's constraints
+  // use for it, whatever the width: x86 "ax" for rax / eax / ax / al), or ""
+  // when it is not a register that #asm may pin or clobber.
+  static std::string asm_register(const std::string& name, bool x86, bool arm, bool riscv) {
+    std::string n;
+    for (char ch : name) n += (char)std::tolower((unsigned char)ch);
+    if (x86) {
+      static const std::unordered_map<std::string, std::string> legacy = {
+          {"a", "ax"}, {"b", "bx"}, {"c", "cx"}, {"d", "dx"},  // Jai's short names
+          {"rax", "ax"}, {"eax", "ax"}, {"ax", "ax"}, {"al", "ax"}, {"ah", "ax"},
+          {"rbx", "bx"}, {"ebx", "bx"}, {"bx", "bx"}, {"bl", "bx"}, {"bh", "bx"},
+          {"rcx", "cx"}, {"ecx", "cx"}, {"cx", "cx"}, {"cl", "cx"}, {"ch", "cx"},
+          {"rdx", "dx"}, {"edx", "dx"}, {"dx", "dx"}, {"dl", "dx"}, {"dh", "dx"},
+          {"rsi", "si"}, {"esi", "si"}, {"si", "si"}, {"sil", "si"},
+          {"rdi", "di"}, {"edi", "di"}, {"di", "di"}, {"dil", "di"}};
+      if (auto it = legacy.find(n); it != legacy.end()) return it->second;
+      // r8 .. r15 (and their d / w / b forms), xmm0 .. xmm15
+      size_t k = 0;
+      if (n.size() >= 2 && n[0] == 'r' && std::isdigit((unsigned char)n[1])) {
+        k = 1;
+        while (k < n.size() && std::isdigit((unsigned char)n[k])) ++k;
+        int r = std::stoi(n.substr(1, k - 1));
+        std::string suffix = n.substr(k);
+        if (r >= 8 && r <= 15 && (suffix.empty() || suffix == "d" || suffix == "w" || suffix == "b"))
+          return "r" + std::to_string(r);
+        return "";
+      }
+      for (const char* v : {"xmm", "ymm"})
+        if (n.rfind(v, 0) == 0 && n.size() > 3 && n.find_first_not_of("0123456789", 3) == std::string::npos) {
+          int r = std::stoi(n.substr(3));
+          if (r <= 15) return "xmm" + std::to_string(r);
+        }
+      return "";  // (not rsp / rbp / rip: the stack and frame pointers)
+    }
+    if (arm) {
+      if (n == "lr") return "lr";
+      if (n == "ip") return "r12";
+      auto num = [&](char p, int max) -> std::string {
+        if (n.size() < 2 || n[0] != p || n.find_first_not_of("0123456789", 1) != std::string::npos) return "";
+        int r = std::stoi(n.substr(1));
+        return r <= max ? std::string(1, p) + std::to_string(r) : "";
+      };
+      std::string r = num('r', 12);
+      if (!r.empty()) return r == "r7" ? "" : r;  // (r7: Thumb's frame pointer)
+      if (!(r = num('s', 31)).empty()) return r;
+      if (!(r = num('d', 15)).empty()) return r;
+      return "";  // (not sp / pc)
+    }
+    if (riscv) {
+      static const std::unordered_set<std::string> abi = {
+          "ra", "t0", "t1", "t2", "t3", "t4", "t5", "t6", "a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7",
+          "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11",
+          "ft0", "ft1", "ft2", "ft3", "ft4", "ft5", "ft6", "ft7", "ft8", "ft9", "ft10", "ft11",
+          "fa0", "fa1", "fa2", "fa3", "fa4", "fa5", "fa6", "fa7",
+          "fs0", "fs1", "fs2", "fs3", "fs4", "fs5", "fs6", "fs7", "fs8", "fs9", "fs10", "fs11"};
+      if (abi.count(n)) return n;
+      if (n.size() >= 2 && n[0] == 'x' && n.find_first_not_of("0123456789", 1) == std::string::npos) {
+        int r = std::stoi(n.substr(1));
+        static const char* names[32] = {"", "ra", "", "", "", "t0", "t1", "t2", "", "s1", "a0", "a1", "a2",
+                                        "a3", "a4", "a5", "a6", "a7", "s2", "s3", "s4", "s5", "s6", "s7",
+                                        "s8", "s9", "s10", "s11", "t3", "t4", "t5", "t6"};
+        return r < 32 ? names[r] : "";  // (not zero / sp / gp / tp / s0 = fp)
+      }
+      return "";
+    }
+    return "";
+  }
+
   void emit_asm(AsmStmt* a) {
     llvm::Triple tr(mod_->getTargetTriple());
     bool x86 = tr.isX86(), arm = tr.isARM() || tr.isThumb(), riscv = tr.isRISCV();
-    std::vector<llvm::Type*> types;
+    std::vector<llvm::Type*> types;     // the outputs' types
     std::vector<llvm::Value*> inputs;
+    std::vector<llvm::Type*> in_types;
     std::string outs, ins;
+    std::set<std::string> pinned;
     size_t n = a->operands.size();
     for (size_t i = 0; i < n; ++i) {
-      Symbol* s = a->operands[i];
-      Type* t = const_cast<Type*>(s->type->underlying());
-      std::string c = "r";
-      if (t->kind == TypeKind::Float) {
-        if (x86) c = "x";
-        else if (arm) c = t->bits == 32 ? "t" : "w";
-        else throw CompileError(a->loc, cat("#asm: float operand '", s->name, "': this target has no float registers"));
+      const AsmStmt::Operand& op = a->operands[i];
+      llvm::Type* ty;
+      bool is_float;
+      if (op.var) {
+        Type* t = const_cast<Type*>(op.var->type->underlying());
+        ty = lt(op.var->type);
+        is_float = t->kind == TypeKind::Float;
+      } else if (op.vec) {
+        ty = x86 ? (llvm::Type*)llvm::Type::getDoubleTy(ctx_) : (llvm::Type*)llvm::Type::getFloatTy(ctx_);
+        is_float = true;
+      } else {
+        ty = tr.isArch64Bit() ? i64_ : i32_;
+        is_float = false;
       }
-      types.push_back(lt(s->type));
-      inputs.push_back(b_.CreateLoad(lt(s->type), s->llvm_value));
-      outs += (i ? "," : "") + std::string("=") + c;
-      ins += "," + std::to_string(i);
+      std::string c = "r";
+      if (is_float) {
+        if (x86) c = "x";
+        else if (arm) c = ty->isFloatTy() ? "t" : "w";
+        else
+          throw CompileError(a->loc, cat("#asm: '", op.name, "': this target has no float registers"));
+      }
+      if (!op.pin.empty()) {
+        std::string reg = asm_register(op.pin, x86, arm, riscv);
+        if (reg.empty())
+          throw CompileError(a->loc, cat("#asm: '", op.pin, "' (for '", op.name, "') is not a register that can be "
+                                         "pinned on this target"));
+        if (!pinned.insert(reg).second)
+          throw CompileError(a->loc, cat("#asm: two operands are pinned to register '", op.pin, "'"));
+        c = "{" + reg + "}";
+      }
+      types.push_back(ty);
+      // A variable is read before the block (tied to its output); a declared
+      // register has no value then (an early-clobber output: the block may
+      // write it before it reads the inputs).
+      outs += (i ? "," : "") + std::string(op.var ? "=" : "=&") + c;
+      if (op.var) {
+        inputs.push_back(b_.CreateLoad(ty, op.var->llvm_value));
+        in_types.push_back(ty);
+        ins += "," + std::to_string(i);
+      }
     }
     std::string constraints = outs + ins;
     std::string clobbers = "~{memory}";
     if (x86) clobbers += ",~{dirflag},~{fpsr},~{flags}";
     else if (arm) clobbers += ",~{cc}";
-    (void)riscv;
+    // The registers named in the block are clobbered (unless they are operands).
+    for (const std::string& w : a->literal_words) {
+      std::string reg = asm_register(w, x86, arm, riscv);
+      if (!reg.empty() && !pinned.count(reg)) {
+        clobbers += ",~{" + reg + "}";
+        pinned.insert(reg);  // (once)
+      }
+    }
     constraints += (constraints.empty() ? "" : ",") + clobbers;
     llvm::Type* rt = n == 0 ? void_ : n == 1 ? types[0] : llvm::StructType::get(ctx_, types);
-    std::vector<llvm::Type*> in_types(types.begin(), types.end());
     auto* ft = llvm::FunctionType::get(rt, in_types, false);
     if (llvm::Error err = llvm::InlineAsm::verify(ft, constraints))
       throw CompileError(a->loc, cat("internal error: #asm constraints: ", llvm::toString(std::move(err))));
@@ -2242,8 +2388,9 @@ class CodeGen {
                                                            llvm::ConstantInt::get(i64_, cookie))}));
     llvm::Value* r = call;
     for (size_t i = 0; i < n; ++i) {
+      if (!a->operands[i].var) continue;  // a declared register: its value is dropped
       llvm::Value* v = n == 1 ? r : b_.CreateExtractValue(r, (unsigned)i);
-      b_.CreateStore(v, a->operands[i]->llvm_value);
+      b_.CreateStore(v, a->operands[i].var->llvm_value);
     }
   }
 

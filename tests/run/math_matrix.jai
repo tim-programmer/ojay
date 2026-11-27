@@ -36,6 +36,19 @@ main :: () {
     print("%\n", close(rotate(make_vector3(1, 0, 0), half), make_vector3(0.70710678, 0.70710678, 0)));
     print("%\n", close(rotate(rotate(make_vector3(3, 4, 5), q), inverse(q)), make_vector3(3, 4, 5)));
 
+    // Matrix2
+    r2 := make_rotation_matrix2(PI / 2);
+    v2 := r2 * make_vector2(1, 0);
+    print("% %\n", close(v2.x, 0), close(v2.y, 1));
+    m2 := Matrix2.{};
+    m2._11 = 4; m2._12 = 7; m2._21 = 2; m2._22 = 6;
+    i2, ok2 := inverse(m2);
+    print("% % % %\n", determinant(m2), ok2, i2 * m2 == Matrix2_Identity || close(determinant(i2 * m2), 1),
+          transpose(m2)._12);
+    print("% %\n", (m2 + Matrix2_Identity * 2)._11, (m2 - m2) == Matrix2.{});
+    _, singular2 := inverse(Matrix2.{});
+    print("% %\n", singular2, make_scale_matrix2(make_vector2(2, 3)) * make_vector2(1, 1));
+
     look := make_look_at_matrix(make_vector3(0, 0, 5), make_vector3(0, 0, 0), make_vector3(0, 1, 0));
     print("%\n", close(transform_point(look, make_vector3(0, 0, 0)), make_vector3(0, 0, -5)));
     proj := make_projection_matrix(PI / 2, 1, 1, 100);

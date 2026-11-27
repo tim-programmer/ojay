@@ -42,8 +42,8 @@ Operating_System_Tag :: enum u32 {
 // must agree.
 //
 // Differences from Jai: enums that Jai nests inside the structs are top-level
-// here (Type_Info_Array_Type, Type_Info_Struct_Member_Flags, ...), and there
-// are no polymorph sources or struct parameters.
+// here (Type_Info_Array_Type, Type_Info_Struct_Member_Flags, ...), and some
+// members are in another order.
 
 Type_Info_Tag :: enum u32 {
     INTEGER              :: 0;
@@ -127,6 +127,15 @@ Type_Info_Struct :: struct {
     textual_flags: Struct_Textual_Flags;
     initializer: (*void) -> ();  // sets a value to the struct's default value; null when that is all zeros
     notes: [] string;            // `S :: struct @note { ... }`
+
+    // An instance of a polymorphic struct (`Pair(int, 3)`): the polymorphic
+    // struct itself (a Type_Info_Struct with its name and no members), and
+    // the parameters it was given. Each parameter's value is in
+    // constant_storage at its offset_in_bytes (a type parameter's is a Type).
+    // Null and empty for other structs.
+    polymorph_source_struct: *Type_Info_Struct;
+    specified_parameters: [] Type_Info_Struct_Member;
+    constant_storage: [] u8;
 }
 
 Enum_Type_Flags :: enum_flags u32 {

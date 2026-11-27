@@ -469,9 +469,16 @@ Implemented:
     data and count, `c_style_strlen`, `alloc_string`, `copy_string`,
     `compare`, `join` (`separator`, `before_first`, `after_last`),
     `is_digit`, `is_alpha`, `is_alnum`, `is_space`),
-    `String_Builder` (`init_string_builder`, `append` of a string or byte,
-    `print_to_builder`, `builder_string_length`, `builder_to_string`,
-    `reset`, `free_buffers`), enums (`enum_names`, `enum_values_as_s64`
+    `String_Builder` (a chain of buffers as in Jai: the first,
+    `STRING_BUILDER_BUFFER_SIZE` bytes, inside the builder (4096; 512 on
+    bare metal), the next ones from the builder's `allocator`, each
+    `subsequent_buffer_size` bytes or as large as an append needs;
+    `init_string_builder` (with a buffer size), `append` of a string, bytes
+    or a byte, `print_to_builder`, `builder_string_length`,
+    `builder_to_string`, `write_builder`, `reset` (keeps the buffers for
+    reuse), `free_buffers`, `expand`, `ensure_contiguous_space`,
+    `get_base_buffer`, `get_current_buffer`, `get_buffer_data`; a builder
+    must not be copied once used), enums (`enum_names`, `enum_values_as_s64`
     (both T's own tables), `enum_values_as_enum` (a new array),
     `enum_range`, `enum_lowest_value`, `enum_highest_value`,
     `enum_range_given_info`), and `log` / `log_error`, which format like
@@ -485,13 +492,15 @@ Implemented:
     the operators `+ - * /` (per component, and `*` / `/` by a scalar),
     unary `-` and `==`, `dot`, `cross`, `length`, `length_squared`,
     `distance`, `normalize` (leaves vectors shorter than `epsilon`
-    unchanged) and `lerp` of vectors; `Matrix3` and `Matrix4` (row-major
-    `_11` .. `_44`, also `coef[row][column]`, `floats`, and a Matrix4's rows
-    as `v[i]`), `Matrix3_Identity` / `Matrix4_Identity`, `*` (with
+    unchanged) and `lerp` of vectors; `Matrix2`, `Matrix3` and `Matrix4`
+    (row-major `_11` .. `_44`, also `coef[row][column]`, `floats`, and a
+    Matrix4's rows as `v[i]`), `Matrix2_Identity` / `Matrix3_Identity` /
+    `Matrix4_Identity`, `*` (with
     matrices, vectors and scalars), `+`, `-`, `==`, `multiply`,
     `transform_point`, `transform_vector`, `transpose`, `determinant`,
     `inverse` (and whether there is one), `make_translation_matrix4`,
-    `make_scale_matrix3/4`, `make_matrix3` / `make_matrix4`,
+    `make_scale_matrix2/3/4`, `make_rotation_matrix2` (an angle in radians),
+    `make_matrix3` / `make_matrix4`,
     `make_look_at_matrix`, `make_projection_matrix` (OpenGL clip space) and
     `make_orthographic_projection_matrix`; `Quaternion` (`x`, `y`, `z`, `w`),
     `Quaternion_Identity`, `make_quaternion`, `set_from_axis_and_angle`,
@@ -571,9 +580,8 @@ Implemented:
       atomics mask interrupts (these cores have no 64-bit exclusive access);
       `signal` may be called from an interrupt handler.
   Differences from Jai's modules: `array_reserve` and `String_Builder`
-  memory come from the array's allocator (`context.allocator` when it first
-  grows), `String_Builder` is one growing buffer rather than a chain of
-  buffers, and a `Log_Section` only has a `name`.
+  memory come from the array's / builder's allocator (`context.allocator`
+  when it first grows), and a `Log_Section` only has a `name`.
   `print` shows anonymous struct and union members inline, so a `Vector3`
   prints as `{1, 2, 3}`.
   The allocating ones use `context.allocator`; `alloc`, `free`, `realloc`,
@@ -717,10 +725,24 @@ SHIFT :: 2;
   register hides it. Labels defined in the block (`again:`) are made unique to
   each copy of it (inlining, macros); use them rather than numeric labels.
   A line in quotes (`"wfi"`) is passed on unchanged.
+* Registers, as in Jai: `name: gpr;` declares a general register and
+  `name: vec;` a float / vector one (SSE on x86-64, VFP on ARM), chosen by
+  the compiler, for the block's own use (no value before or after it).
+  `name: gpr === reg;` declares it in a given register, and `x === reg;`
+  puts a variable operand in one, for instructions with fixed registers
+  (x86 `div`, `cpuid`, shifts by `cl`; calls on ARM / RISC-V). On x86-64
+  `reg` may be Jai's short `a`, `b`, `c`, `d` or any width's name (`rax`,
+  `eax`, `r8`, `xmm1`); on ARM `r0` .. `r12`, `lr`, `s0` .. `s31`; on RISC-V
+  the ABI names (`a0`, `t1`, ...) or `x5` .. `x31`. The stack and frame
+  pointers cannot be pinned.
 * Every block is volatile and clobbers memory (and the flags), so the
-  compiler neither removes nor moves it, and memory is reread after it.
-  Registers the instructions change other than the operands are not known to
-  the compiler: save them or use variables instead. Assembler errors are
+  compiler neither removes nor moves it, and memory is reread after it. The
+  registers named in the block (other than its operands; not the stack or
+  frame pointer) are clobbered: the compiler keeps nothing there across the
+  block (an ojay rule: Jai's assembler knows each instruction's registers,
+  ojay passes the text on). An instruction that changes a register it does
+  not name (x86 `cpuid`, `div`) needs that register declared, pinned
+  (`b: gpr === b;`), which also makes it clobbered. Assembler errors are
   reported at the block. `#asm` cannot run in `#run` code.
 * `CPU` (`CPU_Tag`: `.X64`, `.ARM32`, `.RISCV32`, `.ARM64`) and `OS`
   (`Operating_System_Tag`: `.LINUX`, `.NONE` on bare metal, ...) are
@@ -834,17 +856,20 @@ buffer: [#run compute_size()]u8;        // anywhere a constant is needed
   integers, floats, bools, strings, enums, `Type`s, fixed arrays and structs
   (nested, including polymorphic struct instances). Indexing a constant array
   with a runtime index reads a read-only table in the object file.
-  Results can also contain memory: array views, dynamic arrays, typed
-  pointers, `Any`s and procedure values (also a whole `Context`). The memory
+  Results can also contain memory: array views, dynamic arrays, pointers,
+  `Any`s and procedure values (also a whole `Context`). The memory
   they point to is baked into the program as writable globals (one per
-  object, so two pointers into it stay consistent): the items of a view or
+  object, so two pointers into it stay consistent, and pointers may form
+  cycles, as in a ring of nodes): the items of a view or
   dynamic array, the heap block a pointer points into (the whole
   allocation, so pointer arithmetic within it works) or else the one value,
   and the value of an `Any`. A baked dynamic array owns no memory
   (`allocated` is 0): `array_add` copies the items into new memory, and
   `array_free` / `array_reset` leave them alone. A union is baked as its
-  first member that covers all of it. Pointers to `void` and cycles of
-  pointers cannot be baked.
+  first member that covers all of it. A `*void` must point into memory the
+  `#run` code allocated: it shares the object when the result also reaches
+  that heap block through a typed pointer, else the block is baked as bytes
+  (and pointers stored in it are not followed).
 * `#run expr;` as a statement (at top level or in a procedure body) runs
   during compilation and produces no code. Top-level ones run in source order
   after the program's declarations are resolved.
@@ -995,7 +1020,12 @@ for e.names  print("% = %\n", it, e.values[it_index]);
   (`Type_Info_Struct_Member`: `name`, `type`, `offset_in_bytes`, `flags`,
   `notes`), `textual_flags` (`.UNION`, `.ALIGNED` when a member has
   `#align`), `initializer` (a procedure that sets a value to the struct's
-  defaults, null when those are all zeros) and `notes` for structs and
+  defaults, null when those are all zeros), `notes`, and for an instance of
+  a polymorphic struct `polymorph_source_struct` (a `Type_Info_Struct` with
+  the polymorphic struct's name and no members, the same for all its
+  instances), `specified_parameters` (members: each parameter's name, type,
+  `Type` for a type parameter, and its value's offset in
+  `constant_storage`) and `constant_storage` (the values), for structs and
   unions; notes are written `x: int @Min1 @Max10;` (members) and `S ::
   struct @Serializable { ... }` (structs), and listed without the `@`; the members include the struct's constants in
   declaration order, with flag `CONSTANT`, offset 0 and the constant's type

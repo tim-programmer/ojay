@@ -1,0 +1,10 @@
+empty: 0 []
+5 allocs 0 buffers 1
+length 4100 (4100 expected) allocs>0 true buffers>1 true
+text ok true
+reused: 0 new allocs, length 4000
+true contiguous true length 100
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+wrote 100 now 0
+freed all true left 0
+1,2,3,4,5,6,7,8,9,10,

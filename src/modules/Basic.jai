@@ -198,31 +198,121 @@ is_space :: (c: u8) -> bool {
 
 // ------------------------------------------------------------------ String_Builder
 
-// Text assembled piece by piece. The memory comes from context.allocator
-// when the builder first grows (it keeps that allocator).
+// Text assembled piece by piece, as in Jai: a chain of buffers. The first one
+// is inside the builder (`initial_bytes`), so short texts allocate nothing;
+// more come from the builder's allocator (context.allocator when it first
+// needs one), each `subsequent_buffer_size` bytes or as large as an append
+// needs. A builder works without init_string_builder (it starts empty), and
+// must not be copied once used (its first buffer points into it).
+#if OS == .NONE  STRING_BUILDER_BUFFER_SIZE :: 512;  // (small stacks)
+else             STRING_BUILDER_BUFFER_SIZE :: 4096;
+
 String_Builder :: struct {
-    buffer: [..] u8;
+    Buffer :: struct {
+        count: s64;       // bytes used
+        allocated: s64;   // bytes of data after this header
+        ocupied: s64;     // (as in Jai: the bytes of the whole buffer)
+        next: *Buffer;
+    }
+
+    allocator: Allocator;
+    subsequent_buffer_size: s64 = STRING_BUILDER_BUFFER_SIZE;
+    current_buffer: *Buffer;
+    failed: bool;  // an allocation failed (text was lost)
+    initial_bytes: [STRING_BUILDER_BUFFER_SIZE] u8 #align 8;
 }
 
-init_string_builder :: (builder: *String_Builder) {
-    builder.* = .{};
+// Starts (or restarts) the builder empty; buffer_size > 0 sets the size of the
+// buffers it allocates later.
+init_string_builder :: (builder: *String_Builder, buffer_size: s64 = -1) {
+    if buffer_size > 0  builder.subsequent_buffer_size = buffer_size;
+    if builder.subsequent_buffer_size <= 0  builder.subsequent_buffer_size = STRING_BUILDER_BUFFER_SIZE;
+    base := get_base_buffer(builder);
+    base.count = 0;
+    base.allocated = size_of(type_of(builder.initial_bytes)) - size_of(String_Builder.Buffer);
+    base.ocupied = size_of(type_of(builder.initial_bytes));
+    base.next = null;
+    builder.current_buffer = base;
+    builder.failed = false;
+}
+
+get_base_buffer :: (builder: *String_Builder) -> *String_Builder.Buffer {
+    return cast(*String_Builder.Buffer) builder.initial_bytes.data;
+}
+
+get_current_buffer :: (builder: *String_Builder) -> *String_Builder.Buffer {
+    if !builder.current_buffer  init_string_builder(builder);
+    return builder.current_buffer;
+}
+
+// The bytes a buffer holds (right after its header).
+get_buffer_data :: (buffer: *String_Builder.Buffer) -> *u8 {
+    return cast(*u8) (buffer + 1);
+}
+
+// Moves on to the next buffer (reusing one kept by reset, else allocating
+// one with room for at least `min_bytes`). Returns whether it worked.
+expand :: (builder: *String_Builder, min_bytes: s64 = 0) -> bool {
+    current := get_current_buffer(builder);
+    if current.next && current.next.allocated >= min_bytes {
+        builder.current_buffer = current.next;
+        builder.current_buffer.count = 0;
+        return true;
+    }
+    if !builder.allocator.proc  builder.allocator = context.allocator;
+    size := builder.subsequent_buffer_size;
+    if size < min_bytes  size = min_bytes;
+    buffer := cast(*String_Builder.Buffer) alloc(size_of(String_Builder.Buffer) + size, builder.allocator);
+    if !buffer {
+        builder.failed = true;
+        return false;
+    }
+    buffer.count = 0;
+    buffer.allocated = size;
+    buffer.ocupied = size_of(String_Builder.Buffer) + size;
+    buffer.next = current.next;  // (a smaller kept buffer stays in the chain, after it)
+    current.next = buffer;
+    builder.current_buffer = buffer;
+    return true;
+}
+
+// Makes sure the current buffer has `bytes` free bytes in a row.
+ensure_contiguous_space :: (builder: *String_Builder, bytes: s64) -> bool {
+    current := get_current_buffer(builder);
+    if current.allocated - current.count >= bytes  return true;
+    return expand(builder, bytes);
+}
+
+append :: (builder: *String_Builder, data: *u8, count: s64) {
+    current := get_current_buffer(builder);
+    done: s64 = 0;
+    while done < count {
+        free_bytes := current.allocated - current.count;
+        if free_bytes == 0 {
+            if !expand(builder, count - done)  return;
+            current = builder.current_buffer;
+            continue;
+        }
+        n := count - done;
+        if n > free_bytes  n = free_bytes;
+        memcpy(get_buffer_data(current) + current.count, data + done, n);
+        current.count += n;
+        done += n;
+    }
 }
 
 append :: (builder: *String_Builder, s: string) {
-    if !s.count  return;
-    need := builder.buffer.count + s.count;
-    if need > builder.buffer.allocated {
-        cap := builder.buffer.allocated * 2;
-        if cap < 64  cap = 64;
-        if cap < need  cap = need;
-        array_reserve(*builder.buffer, cap);
-    }
-    memcpy(builder.buffer.data + builder.buffer.count, s.data, s.count);
-    builder.buffer.count = need;
+    append(builder, s.data, s.count);
 }
 
 append :: (builder: *String_Builder, byte: u8) {
-    array_add(*builder.buffer, byte);
+    current := get_current_buffer(builder);
+    if current.count == current.allocated {
+        if !expand(builder)  return;
+        current = builder.current_buffer;
+    }
+    get_buffer_data(current)[current.count] = byte;
+    current.count += 1;
 }
 
 // Appends formatted text, as sprint formats it.
@@ -233,7 +323,15 @@ print_to_builder :: (builder: *String_Builder, format: string, args: .. Any) {
 }
 
 builder_string_length :: (builder: *String_Builder) -> s64 {
-    return builder.buffer.count;
+    if !builder.current_buffer  return 0;
+    n: s64 = 0;
+    buffer := get_base_buffer(builder);
+    while buffer {
+        n += buffer.count;
+        if buffer == builder.current_buffer  break;
+        buffer = buffer.next;
+    }
+    return n;
 }
 
 // The text so far, as a new string (allocated with `allocator`, else
@@ -241,13 +339,43 @@ builder_string_length :: (builder: *String_Builder) -> s64 {
 // caller. The builder is emptied (its memory is kept for reuse).
 builder_to_string :: (builder: *String_Builder, allocator: Allocator = .{}, extra_bytes_to_prepend := 0) -> string {
     a := ifx allocator.proc then allocator else context.allocator;
-    n := builder.buffer.count;
+    n := builder_string_length(builder);
     result: string;
     result.count = extra_bytes_to_prepend + n;
     if result.count  result.data = alloc(result.count, a);
-    if n  memcpy(result.data + extra_bytes_to_prepend, builder.buffer.data, n);
-    builder.buffer.count = 0;
+    if n {
+        at := result.data + extra_bytes_to_prepend;
+        buffer := get_base_buffer(builder);
+        while buffer {
+            if buffer.count  memcpy(at, get_buffer_data(buffer), buffer.count);
+            at += buffer.count;
+            if buffer == builder.current_buffer  break;
+            buffer = buffer.next;
+        }
+    }
+    reset(builder);
     return result;
+}
+
+// Writes the text to stdout (or stderr) and empties the builder unless told
+// not to. Returns how many bytes it wrote.
+write_builder :: (builder: *String_Builder, do_reset := true, to_standard_error := false) -> s64 {
+    if !builder.current_buffer  return 0;
+    n: s64 = 0;
+    buffer := get_base_buffer(builder);
+    while buffer {
+        if buffer.count {
+            s: string;
+            s.data = get_buffer_data(buffer);
+            s.count = buffer.count;
+            write_string(s, to_standard_error);
+            n += buffer.count;
+        }
+        if buffer == builder.current_buffer  break;
+        buffer = buffer.next;
+    }
+    if do_reset  reset(builder);
+    return n;
 }
 
 // The strings one after another with `separator` between them (and before the
@@ -275,14 +403,30 @@ join :: (inputs: .. string, separator := "", before_first := false, after_last :
     return result;
 }
 
-// Empties the builder, keeping its memory.
+// Empties the builder, keeping its memory (the buffers it allocated are
+// reused as it fills again).
 reset :: (builder: *String_Builder) {
-    builder.buffer.count = 0;
+    if !builder.current_buffer  return;
+    buffer := get_base_buffer(builder);
+    while buffer {
+        buffer.count = 0;
+        buffer = buffer.next;
+    }
+    builder.current_buffer = get_base_buffer(builder);
 }
 
-// Empties the builder and frees its memory.
+// Empties the builder and frees the buffers it allocated.
 free_buffers :: (builder: *String_Builder) {
-    array_reset(*builder.buffer);
+    if !builder.current_buffer  return;
+    buffer := get_base_buffer(builder).next;
+    while buffer {
+        next := buffer.next;
+        free(buffer, builder.allocator);
+        buffer = next;
+    }
+    get_base_buffer(builder).next = null;
+    get_base_buffer(builder).count = 0;
+    builder.current_buffer = get_base_buffer(builder);
 }
 
 // ------------------------------------------------------------------ logging

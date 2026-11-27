@@ -1,0 +1,5 @@
+Pair(float32, 3, "pair") source=Pair A:float32 N:3 NAME:"pair" (32 bytes)
+Pair(u8, 2, "named") source=Pair A:u8 N:2 NAME:"named" (32 bytes)
+Plain source=null (0 bytes)
+true
+Pair(s16, 4, "pair") source=Pair A:s16 N:4 NAME:"pair" (32 bytes)

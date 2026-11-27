@@ -705,14 +705,16 @@ class Checker : public InterpHost {
     const char* src = module == "Basic" ? kBasicSource : module == "Math" ? kMathSource : nullptr;
     if (!src) return;
     std::vector<Stmt*> stmts = parse_source_stmts(ast_, sm_, sm_.add("<" + module + ">", src), true);
+    // (Imported first: a top-level #if is decided while collecting, and may
+    // test the target constants, `#if OS == .NONE`.)
+    sc->imports.push_back(preload_);
+    sc->imports.push_back(core_);
     Scope* saved = scope_;
     scope_ = sc;
     lazy_collect_ = true;
     collect(stmts, true);
     lazy_collect_ = false;
     scope_ = saved;
-    sc->imports.push_back(preload_);
-    sc->imports.push_back(core_);
   }
 
   Symbol* preload_sym(const char* name) { return preload_->syms.at(name); }
@@ -3132,9 +3134,14 @@ class Checker : public InterpHost {
 
   // The procedures a #run result refers to get code.
   void want_const_procs(const ConstValue& v) {
+    std::unordered_set<const void*> seen;  // (baked objects can form cycles)
+    want_const_procs(v, seen);
+  }
+  void want_const_procs(const ConstValue& v, std::unordered_set<const void*>& seen) {
     if (v.kind == ConstValue::Proc) want_proc(v.proc);
+    if (v.kind == ConstValue::Pointer && v.elems && !seen.insert(v.elems.get()).second) return;
     if ((v.kind == ConstValue::Aggregate || v.kind == ConstValue::Pointer) && v.elems)
-      for (const ConstValue& e : *v.elems) want_const_procs(e);
+      for (const ConstValue& e : *v.elems) want_const_procs(e, seen);
   }
 
   // `#asm { ... }`: instructions separated by ';' or newlines (`//` comments
@@ -3157,7 +3164,13 @@ class Checker : public InterpHost {
         if (start && (std::isalpha((unsigned char)c) || c == '_')) {
           size_t e = k;
           while (e < a->text.size() && (std::isalnum((unsigned char)a->text[e]) || a->text[e] == '_')) ++e;
-          if (e < a->text.size() && a->text[e] == ':') labels.insert(a->text.substr(k, e - k));
+          if (e < a->text.size() && a->text[e] == ':' && a->text.compare(e, 3, "===") != 0) {
+            // (not `name: gpr` / `name: vec`, a register declaration)
+            size_t w = a->text.find_first_not_of(" \t", e + 1);
+            bool decl = w != std::string::npos && (a->text.compare(w, 3, "gpr") == 0 || a->text.compare(w, 3, "vec") == 0) &&
+                        (w + 3 >= a->text.size() || !(std::isalnum((unsigned char)a->text[w + 3]) || a->text[w + 3] == '_'));
+            if (!decl) labels.insert(a->text.substr(k, e - k));
+          }
           k = e - 1;
         }
         start = false;
@@ -3165,6 +3178,85 @@ class Checker : public InterpHost {
     }
     std::vector<std::string> out;
     std::unordered_map<Symbol*, size_t> index;
+    std::unordered_map<std::string, size_t> declared;  // registers declared in the block
+    std::unordered_set<std::string> literal;
+    // The operand for variable s (added on first use).
+    auto var_operand = [&](Symbol* s) {
+      auto it = index.find(s);
+      if (it == index.end()) {
+        it = index.emplace(s, a->operands.size()).first;
+        AsmStmt::Operand op;
+        op.var = s;
+        op.name = s->name;
+        a->operands.push_back(op);
+      }
+      return it->second;
+    };
+    // A variable usable as an operand.
+    auto check_operand_var = [&](Symbol* s, const std::string& word, SourceLoc wl) {
+      resolve(s);
+      Type* vt = const_cast<Type*>(s->type->underlying());
+      bool ok = vt->kind == TypeKind::Int || vt->kind == TypeKind::Enum || vt->is_pointer() ||
+                vt->kind == TypeKind::Float;
+      if (!ok)
+        fail(wl, "#asm: variable '", word, "' has type ", type_name(s->type),
+             "; only integers, enums, floats and pointers can be operands (use a pointer to the value)");
+      if (s->is_context) fail(wl, "#asm: 'context' cannot be an operand");
+    };
+    // `name: gpr;`, `name: vec;` (`=== reg` pins it) and `variable === reg;`:
+    // declarations, not instructions. Returns whether `line` is one.
+    auto declaration = [&](std::string line, SourceLoc dl) {
+      size_t cmt = line.find("//");
+      if (cmt != std::string::npos) line.resize(cmt);
+      std::vector<std::string> w;  // words and the tokens ':' and '==='
+      for (size_t k = 0; k < line.size();) {
+        char ch = line[k];
+        if (ch == ' ' || ch == '\t' || ch == '\r') { ++k; continue; }
+        if (std::isalnum((unsigned char)ch) || ch == '_') {
+          size_t e = k;
+          while (e < line.size() && (std::isalnum((unsigned char)line[e]) || line[e] == '_')) ++e;
+          w.push_back(line.substr(k, e - k));
+          k = e;
+        } else if (line.compare(k, 3, "===") == 0) {
+          w.push_back("===");
+          k += 3;
+        } else if (ch == ':') {
+          w.push_back(":");
+          ++k;
+        } else {
+          return false;
+        }
+      }
+      auto is_word = [](const std::string& x) { return !x.empty() && (std::isalpha((unsigned char)x[0]) || x[0] == '_'); };
+      if (w.size() >= 3 && is_word(w[0]) && w[1] == ":" && (w[2] == "gpr" || w[2] == "vec") &&
+          (w.size() == 3 || (w.size() == 5 && w[3] == "===" && is_word(w[4])))) {
+        if (declared.count(w[0])) fail(dl, "#asm: register '", w[0], "' is declared twice");
+        AsmStmt::Operand op;
+        op.name = w[0];
+        op.vec = w[2] == "vec";
+        if (w.size() == 5) op.pin = w[4];
+        declared[w[0]] = a->operands.size();
+        a->operands.push_back(op);
+        return true;
+      }
+      if (w.size() == 3 && is_word(w[0]) && w[1] == "===" && is_word(w[2])) {
+        auto d = declared.find(w[0]);
+        if (d != declared.end()) {
+          a->operands[d->second].pin = w[2];
+          return true;
+        }
+        Found f = find(w[0], dl);
+        if (!f.sym || f.sym->kind != SymKind::Var || f.via || f.enum_type)
+          fail(dl, "#asm: '", w[0], "' is not a variable or a register declared in the block, so it cannot be pinned");
+        check_operand_var(f.sym, w[0], dl);
+        size_t k = var_operand(f.sym);
+        if (!a->operands[k].pin.empty() && a->operands[k].pin != w[2])
+          fail(dl, "#asm: '", w[0], "' is pinned to two registers");
+        a->operands[k].pin = w[2];
+        return true;
+      }
+      return false;
+    };
     const std::string& t = a->text;
     SourceLoc loc = a->text_loc;
     size_t i = 0;
@@ -3205,6 +3297,15 @@ class Checker : public InterpHost {
         i = e + 1;
         continue;
       }
+      if (at_mnemonic && cur.find_first_not_of(" \t\r") == std::string::npos) {
+        size_t e = t.find_first_of(";\n", i);
+        if (e == std::string::npos) e = t.size();
+        if (declaration(t.substr(i, e - i), loc)) {
+          i = e;
+          cur.clear();
+          continue;
+        }
+      }
       if (std::isalpha((unsigned char)c) || c == '_') {
         size_t e = i;
         while (e < t.size() && (std::isalnum((unsigned char)t[e]) || t[e] == '_')) ++e;
@@ -3223,6 +3324,11 @@ class Checker : public InterpHost {
           i = e;
           continue;
         }
+        if (auto d = declared.find(word); d != declared.end()) {  // a register declared in the block
+          cur += "${" + std::to_string(d->second) + "}";
+          i = e;
+          continue;
+        }
         Found f = find(word, loc);
         Symbol* s = f.sym;
         if (f.via || f.enum_type)
@@ -3232,22 +3338,11 @@ class Checker : public InterpHost {
           if (s->cv.kind != ConstValue::Int) fail(loc, "#asm: constant '", word, "' is not an integer");
           cur += i128_str(s->cv.i);
         } else if (s && s->kind == SymKind::Var) {
-          resolve(s);
-          Type* vt = const_cast<Type*>(s->type->underlying());
-          bool ok = vt->kind == TypeKind::Int || vt->kind == TypeKind::Enum || vt->is_pointer() ||
-                    vt->kind == TypeKind::Float;
-          if (!ok)
-            fail(loc, "#asm: variable '", word, "' has type ", type_name(s->type),
-                 "; only integers, enums, floats and pointers can be operands (use a pointer to the value)");
-          if (s->is_context) fail(loc, "#asm: 'context' cannot be an operand");
-          auto it = index.find(s);
-          if (it == index.end()) {
-            it = index.emplace(s, a->operands.size()).first;
-            a->operands.push_back(s);
-          }
-          cur += "${" + std::to_string(it->second) + "}";
+          check_operand_var(s, word, loc);
+          cur += "${" + std::to_string(var_operand(s)) + "}";
         } else {
           cur += word;  // a register, CSR, label, ...
+          literal.insert(word);
         }
         i = e;
         continue;
@@ -3258,6 +3353,8 @@ class Checker : public InterpHost {
     }
     finish();
     if (out.empty()) fail(a->loc, "#asm block is empty");
+    a->literal_words.assign(literal.begin(), literal.end());
+    std::sort(a->literal_words.begin(), a->literal_words.end());
     a->asm_text.clear();
     for (size_t k = 0; k < out.size(); ++k) a->asm_text += (k ? "\n\t" : "") + out[k];
   }
@@ -5085,6 +5182,24 @@ class Checker : public InterpHost {
     Type* t = with_bindings(tmpl->scope, b, [&] { return define_struct(inst, name); });
     poly_structs_[key] = t;
     poly_struct_types_[t] = PolyStructInstance{tmpl, b};
+    t->poly_source = poly_source_type(tmpl);
+    for (const PolyBinding& x : b) {
+      if (x.runtime) continue;
+      if (x.is_value) t->poly_params.push_back({x.name, x.type, std::make_shared<const ConstValue>(x.value)});
+      else t->poly_params.push_back({x.name, T.type_t, std::make_shared<const ConstValue>(ConstValue::of_type(x.type))});
+    }
+    return t;
+  }
+
+  // The struct type that stands for polymorphic struct `tmpl` itself in type
+  // information (an instance's polymorph_source_struct): its name, no members.
+  std::unordered_map<Symbol*, Type*> poly_source_types_;
+  Type* poly_source_type(Symbol* tmpl) {
+    Type*& t = poly_source_types_[tmpl];
+    if (!t) {
+      t = T.new_struct(tmpl->name);
+      t->layout_state = Type::LayoutState::Done;
+    }
     return t;
   }
 

@@ -201,7 +201,9 @@ class Machine {
         eval_any(e);
       } else {
         Val v = eval(e);
+        baked_.clear();
         out = read_const(v.data(), conc(e->type), "", e->loc);
+        baked_.clear();
       }
     } catch (const FlowEscape&) {
       err(e->loc, "internal error: break, continue or return out of a #run expression");
@@ -220,7 +222,10 @@ class Machine {
   std::vector<uint8_t> typeinfo_;     // the Type_Info of Type values (at kTypeBase), as accessed
   std::vector<bool> typeinfo_done_;   // per kTypeStride block: filled in
   std::map<u64, int64_t> heap_blocks_;  // live allocations: address -> size
-  std::set<u64> baking_;                // read_const: the objects being baked (to find cycles)
+  // read_const: the objects of the result baked so far, by address and the
+  // type they are baked as. A pointer to one of them shares it (so pointers
+  // to the same object, and cycles of pointers, survive baking).
+  std::map<std::pair<u64, Type*>, std::shared_ptr<std::vector<ConstValue>>> baked_;
   std::unordered_map<const void*, u64> baked_objects_;  // put_const: where each Pointer constant's object is
   std::vector<Frame*> frames_;
   std::vector<Val> args_;  // arguments of the calls being made
@@ -589,6 +594,33 @@ class Machine {
         }
         if (!t->is_union)
           if (ProcLit* ip = in_.host.initializer_for(t)) put("initializer", ps_, in_.proc_id(ip));
+        if (t->poly_source) {  // an instance of a polymorphic struct: its source and parameters
+          put("polymorph_source_struct", ps_, in_.type_id(t->poly_source));
+          int64_t np = (int64_t)t->poly_params.size();
+          std::vector<int64_t> offs;
+          int64_t total = 0, max_align = 1;
+          for (auto& pp : t->poly_params) {
+            int64_t a = al(pp.type);
+            total = (total + a - 1) / a * a;
+            offs.push_back(total);
+            total += sz(pp.type);
+            max_align = std::max(max_align, a);
+          }
+          u64 storage = ti_array(total, 1, max_align, loc);
+          u64 params = ti_array(np, msz, mt->align, loc);
+          for (int64_t i = 0; i < np; ++i) {
+            const Type::PolyParam& pp = t->poly_params[(size_t)i];
+            if (sz(pp.type) > 0) put_const(at(storage + (u64)offs[(size_t)i], sz(pp.type), loc), *pp.value, pp.type, loc);
+            uint8_t* p = at(params + (u64)(i * msz), msz, loc);
+            int64_t no = ti_offset(mt, "name");
+            store_u(p + no, 8, pp.name.size());
+            store_u(p + no + 8, ps_, pp.name.empty() ? 0 : intern(pp.name, loc));
+            store_u(p + ti_offset(mt, "type"), ps_, in_.type_id(pp.type));
+            store_u(p + ti_offset(mt, "offset_in_bytes"), 8, (u64)offs[(size_t)i]);
+          }
+          put_view("specified_parameters", np, params);
+          put_view("constant_storage", total, storage);
+        }
         break;
       }
       case TypeKind::Proc: {
@@ -808,9 +840,7 @@ class Machine {
           if (!pl) err(loc, where(), " (of type ", type_name(t), ") is not a valid procedure value (", hex(v), ")");
           return ConstValue::procedure(pl);
         }
-        if (conc(t->elem)->kind == TypeKind::Void || sz(t->elem) <= 0)
-          err(loc, where(), " (of type ", type_name(t), ") is a pointer to data of unknown type; only typed pointers "
-              "can be baked into a #run result");
+        if (conc(t->elem)->kind == TypeKind::Void || sz(t->elem) <= 0) return bake_untyped_pointer(v, t, path, loc);
         return bake_pointer(v, conc(t->elem), path, loc);
       }
       case TypeKind::Array: {
@@ -830,10 +860,7 @@ class Machine {
         Type* elem = conc(t->elem);
         Type* storage = T.array_of(elem, ArrayKind::Fixed, n);
         in_.host.prepare_type(storage);
-        if (!baking_.insert(data).second) err(loc, where(), " is part of a cycle of pointers, which cannot be baked");
-        ConstValue items = read_const(at(data, n * sz(elem), loc), storage, path + ".data", loc);
-        baking_.erase(data);
-        std::vector<ConstValue> es{ConstValue::of_int(n), ConstValue::pointer(storage, std::move(items), 0)};
+        std::vector<ConstValue> es{ConstValue::of_int(n), bake_object(data, storage, 0, path + ".data", loc)};
         return ConstValue::aggregate(std::move(es));
       }
       case TypeKind::Struct: {
@@ -869,10 +896,7 @@ class Machine {
         } else {
           Type* storage = T.array_of(vt, ArrayKind::Fixed, 1);
           in_.host.prepare_type(storage);
-          if (!baking_.insert(v).second) err(loc, where(), " is part of a cycle of pointers, which cannot be baked");
-          ConstValue obj = read_const(at(v, sz(vt), loc), storage, path + ".value_pointer", loc);
-          baking_.erase(v);
-          es.push_back(ConstValue::pointer(storage, std::move(obj), 0));
+          es.push_back(bake_object(v, storage, 0, path + ".value_pointer", loc));
         }
         return ConstValue::aggregate(std::move(es));
       }
@@ -900,11 +924,56 @@ class Machine {
     }
     Type* storage = T.array_of(elem, ArrayKind::Fixed, n);
     in_.host.prepare_type(storage);
-    if (!baking_.insert(base).second)
-      err(loc, "the result's ", path.empty() ? "value" : path, " is part of a cycle of pointers, which cannot be baked");
-    ConstValue obj = read_const(at(base, n * es, loc), storage, path + ".*", loc);
-    baking_.erase(base);
-    return ConstValue::pointer(storage, std::move(obj), (int64_t)(v - base));
+    return bake_object(base, storage, (int64_t)(v - base), path + ".*", loc);
+  }
+
+  // The baked object at `base` (of type `storage`), shared with the other
+  // pointers of the result to it: a pointer constant `offset` bytes into it.
+  // Its holder is registered before its contents are read, so a pointer back
+  // to it (a cycle) refers to it too.
+  ConstValue bake_object(u64 base, Type* storage, int64_t offset, const std::string& path, SourceLoc loc) {
+    ConstValue c;
+    c.kind = ConstValue::Pointer;
+    c.t = storage;
+    c.i = offset;
+    auto key = std::make_pair(base, storage);
+    auto it = baked_.find(key);
+    if (it != baked_.end()) {
+      c.elems = it->second;
+      return c;
+    }
+    auto holder = std::make_shared<std::vector<ConstValue>>(1);
+    baked_[key] = holder;
+    (*holder)[0] = read_const(at(base, sz(storage), loc), storage, path, loc);
+    c.elems = holder;
+    return c;
+  }
+
+  // A *void (or a pointer to something of no size) in a #run result: it must
+  // point into a heap block. When the result also reaches that block through a
+  // typed pointer it shares that object; otherwise the block is baked as bytes
+  // (pointers stored in it are not followed, so they would be meaningless).
+  ConstValue bake_untyped_pointer(u64 v, Type* t, const std::string& path, SourceLoc loc) {
+    auto it = heap_blocks_.upper_bound(v);
+    if (it == heap_blocks_.begin() || v >= std::prev(it)->first + (u64)std::prev(it)->second)
+      err(loc, "the result's ", path.empty() ? "value" : path, " (of type ", type_name(t),
+          ") points to data of unknown type outside the heap; a #run "
+          "result can only hold such a pointer into memory it allocated");
+    --it;
+    u64 base = it->first;
+    for (auto& [key, holder] : baked_) {
+      if (key.first != base) continue;
+      ConstValue c;
+      c.kind = ConstValue::Pointer;
+      c.t = key.second;
+      c.i = (int64_t)(v - base);
+      c.elems = holder;
+      return c;
+    }
+    int64_t size = it->second > 0 ? it->second : 1;
+    Type* storage = T.array_of(T.u8, ArrayKind::Fixed, size);
+    in_.host.prepare_type(storage);
+    return bake_object(base, storage, (int64_t)(v - base), path + ".*", loc);
   }
 
   // ------------------------------------------------------------------ default values

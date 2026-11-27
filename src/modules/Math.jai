@@ -129,6 +129,17 @@ lerp :: (a: Vector4, b: Vector4, t: float32) -> Vector4 { return a + (b - a) * t
 // column vectors (`m * v`). `coef[row][column]` and `v[row]` (Matrix4: the
 // rows as Vector4s) view the same numbers.
 
+Matrix2 :: struct {
+    union {
+        struct {
+            _11, _12: float32;
+            _21, _22: float32;
+        }
+        coef: [2][2] float32;
+        floats: [4] float32;
+    }
+}
+
 Matrix3 :: struct {
     union {
         struct {
@@ -155,6 +166,11 @@ Matrix4 :: struct {
     }
 }
 
+matrix2_identity :: () -> Matrix2 {
+    m: Matrix2;
+    m._11 = 1; m._22 = 1;
+    return m;
+}
 matrix3_identity :: () -> Matrix3 {
     m: Matrix3;
     m._11 = 1; m._22 = 1; m._33 = 1;
@@ -166,9 +182,15 @@ matrix4_identity :: () -> Matrix4 {
     return m;
 }
 
+Matrix2_Identity :: #run matrix2_identity();
 Matrix3_Identity :: #run matrix3_identity();
 Matrix4_Identity :: #run matrix4_identity();
 
+operator * :: (a: Matrix2, b: Matrix2) -> Matrix2 {
+    r: Matrix2;
+    for i: 0..1  for j: 0..1  for k: 0..1  r.coef[i][j] += a.coef[i][k] * b.coef[k][j];
+    return r;
+}
 operator * :: (a: Matrix3, b: Matrix3) -> Matrix3 {
     r: Matrix3;
     for i: 0..2  for j: 0..2  for k: 0..2  r.coef[i][j] += a.coef[i][k] * b.coef[k][j];
@@ -179,17 +201,25 @@ operator * :: (a: Matrix4, b: Matrix4) -> Matrix4 {
     for i: 0..3  for j: 0..3  for k: 0..3  r.coef[i][j] += a.coef[i][k] * b.coef[k][j];
     return r;
 }
+operator * :: (m: Matrix2, v: Vector2) -> Vector2 { return multiply(m, v); }
 operator * :: (m: Matrix3, v: Vector3) -> Vector3 { return multiply(m, v); }
 operator * :: (m: Matrix4, v: Vector4) -> Vector4 { return multiply(m, v); }
+operator * :: (m: Matrix2, k: float32) -> Matrix2 #symmetric { r := m; for * r.floats  it.* *= k; return r; }
 operator * :: (m: Matrix3, k: float32) -> Matrix3 #symmetric { r := m; for * r.floats  it.* *= k; return r; }
 operator * :: (m: Matrix4, k: float32) -> Matrix4 #symmetric { r := m; for * r.floats  it.* *= k; return r; }
+operator + :: (a: Matrix2, b: Matrix2) -> Matrix2 { r := a; for 0..3  r.floats[it] += b.floats[it]; return r; }
 operator + :: (a: Matrix3, b: Matrix3) -> Matrix3 { r := a; for 0..8  r.floats[it] += b.floats[it]; return r; }
 operator + :: (a: Matrix4, b: Matrix4) -> Matrix4 { r := a; for 0..15  r.floats[it] += b.floats[it]; return r; }
+operator - :: (a: Matrix2, b: Matrix2) -> Matrix2 { r := a; for 0..3  r.floats[it] -= b.floats[it]; return r; }
 operator - :: (a: Matrix3, b: Matrix3) -> Matrix3 { r := a; for 0..8  r.floats[it] -= b.floats[it]; return r; }
 operator - :: (a: Matrix4, b: Matrix4) -> Matrix4 { r := a; for 0..15  r.floats[it] -= b.floats[it]; return r; }
+operator == :: (a: Matrix2, b: Matrix2) -> bool { for 0..3  if a.floats[it] != b.floats[it]  return false; return true; }
 operator == :: (a: Matrix3, b: Matrix3) -> bool { for 0..8  if a.floats[it] != b.floats[it]  return false; return true; }
 operator == :: (a: Matrix4, b: Matrix4) -> bool { for 0..15  if a.floats[it] != b.floats[it]  return false; return true; }
 
+multiply :: (m: Matrix2, v: Vector2) -> Vector2 {
+    return make_vector2(m._11 * v.x + m._12 * v.y, m._21 * v.x + m._22 * v.y);
+}
 multiply :: (m: Matrix3, v: Vector3) -> Vector3 {
     return make_vector3(m._11 * v.x + m._12 * v.y + m._13 * v.z,
                         m._21 * v.x + m._22 * v.y + m._23 * v.z,
@@ -210,6 +240,12 @@ transform_vector :: (m: Matrix4, d: Vector3) -> Vector3 {
     return make_vector3(r.x, r.y, r.z);
 }
 
+transpose :: (m: Matrix2) -> Matrix2 {
+    r := m;
+    r._12 = m._21;
+    r._21 = m._12;
+    return r;
+}
 transpose :: (m: Matrix3) -> Matrix3 {
     r: Matrix3 = ---;
     for i: 0..2  for j: 0..2  r.coef[i][j] = m.coef[j][i];
@@ -221,6 +257,7 @@ transpose :: (m: Matrix4) -> Matrix4 {
     return r;
 }
 
+determinant :: (m: Matrix2) -> float32 { return m._11 * m._22 - m._12 * m._21; }
 determinant :: (m: Matrix3) -> float32 {
     return m._11 * (m._22 * m._33 - m._23 * m._32)
          - m._12 * (m._21 * m._33 - m._23 * m._31)
@@ -232,6 +269,16 @@ determinant :: (m: Matrix4) -> float32 {
 }
 
 // The inverse, and false (and the identity) if m has none.
+inverse :: (m: Matrix2) -> Matrix2, bool {
+    d := determinant(m);
+    if d == 0  return Matrix2_Identity, false;
+    r: Matrix2 = ---;
+    r._11 = m._22 / d;
+    r._12 = -m._12 / d;
+    r._21 = -m._21 / d;
+    r._22 = m._11 / d;
+    return r, true;
+}
 inverse :: (m: Matrix3) -> Matrix3, bool {
     d := determinant(m);
     if d == 0  return Matrix3_Identity, false;
@@ -264,6 +311,20 @@ make_translation_matrix4 :: (t: Vector3) -> Matrix4 {
 make_scale_matrix4 :: (s: Vector3) -> Matrix4 {
     m := Matrix4_Identity;
     m._11 = s.x; m._22 = s.y; m._33 = s.z;
+    return m;
+}
+make_scale_matrix2 :: (s: Vector2) -> Matrix2 {
+    m := Matrix2_Identity;
+    m._11 = s.x; m._22 = s.y;
+    return m;
+}
+// A rotation by `angle` radians (counterclockwise: x towards y).
+make_rotation_matrix2 :: (angle: float32) -> Matrix2 {
+    c := cos(angle);
+    s := sin(angle);
+    m: Matrix2 = ---;
+    m._11 = c; m._12 = -s;
+    m._21 = s; m._22 = c;
     return m;
 }
 make_scale_matrix3 :: (s: Vector3) -> Matrix3 {

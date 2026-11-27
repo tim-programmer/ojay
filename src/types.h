@@ -17,6 +17,8 @@ class GlobalVariable;
 
 namespace ojay {
 
+struct ConstValue;
+
 struct Expr;
 struct Decl;
 
@@ -97,6 +99,17 @@ struct Type {
   bool has_place = false;    // some member follows a `#place`: members may overlap
   bool has_align = false;    // some member has `#align` (Struct_Textual_Flags.ALIGNED)
   std::vector<StructConstant> constants;
+  // An instance of a polymorphic struct: its template (a struct type of that
+  // name with no members: Type_Info_Struct.polymorph_source_struct) and the
+  // values of its parameters (specified_parameters; a type parameter's value
+  // is a Type).
+  struct PolyParam {
+    std::string name;
+    Type* type = nullptr;
+    std::shared_ptr<const ConstValue> value;  // (ConstValue is in ast.h)
+  };
+  Type* poly_source = nullptr;
+  std::vector<PolyParam> poly_params;
   enum class LayoutState { None, InProgress, Done } layout_state = LayoutState::None;
   Decl* struct_decl = nullptr;  // for diagnostics
 
