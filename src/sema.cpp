@@ -5,6 +5,7 @@
 #include "interp.h"
 #include "parser.h"
 
+#include <deque>
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
@@ -145,18 +146,36 @@ class Checker : public InterpHost {
     scope_ = global_;
 
     for (size_t i = 0; i < global_order_.size(); ++i) resolve(global_order_[i]);
-    // Top-level #assert and #run, in order.
-    for (auto& [stmt, sc] : top_directives_) {
+    // Top-level #assert and #run, in order (#run,stallable: once the rest is
+    // typechecked).
+    std::vector<std::pair<Stmt*, Scope*>> stallable;
+    for (size_t i = 0; i < top_directives_.size(); ++i) {
+      auto [stmt, sc] = top_directives_[i];
+      auto* d = static_cast<DirectiveExpr*>(static_cast<ExprStmt*>(stmt)->expr);
+      if (d->name == "run" && d->stallable) {
+        stallable.push_back({stmt, sc});
+        continue;
+      }
       scope_ = sc;
       check_directive_stmt(stmt);
     }
+    directives_done_ = top_directives_.size();
     scope_ = global_;
-    // Laying out a struct can register procedures (its constants), and
-    // checking a body can make structs: until neither has more to do.
-    for (size_t ns = 0, np = 0; ns < all_structs_.size() || np < pending_.size();) {
-      for (; ns < all_structs_.size(); ++ns) complete_type(all_structs_[ns], SourceLoc{});
-      for (; np < pending_.size(); ++np) check_proc_body(pending_[np]);
+    // A message loop runs before the procedure bodies are checked, so they
+    // can use what it adds (add_build_string); the bodies it calls are
+    // checked when they are called, the rest after it.
+    if (stallable.empty()) finish_checking();
+    for (auto& [stmt, sc] : stallable) {
+      scope_ = sc;
+      in_stallable_ = true;
+      message_state_ = MessageState{};
+      check_directive_stmt(stmt);
+      in_stallable_ = false;
+      intercepting_ = false;
+      scope_ = global_;
+      compile_build_strings();  // (added after the last message it read)
     }
+    finish_checking();
 
     // `main` is optional (an object may be a library); when present it becomes
     // the program entry point.
@@ -283,6 +302,7 @@ class Checker : public InterpHost {
   // its body needed while it was checked for compile-time execution only.
   void register_proc(ProcLit* p) {
     if (p->registered || p->is_macro) return;  // macros are expanded, never called
+    if (p->is_compiler) compiler_proc_used(p, use_loc_.file ? use_loc_ : p->loc);
     p->registered = true;
     prog_.procs.push_back(p);
     if (p->body) pending_.push_back(p);
@@ -316,6 +336,34 @@ class Checker : public InterpHost {
   ProcLit* allocate_aligned_proc() override { return prog_.allocate_aligned_proc; }
   const Program::TypeInfoTypes& type_info_types() override { return prog_.type_info; }
   ProcLit* initializer_for(Type* t) override { return type_has_default(t) ? initializer_proc(t) : nullptr; }
+  Type* code_node_type(const std::string& name) override {
+    auto it = code_node_types_.find(name);
+    if (it == code_node_types_.end())
+      throw CompileError(SourceLoc{}, cat("internal error: module Compiler has no type '", name, "'"));
+    return it->second;
+  }
+  void code_syntax(int64_t code, Expr** expr, Block** block, SourceLoc* loc) override {
+    const CodeEntry& ce = code_entry(ConstValue::code((i128)code));
+    *expr = ce.expr;
+    *block = ce.block;
+    *loc = ce.loc;
+  }
+  int64_t make_code(Expr* expr, Block* block, int64_t like) override {
+    CodeEntry ce;
+    ce.expr = expr;
+    ce.block = block;
+    if (like > 0 && (size_t)like <= codes_.size()) {
+      const CodeEntry& l = codes_[(size_t)like - 1];
+      ce.loc = l.loc;
+      ce.scope = l.scope;
+      ce.macro_id = l.macro_id;
+    } else {  // nodes all made by the program: the code means what it means where it is inserted
+      ce.loc = expr ? expr->loc : block->loc;
+    }
+    codes_.push_back(ce);
+    return (int64_t)codes_.size();
+  }
+  AstContext& ast_context() override { return ast_; }
 
  private:
 
@@ -438,9 +486,12 @@ class Checker : public InterpHost {
       fail(loc, "cannot use local variable '", name, "' of an enclosing procedure (Jai procedures do not capture)");
   }
 
-  Found find(const std::string& name, SourceLoc loc) {
+  Found find(const std::string& name, SourceLoc loc) { return find_from(scope_, name, loc); }
+  Found find_from(Scope* start, const std::string& name, SourceLoc loc) {
     Found f;
-    for (Scope* s = scope_; s; s = s->parent) {
+    Scope* also = nullptr;
+    for (Scope* s = start; s; s = s->parent) {
+      if (s->also && !also) also = s->also;
       auto it = s->syms.find(name);
       if (it != s->syms.end()) {
         check_capture(it->second, name, loc);
@@ -474,6 +525,7 @@ class Checker : public InterpHost {
         }
       }
     }
+    if (also) return find_from(also, name, loc);
     return f;
   }
 
@@ -542,8 +594,8 @@ class Checker : public InterpHost {
     if (name == "context")
       fail(loc, "the context (context.allocator, context.logger, ...) is not supported yet");
     if (name == "compiler_get_nodes" || name == "Code_Node" || name.rfind("Code_", 0) == 0 ||
-        name == "code_of" || name == "compiler_get_code")
-      fail(loc, "'", name, "': Code_Node introspection (compiler_get_nodes) is not supported yet");
+        name == "compiler_get_code" || name == "print_expression")
+      fail(loc, "undeclared identifier '", name, "' (did you forget #import \"Compiler\" (or \"Program_Print\")?)");
     if (name == "volatile_load" || name == "volatile_store") {
       fail(loc, "undeclared identifier '", name, "' (did you forget #import \"Hardware\"?)");
     }
@@ -735,6 +787,12 @@ class Checker : public InterpHost {
     lazy_collect_ = true;
     collect(stmts, true);
     lazy_collect_ = false;
+    // Module Compiler's way into the compiler (compile time only).
+    add_builtin(core_, "__ojay_code_to_nodes", Builtin::CodeToNodes);
+    add_builtin(core_, "__ojay_nodes_to_code", Builtin::NodesToCode);
+    add_builtin(core_, "__ojay_compiler_intercept", Builtin::CompilerIntercept);
+    add_builtin(core_, "__ojay_compiler_wait_for_message", Builtin::CompilerWaitForMessage);
+    add_builtin(core_, "__ojay_add_build_string", Builtin::AddBuildString);
     auto get = [&](const char* name) {
       Symbol* sym = core_->syms.at(name);
       resolve(sym);
@@ -1167,6 +1225,124 @@ class Checker : public InterpHost {
     return t;
   }
 
+  // Laying out a struct can register procedures (its constants), and
+  // checking a body can make structs: until neither has more to do.
+  size_t structs_done_ = 0, pending_done_ = 0;
+  void finish_checking() {
+    while (structs_done_ < all_structs_.size() || pending_done_ < pending_.size()) {
+      for (; structs_done_ < all_structs_.size(); ++structs_done_) complete_type(all_structs_[structs_done_], SourceLoc{});
+      for (; pending_done_ < pending_.size(); ++pending_done_) check_proc_body(pending_[pending_done_]);
+    }
+  }
+
+  // ------------------------------------------------------------------ the message loop (#run,stallable)
+
+  bool in_stallable_ = false;
+  bool intercepting_ = false;
+  size_t directives_done_ = 0;
+  struct MessageState {
+    bool started = false;
+    bool complete = false;
+    std::deque<CompilerMessage> queue;
+  } message_state_;
+  std::vector<std::pair<std::string, SourceLoc>> build_strings_;
+  int build_string_count_ = 0;
+
+  void compiler_intercept(bool on, SourceLoc loc) override {
+    if (on && !in_stallable_)
+      fail(loc, "compiler_begin_intercept: only a top-level #run,stallable can intercept the compilation");
+    intercepting_ = on;
+  }
+
+  // The top-level declarations of the main program from global_order_[from..].
+  std::vector<Symbol*> main_declarations(size_t from) {
+    std::vector<Symbol*> out;
+    for (size_t i = from; i < global_order_.size(); ++i) {
+      Symbol* s = global_order_[i];
+      bool in_main = false;  // (the program's scope, or one of its files' scopes)
+      for (Scope* sc = s->scope; sc && !in_main; sc = sc->parent) in_main = sc == global_;
+      if (!in_main) continue;
+      if (s->kind == SymKind::Builtin || s->kind == SymKind::Library || s->kind == SymKind::Module) continue;
+      out.push_back(s);
+    }
+    return out;
+  }
+
+  CompilerMessage compiler_next_message(SourceLoc loc) override {
+    if (!intercepting_)
+      fail(loc, "compiler_wait_for_message: call compiler_begin_intercept(get_current_workspace()) first (in a "
+           "top-level #run,stallable)");
+    MessageState& st = message_state_;
+    if (st.queue.empty()) {
+      auto typechecked = [&](std::vector<Symbol*> decls) {
+        CompilerMessage m;
+        m.kind = 4;  // TYPECHECKED
+        m.declarations = std::move(decls);
+        st.queue.push_back(std::move(m));
+        CompilerMessage p;
+        p.kind = 3;  // PHASE
+        p.phase = 1; // TYPECHECKED_ALL_WE_CAN
+        st.queue.push_back(p);
+      };
+      if (!st.started) {
+        st.started = true;
+        typechecked(main_declarations(0));
+      } else if (!build_strings_.empty()) {
+        size_t before = global_order_.size();
+        compile_build_strings();
+        typechecked(main_declarations(before));
+      } else {
+        CompilerMessage c;
+        c.kind = 5;  // COMPLETE
+        st.queue.push_back(c);
+        st.complete = true;
+      }
+    }
+    CompilerMessage m = st.queue.front();
+    if (!(st.complete && st.queue.size() == 1)) st.queue.pop_front();  // (COMPLETE stays)
+    return m;
+  }
+
+  void compiler_add_build_string(const std::string& text, SourceLoc loc) override {
+    if (!in_stallable_) fail(loc, "add_build_string: only a top-level #run,stallable can add code to the program");
+    if (message_state_.complete) fail(loc, "add_build_string: the compilation is complete (after .COMPLETE)");
+    build_strings_.push_back({text, loc});
+  }
+
+  // Compiles the build strings added so far as top-level code of the main
+  // program (its declarations are resolved and checked like the others).
+  void compile_build_strings() {
+    if (build_strings_.empty()) return;
+    std::vector<std::pair<std::string, SourceLoc>> strings = std::move(build_strings_);
+    build_strings_.clear();
+    ContextGuard guard(*this);
+    ComptimeMode mode(*this, false, nullptr, false);
+    std::vector<MacroCtx> saved_macros = std::move(macros_);
+    macros_.clear();
+    proc_ = nullptr;
+    loops_.clear();
+    for (auto& [text, at] : strings) {
+      uint32_t id = sm_.add(cat("<build string ", ++build_string_count_, " from ", sm_.describe(at), ">"), text, at);
+      std::vector<Stmt*> stmts = parse_source_stmts(ast_, sm_, id, true);
+      scope_ = global_;
+      size_t before = global_order_.size();
+      collect(stmts, false);
+      auto& tl = prog_.modules[0].top_level;
+      tl.insert(tl.end(), stmts.begin(), stmts.end());
+      for (size_t i = before; i < global_order_.size(); ++i) resolve(global_order_[i]);
+      for (; directives_done_ < top_directives_.size(); ++directives_done_) {
+        auto [stmt, sc] = top_directives_[directives_done_];
+        auto* d = static_cast<DirectiveExpr*>(static_cast<ExprStmt*>(stmt)->expr);
+        if (d->name == "run" && d->stallable) fail(d->loc, "#run,stallable cannot be added by add_build_string");
+        scope_ = sc;
+        check_directive_stmt(stmt);
+      }
+      scope_ = global_;
+      if (!in_stallable_) finish_checking();
+    }
+    macros_ = std::move(saved_macros);
+  }
+
   // ------------------------------------------------------------------ symbol resolution
 
   void resolve(Symbol* s) {
@@ -1591,7 +1767,7 @@ class Checker : public InterpHost {
       if (p->foreign_name.empty()) fail(p->loc, "anonymous #foreign procedures need an explicit symbol name");
     }
     p->signature_done = true;
-    if (for_codegen) want_proc(p);
+    if (for_codegen && !p->is_compiler) want_proc(p);  // (#compiler: never code in the program)
   }
 
   // The result types of short lambda `p` without `-> T`: the type of its
@@ -2696,12 +2872,47 @@ class Checker : public InterpHost {
   // ------------------------------------------------------------------ expressions
 
   // Checks an expression; the result may be untyped, a tuple, or void.
+  SourceLoc use_loc_;  // the latest identifier or call checked (#compiler errors point there)
+  std::unordered_map<std::string, Type*> code_node_types_;  // module Compiler's Code_* structs
+
+  // The Code_* and Message_* types, from the scope of the call (module Compiler).
+  void load_code_node_types(SourceLoc loc) {
+    if (!code_node_types_.empty()) return;
+    for (const char* tn : {"Code_Node", "Code_Literal", "Code_Ident", "Code_Unary_Operator", "Code_Binary_Operator",
+                           "Code_Argument", "Code_Procedure_Call", "Code_Cast", "Code_Array_Subscript",
+                           "Code_If_Expression", "Code_Block", "Code_Declaration", "Code_If", "Code_While", "Code_For",
+                           "Code_Return", "Code_Break_Continue", "Code_Defer", "Code_Note", "Code_Struct",
+                           "Code_Procedure_Header", "Message", "Message_Typechecked", "Message_Phase",
+                           "Message_Complete"}) {
+      Found f = find(tn, loc);
+      if (!f.sym || f.sym->kind != SymKind::Type) fail(loc, "internal error: module Compiler has no '", tn, "'");
+      resolve(f.sym);
+      complete_type(f.sym->cv.t, loc);
+      code_node_types_[tn] = f.sym->cv.t;
+    }
+  }
+
+  // `p` (#compiler) is used by code that goes into the program.
+  [[noreturn]] void compiler_proc_used(ProcLit* p, SourceLoc at) {
+    fail(at, "'", p->name.empty() ? std::string("procedure") : p->name, "' is a #compiler procedure: it only runs at "
+         "compile time (in #run, #insert or #modify code, or in another #compiler procedure), but this is code that "
+         "goes into the program\n    note: '", p->name, "' is declared at ", sm_.describe(p->loc));
+  }
   Type* check(Expr*& e, Type* hint) {
     // Checking is idempotent: an expression is checked once (e.g. call
     // arguments are checked before an overload is chosen).
     if (e->type) return e->type;
+    if (e->kind == NK::Ident || e->kind == NK::Call) use_loc_ = e->loc;
+    SourceLoc at = e->loc;
     Type* t = check_inner(e, hint);
     e->type = t;
+    if (!comptime_) {  // code for the program: no #compiler procedures
+      Expr* callee = e->kind == NK::Call ? static_cast<Call*>(e)->callee : e;
+      if (callee && callee->kind == NK::Ident) {
+        Symbol* s = static_cast<Ident*>(callee)->sym;
+        if (s && s->kind == SymKind::Proc && s->proc && s->proc->is_compiler) compiler_proc_used(s->proc, at);
+      }
+    }
     return t;
   }
 
@@ -5282,10 +5493,40 @@ class Checker : public InterpHost {
     f();
   }
 
+  // `#insert,scope(target)`: target must be a Code constant. (Source text, a
+  // string, is always checked at the #insert, so there it changes nothing.)
+  void check_insert_scope_target(Expr* target) {
+    if (!target) return;
+    Type* t = check_value(target, nullptr);
+    if (t->kind != TypeKind::Code || !target->is_const())
+      fail(target->loc, "#insert,scope(...) needs a Code constant (code whose scope to use), or nothing");
+  }
+
+  // Runs f where inserted Code `c` is checked: where it was written
+  // (in_code_context), or for `#insert,scope()` right at the #insert, or for
+  // `#insert,scope(target)` where Code `target` was written.
+  template <typename F>
+  void in_insert_scope(const CodeEntry& c, bool scope_given, Expr* target, F f) {
+    if (!scope_given) return in_code_context(c, f);
+    check_insert_scope_target(target);
+    if (!target) {  // here, with the names where the code was written behind the ones here
+      ContextGuard guard(*this);
+      scope_ = new_scope(scope_, proc_);
+      if (c.scope && c.scope->proc == proc_ && c.scope != scope_) scope_->also = c.scope;
+      f();
+      return;
+    }
+    CodeEntry where = code_entry(target->cv);
+    where.expr = c.expr;
+    where.block = c.block;
+    in_code_context(where, f);
+  }
+
   // `#insert x;` as a statement: the inserted statements are checked in the
   // current scope (an inserted declaration is visible after the #insert).
   void check_insert(Insert* ins) {
     ConstValue v = insert_operand(ins->operand);
+    if (ins->insert_scope) check_insert_scope_target(ins->scope_target);
     auto* blk = ast_.make<Block>(ins->loc);
     blk->scope = scope_;
     ins->result = blk;
@@ -5302,7 +5543,7 @@ class Checker : public InterpHost {
       if (ins->remove_code) insert_removes_.push_back({ins->remove_code, save(), in_run_operand_});
       auto fb = c.block ? for_bodies_.find(c.block) : for_bodies_.end();
       if (fb != for_bodies_.end()) body_insert_loops_.push_back({fb->second, loops_.empty() ? nullptr : loops_.back()});
-      in_code_context(c, [&] {
+      in_insert_scope(c, ins->insert_scope, ins->scope_target, [&] {
         for (Stmt* x : blk->stmts) check_stmt(x);
       });
       if (fb != for_bodies_.end()) body_insert_loops_.pop_back();
@@ -5315,6 +5556,7 @@ class Checker : public InterpHost {
   Type* check_insert_expr(Expr*& e, Type* hint) {
     auto* d = static_cast<DirectiveExpr*>(e);
     ConstValue v = insert_operand(d->operand);
+    if (d->insert_scope) check_insert_scope_target(d->scope_target);
     SourceLoc at = d->loc;
     return with_note(insert_note(at), [&] {
       Expr* x;
@@ -5328,7 +5570,7 @@ class Checker : public InterpHost {
       x = clone_expr(ast_, c.expr);
       e = x;
       Type* t = nullptr;
-      in_code_context(c, [&] { t = check(e, hint); });
+      in_insert_scope(c, d->insert_scope, d->scope_target, [&] { t = check(e, hint); });
       return t;
     });
   }
@@ -5610,7 +5852,50 @@ class Checker : public InterpHost {
 
   // ------------------------------------------------------------------ calls
 
+  // A `Code` parameter takes the expression written as code, as in Jai:
+  // `check(x > 0)` passes `#code x > 0` when check's parameter is a Code.
+  // (For a callee that is one procedure or macro, not an overload set; an
+  // argument that is already Code (#code, #run, a Code name) is left alone.)
+  void wrap_code_arguments(Call* c) {
+    if (c->callee->kind != NK::Ident || c->args.empty()) return;
+    auto* id = static_cast<Ident*>(c->callee);
+    if (id->backtick) return;
+    Found f = find(id->name, id->loc);
+    Symbol* s = f.sym;
+    if (!s || f.via || s->overloads.size() > 1 || !s->decl || !is_proc_decl(s->decl, s->decl_index)) return;
+    auto* p = static_cast<ProcLit*>(s->decl->values[s->decl_index]);
+    auto is_code_param = [&](Decl* pd) {
+      return pd->type_expr && pd->type_expr->kind == NK::Ident && static_cast<Ident*>(pd->type_expr)->name == "Code";
+    };
+    auto already_code = [&](Expr* a) {
+      if (a->kind == NK::CodeLit || a->kind == NK::Directive) return true;
+      if (a->kind == NK::Ident) {
+        Found g = find(static_cast<Ident*>(a)->name, a->loc);
+        if (g.sym && (g.sym->kind == SymKind::Const || g.sym->kind == SymKind::Var)) {
+          if (g.sym->state != Symbol::State::Resolved) return false;
+          return g.sym->type == T.code_t;
+        }
+      }
+      return false;
+    };
+    size_t pos = 0;
+    for (Arg& a : c->args) {
+      Decl* pd = nullptr;
+      if (!a.name.empty()) {
+        for (Decl* d : p->params)
+          if (!d->names.empty() && d->names[0].name == a.name) pd = d;
+      } else if (pos < p->params.size() && !p->params[pos]->is_vararg) {
+        pd = p->params[pos++];
+      }
+      if (!pd || !is_code_param(pd) || already_code(a.value)) continue;
+      auto* cl = ast_.make<CodeLit>(a.value->loc);
+      cl->code_expr = a.value;
+      a.value = cl;
+    }
+  }
+
   Type* check_call(Call* c, Type* hint) {
+    wrap_code_arguments(c);
     Symbol* qualified = nullptr;  // Module.proc(...)
     bool from_module = false;     // qualified by a module: only its exported overloads
     Symbol* qualified_set = nullptr;
@@ -6463,6 +6748,42 @@ class Checker : public InterpHost {
         auto& a = positional(c, 1, 1, "__ojay_raw_alloc");
         check_value(a[0], T.s64);
         return T.void_ptr;
+      }
+      case Builtin::CompilerIntercept: {
+        auto& a = positional(c, 1, 1, "__ojay_compiler_intercept");
+        if (!comptime_) fail(c->loc, "compiler_begin_intercept only runs at compile time");
+        check_value(a[0], T.bool_t);
+        return T.void_t;
+      }
+      case Builtin::CompilerWaitForMessage: {
+        positional(c, 0, 0, "__ojay_compiler_wait_for_message");
+        if (!comptime_) fail(c->loc, "compiler_wait_for_message only runs at compile time");
+        load_code_node_types(c->loc);
+        return T.void_ptr;
+      }
+      case Builtin::AddBuildString: {
+        auto& a = positional(c, 2, 2, "__ojay_add_build_string");
+        if (!comptime_) fail(c->loc, "add_build_string only runs at compile time");
+        check_value(a[0], T.string_t);
+        check_value(a[1], nullptr);
+        return T.void_t;
+      }
+      case Builtin::CodeToNodes:
+      case Builtin::NodesToCode: {
+        const char* name = c->builtin == Builtin::CodeToNodes ? "__ojay_code_to_nodes" : "__ojay_nodes_to_code";
+        auto& a = positional(c, 1, 1, name);
+        if (!comptime_)
+          fail(c->loc, "compiler_get_nodes / compiler_get_code only run at compile time (in #run, #insert or #modify "
+               "code, or in a #compiler procedure)");
+        load_code_node_types(c->loc);
+        if (c->builtin == Builtin::CodeToNodes) {
+          check_value(a[0], T.code_t);
+          if (a[0]->type->kind != TypeKind::Code) fail(a[0]->loc, "compiler_get_nodes needs a Code value");
+          return T.void_ptr;
+        }
+        check_value(a[0], T.void_ptr);
+        if (!a[0]->type->is_pointer()) fail(a[0]->loc, "compiler_get_code needs a *Code_Node");
+        return T.code_t;
       }
       case Builtin::RawFree: {
         auto& a = positional(c, 1, 1, "__ojay_raw_free");

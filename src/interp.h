@@ -38,6 +38,25 @@ class InterpHost {
   // The procedure that sets a t to its default value (initializer_of(t)), or
   // null when that is all zeros.
   virtual ProcLit* initializer_for(Type* t) = 0;
+  // Module Compiler (Code_Node): the struct type it declares named `name`
+  // (laid out), a Code value's syntax (an expression or a block, and where it
+  // was written), a new Code value made of syntax that means what Code `like`
+  // means where that was written, and the syntax trees' owner.
+  virtual Type* code_node_type(const std::string& name) = 0;
+  virtual void code_syntax(int64_t code, Expr** expr, Block** block, SourceLoc* loc) = 0;
+  virtual int64_t make_code(Expr* expr, Block* block, int64_t like) = 0;
+  virtual AstContext& ast_context() = 0;
+  // The message loop (`#run,stallable`): intercepting on or off, the next
+  // message (kind: Message.Kind; for TYPECHECKED the declarations, for PHASE
+  // the phase), and adding source text to the program.
+  struct CompilerMessage {
+    int kind = 0;
+    int phase = 0;
+    std::vector<Symbol*> declarations;
+  };
+  virtual void compiler_intercept(bool on, SourceLoc loc) = 0;
+  virtual CompilerMessage compiler_next_message(SourceLoc loc) = 0;
+  virtual void compiler_add_build_string(const std::string& text, SourceLoc loc) = 0;
 };
 
 class Interpreter {

@@ -332,15 +332,25 @@ class Parser {
     if (d == "run") {
       // `#run expr;`: executed during compilation for its side effects.
       advance();
-      reject_run_modifiers();
-      Expr* e = parse_expr();
-      expect(Tok::Semi, "after #run statement");
-      return ast_.make<ExprStmt>(loc, ast_.make<DirectiveExpr>(loc, "run", e));
+      bool stallable = parse_run_modifiers(top_level);
+      Expr* e;
+      if (at(Tok::LBrace)) {  // `#run { ... }`: `#run () { ... }();`
+        e = run_block();
+        accept(Tok::Semi);
+      } else {
+        e = parse_expr();
+        expect(Tok::Semi, "after #run statement");
+      }
+      auto* d = ast_.make<DirectiveExpr>(loc, "run", e);
+      d->stallable = stallable;
+      return ast_.make<ExprStmt>(loc, d);
     }
     if (d == "insert") {
       // `#insert expr;`: expr is a Code or string constant.
       advance();
-      reject_insert_modifiers();
+      bool scope_given = false;
+      Expr* scope_target = nullptr;
+      parse_insert_modifiers(&scope_given, &scope_target);
       // `#insert (remove = { ... }) body;` (for_expansion)
       Block* remove_code = nullptr;
       if (at(Tok::LParen) && (peek().kind == Tok::Ident || peek().kind == Tok::KwRemove) && peek(2).kind == Tok::Eq) {
@@ -366,6 +376,8 @@ class Parser {
       }
       auto* ins = ast_.make<Insert>(loc, e);
       ins->remove_code = remove_code;
+      ins->insert_scope = scope_given;
+      ins->scope_target = scope_target;
       return ins;
     }
     if (d == "add_context") {
@@ -385,16 +397,43 @@ class Parser {
     return parse_simple_stmt(top_level);
   }
 
-  // `#run,stallable` / `#run,host`: need the compiler message loop.
+  // `#run { statements }`: a call of a procedure with that body.
+  Expr* run_block() {
+    SourceLoc loc = cur().loc;
+    auto* p = ast_.make<ProcLit>(loc);
+    p->body = parse_block();
+    return ast_.make<Call>(loc, p);
+  }
+
+  // `#run,stallable` (a top-level statement): returns whether it was given.
+  bool parse_run_modifiers(bool top_level) {
+    if (!at(Tok::Comma)) return false;
+    if (!(peek().kind == Tok::Ident && peek().text == "stallable"))
+      fail(cur().loc, "#run,", peek().kind == Tok::Ident ? peek().text : "...", " is not supported (only #run,stallable)");
+    if (!top_level) fail(cur().loc, "#run,stallable is only allowed at top level");
+    advance();
+    advance();
+    return true;
+  }
   void reject_run_modifiers() {
     if (at(Tok::Comma))
       fail(cur().loc, "#run,", peek().kind == Tok::Ident ? peek().text : "...", " is not supported yet");
   }
 
-  // `#insert,scope(...)` / `#insert -> string { ... }`
+  // `#insert,scope(target)` / `#insert,scope()`: sets *given and *target.
+  void parse_insert_modifiers(bool* given, Expr** target) {
+    if (!at(Tok::Comma)) return;
+    if (!(peek().kind == Tok::Ident && peek().text == "scope"))
+      fail(cur().loc, "#insert,", peek().kind == Tok::Ident ? peek().text : "...", " is not supported (only #insert,scope(...))");
+    advance();
+    advance();
+    expect(Tok::LParen, "after #insert,scope");
+    *given = true;
+    if (!at(Tok::RParen)) *target = parse_expr();
+    expect(Tok::RParen, "after #insert,scope(...");
+  }
   void reject_insert_modifiers() {
-    if (at(Tok::Comma))
-      fail(cur().loc, "#insert,", peek().kind == Tok::Ident ? peek().text : "...", " is not supported yet");
+    if (at(Tok::Comma)) fail(cur().loc, "#insert,scope is not allowed here (only in statements and expressions)");
   }
 
   // The operand of `#code` that is not a block: an expression, or one bare
@@ -1040,6 +1079,7 @@ class Parser {
     }
     if (d == "run") {
       reject_run_modifiers();
+      if (at(Tok::LBrace)) return ast_.make<DirectiveExpr>(loc, "run", run_block());
       return ast_.make<DirectiveExpr>(loc, "run", parse_unary());
     }
     if (d == "code") {
@@ -1051,9 +1091,15 @@ class Parser {
       return c;
     }
     if (d == "insert") {
-      reject_insert_modifiers();
-      if (at(Tok::Arrow)) return ast_.make<DirectiveExpr>(loc, "insert", parse_insert_generator(loc));
-      return ast_.make<DirectiveExpr>(loc, "insert", parse_unary());
+      bool scope_given = false;
+      Expr* scope_target = nullptr;
+      parse_insert_modifiers(&scope_given, &scope_target);
+      DirectiveExpr* x;
+      if (at(Tok::Arrow)) x = ast_.make<DirectiveExpr>(loc, "insert", parse_insert_generator(loc));
+      else x = ast_.make<DirectiveExpr>(loc, "insert", parse_unary());
+      x->insert_scope = scope_given;
+      x->scope_target = scope_target;
+      return x;
     }
     if (d == "caller_location") return ast_.make<DirectiveExpr>(loc, d, nullptr);
     if (d == "procedure_name") {  // `#procedure_name()`: the name of the enclosing procedure
@@ -1077,7 +1123,7 @@ class Parser {
       if (x->kind != NK::Call) fail(x->loc, "#", d, " expects a call-like list of arguments: #", d, " f(name = value)");
       return ast_.make<DirectiveExpr>(loc, d, x);
     }
-    if (d == "procedure_of_call" || d == "compiler") {
+    if (d == "procedure_of_call") {
       fail(loc, "#", d, " is not supported yet");
     }
     if (d == "modify" || d == "expand") fail(loc, "#", d, " must follow a procedure's parameter list");
@@ -1240,6 +1286,7 @@ class Parser {
   ProcLit* parse_proc_lit() {
     // A short lambda's parameters may leave out their types: `(a, b) => a + b`.
     bool short_lambda = paren_followed_by(Tok::FatArrow);
+    size_t header = p_;
     auto* p = ast_.make<ProcLit>(expect(Tok::LParen).loc);
     int polys = poly_idents_;
     while (!at(Tok::RParen)) {
@@ -1285,7 +1332,9 @@ class Parser {
         if (p->modify) fail(loc, "a procedure can only have one #modify block");
         if (!at(Tok::LBrace)) fail(cur().loc, "expected '{' after #modify, found ", describe(cur()));
         p->modify = parse_block();
-      } else if (d == "compiler" || d == "elsewhere") {
+      } else if (d == "compiler") {
+        p->is_compiler = true;
+      } else if (d == "elsewhere") {
         fail(loc, "#", d, " procedures are not supported yet");
       } else if (!is_ignored_proc_directive(d)) {
         fail(loc, "unknown procedure directive '#", d, "'");
@@ -1298,6 +1347,7 @@ class Parser {
       p->short_expr = parse_expr();
       return p;
     }
+    p->notes = notes_since(header);  // `f :: () @note { ... }`
     if (!p->is_foreign) {
       if (!at(Tok::LBrace)) fail(cur().loc, "expected procedure body, found ", describe(cur()));
       p->body = parse_block();

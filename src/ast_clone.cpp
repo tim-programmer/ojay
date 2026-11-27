@@ -127,6 +127,9 @@ class Cloner {
       case NK::Directive: {
         auto* d = as<DirectiveExpr>(e);
         auto* n = ast_.make<DirectiveExpr>(e->loc, d->name, expr(d->operand));
+        n->insert_scope = d->insert_scope;
+        n->stallable = d->stallable;
+        n->scope_target = expr(d->scope_target);
         n->module_id = d->module_id;
         n->message = expr(d->message);
         return n;
@@ -214,6 +217,8 @@ class Cloner {
       case NK::Insert: {
         auto* n = ast_.make<Insert>(s->loc, expr(as<Insert>(s)->operand));
         if (as<Insert>(s)->remove_code) n->remove_code = static_cast<Block*>(stmt(as<Insert>(s)->remove_code));
+        n->insert_scope = as<Insert>(s)->insert_scope;
+        n->scope_target = expr(as<Insert>(s)->scope_target);
         return n;
       }
       case NK::Remove: return ast_.make<Remove>(s->loc, as<Remove>(s)->name);
@@ -315,6 +320,8 @@ class Cloner {
     n->must = p->must;
     n->deprecated = p->deprecated;
     n->deprecated_note = p->deprecated_note;
+    n->is_compiler = p->is_compiler;
+    n->notes = p->notes;
     n->modify = block(p->modify);
     n->name = p->name;
     return n;

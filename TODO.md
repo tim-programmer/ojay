@@ -7,9 +7,11 @@ What is implemented is documented in `README.md`; this file lists only what is n
 - [ ] Smaller directives and intrinsics: `#bytes`; `#asm` operands declared inline (Jai's
       `mov x:, 5`)
 - [ ] Metaprogramming: `#insert (...)` options other than `remove`
-- [ ] Compiler integration: `#compiler` procedures, the message loop (`#run,stallable`),
-      `Code_Node` introspection (`compiler_get_nodes`), `#insert,scope(...)`, `#procedure_of_call`
-- [ ] Runtime type info: notes on procedures and enums,
+- [ ] Compiler integration: `#procedure_of_call`, `#run,host`; typechecked `Code_Node`s (`type`,
+      `resolved_declaration`) and node types for the remaining syntax (struct and array literals,
+      switches, directives, ...); the message loop's other workspaces (`compiler_create_workspace`),
+      messages for imported modules (`.IMPORT`, `.FILE`) and for the phases after typechecking
+- [ ] Runtime type info: notes on enums,
       the enums nested inside the structs as in Jai, `Type_Info_Overload_Set` and
       `Type_Info_Polymorphic_Variable`
 - [ ] The other `Allocator_Mode`s (`STARTUP`, `CAPS`, ...)

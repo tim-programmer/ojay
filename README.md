@@ -579,6 +579,14 @@ Implemented:
       without one that is a deadlock, which stops the program. 64-bit
       atomics mask interrupts (these cores have no 64-bit exclusive access);
       `signal` may be called from an interrupt handler.
+  * Compiler (all Jai, `src/modules/Compiler.jai`; compile time only):
+    `Code_Node` and its node types, `compiler_get_nodes`, `compiler_get_code`,
+    `get_children`, and the message loop (`get_current_workspace`,
+    `compiler_begin_intercept`, `compiler_wait_for_message`,
+    `compiler_end_intercept`, `add_build_string`, `Message`,
+    `Message_Typechecked`, `Message_Phase`, `Message_Complete`); see
+    "Metaprogramming". Program_Print (`src/modules/Program_Print.jai`):
+    `print_expression`, `expression_to_string`, `operator_to_string`.
   Differences from Jai's modules: `array_reserve` and `String_Builder`
   memory come from the array's / builder's allocator (`context.allocator`
   when it first grows), and a `Log_Section` only has a `name`.
@@ -872,7 +880,15 @@ buffer: [#run compute_size()]u8;        // anywhere a constant is needed
   (and pointers stored in it are not followed).
 * `#run expr;` as a statement (at top level or in a procedure body) runs
   during compilation and produces no code. Top-level ones run in source order
-  after the program's declarations are resolved.
+  after the program's declarations are resolved. `#run { statements }` is
+  short for `#run () { statements }();`.
+* `#compiler` procedures (`build :: () #compiler { ... }`) only run at
+  compile time: in `#run`, `#insert` and `#modify` code and in other
+  `#compiler` procedures. Program code that uses one is an error at the use.
+  ojay compiles every global procedure it resolves, so a procedure that calls
+  a `#compiler` procedure must be `#compiler` itself (as Jai code usually
+  is). The procedures of modules `Compiler` and `Program_Print` are all
+  `#compiler`.
 * The evaluated code can use locals, all statements (`if`, `while`, `for`,
   switches, `defer`, `break`/`continue`), calls (recursion, overloads,
   polymorphic procedures, operators, procedure values), pointers into its own
@@ -1182,6 +1198,54 @@ add :: (a: $T, b: T) -> T #modify { if T == s16  T = s64; return true; } { retur
   moved element is visited next. Such a loop reads the array's count and
   data again on every iteration.
 * `#if` takes a constant bool, number or enum (`#if flags & .REVERSE`).
+* A `Code` parameter takes the expression written as code: `check(x > 0)`
+  passes `#code x > 0` when `check :: (c: Code) #expand`. (When the callee is
+  one procedure or macro rather than an overload set.)
+* `#insert,scope() code` checks the code at the `#insert` (a macro's locals
+  are visible to it) with the names where it was written behind those;
+  `#insert,scope(target) code` checks it where Code constant `target` was
+  written (`here :: #code 0;` in a macro: the macro's scope).
+* Code as data (`#import "Compiler"`): `compiler_get_nodes(code)` returns
+  the root `*Code_Node` and all the nodes (each before the nodes inside it);
+  `compiler_get_code(root)` makes a `Code` value of a node tree (changed, or
+  built with `New(Code_Ident)` etc. with their `kind` set), which `#insert`
+  takes. The nodes are Jai's: `Code_Literal` (`value_type`, `_s64`,
+  `_float64`, `_string`), `Code_Ident` (`name`), `Code_Unary_Operator` /
+  `Code_Binary_Operator` (`operator_type`: the character for one-character
+  operators, else `Operator_Type`; member access is `.` and assignments
+  `=`, `+=` ... are binary operators), `Code_Procedure_Call`
+  (`procedure_expression`, `arguments_unsorted`: `Code_Argument`s),
+  `Code_Cast`, `Code_Array_Subscript`, `Code_If_Expression`, `Code_Block`
+  (`statements`), `Code_Declaration` (`name`, `type_inst`, `expression`,
+  `flags`), `Code_If`, `Code_While`, `Code_For`, `Code_Return`,
+  `Code_Break_Continue`, `Code_Defer`; other syntax (struct literals,
+  switches, directives, ...) is a `Code_Node` of kind `.OTHER`, which
+  `compiler_get_code` gives back unchanged. `get_children(node)` lists a
+  node's children. `#import "Program_Print"`: `print_expression(builder,
+  node)` and `expression_to_string(node)` turn nodes back into source text
+  (with only the parentheses needed), as in the classic assert that prints
+  its condition. Differences from Jai: a `Code` value is not typechecked
+  before it is inserted, so the nodes' `type` is null and identifiers are not
+  resolved.
+* The message loop: a top-level `#run,stallable` (`#run,stallable { ... }`)
+  runs once the program's declarations are resolved, before procedure bodies
+  are checked. With `compiler_begin_intercept(get_current_workspace())` it
+  gets messages from `compiler_wait_for_message()`: `.TYPECHECKED`
+  (`Message_Typechecked.declarations`, `Typechecked(Code_Declaration)`s: the
+  main program's top-level declarations, with `type`, `notes` (procedure
+  notes, `test :: () @test { }`, and struct notes) and as `expression` a
+  `Code_Procedure_Header` (`name`, `procedure_flags`), a `Code_Struct`
+  (`defined_type: *Type_Info_Struct`) or the value), `.PHASE`
+  (`Message_Phase.phase` `TYPECHECKED_ALL_WE_CAN`, after each such batch)
+  and `.COMPLETE` (repeated if asked again). `add_build_string(source)` adds
+  top-level code to the program; it is compiled before the next message and
+  reported in the next `.TYPECHECKED`, so procedure bodies can use what a
+  metaprogram generates (a test runner for the `@test` procedures, a
+  serializer per `@serialize` struct). Differences from Jai: ojay compiles one
+  workspace into one object, so there is only the current workspace (no
+  `compiler_create_workspace`), the declarations of imported modules are not
+  reported, and there are no messages for the phases after typechecking
+  (code is generated after the loop ends). `#run,host` is not supported.
 * Differences from Jai: `assert` is a built-in rather than a macro, and
   takes no format arguments; the embedded modules report names rather than
   paths. A string inserted inside a macro

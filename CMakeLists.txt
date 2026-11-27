@@ -30,12 +30,15 @@ file(READ ${CMAKE_SOURCE_DIR}/src/modules/Random.jai OJAY_RANDOM)
 file(READ ${CMAKE_SOURCE_DIR}/src/modules/File.jai OJAY_FILE)
 file(READ ${CMAKE_SOURCE_DIR}/src/modules/Thread.jai OJAY_THREAD)
 file(READ ${CMAKE_SOURCE_DIR}/src/modules/Console.jai OJAY_CONSOLE)
+file(READ ${CMAKE_SOURCE_DIR}/src/modules/Compiler.jai OJAY_COMPILER)
+file(READ ${CMAKE_SOURCE_DIR}/src/modules/Program_Print.jai OJAY_PROGRAM_PRINT)
 configure_file(src/modules.cpp.in ${CMAKE_BINARY_DIR}/generated/modules.cpp @ONLY)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
   ${CMAKE_SOURCE_DIR}/src/modules/Basic.jai ${CMAKE_SOURCE_DIR}/src/modules/Math.jai
   ${CMAKE_SOURCE_DIR}/src/modules/Hash_Table.jai ${CMAKE_SOURCE_DIR}/src/modules/String.jai
   ${CMAKE_SOURCE_DIR}/src/modules/Random.jai ${CMAKE_SOURCE_DIR}/src/modules/File.jai
   ${CMAKE_SOURCE_DIR}/src/modules/Thread.jai ${CMAKE_SOURCE_DIR}/src/modules/Console.jai
+  ${CMAKE_SOURCE_DIR}/src/modules/Compiler.jai ${CMAKE_SOURCE_DIR}/src/modules/Program_Print.jai
   ${CMAKE_SOURCE_DIR}/src/core.jai)
 
 add_library(ojay_core STATIC

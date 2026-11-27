@@ -44,6 +44,8 @@ extern const char* const kRandomSource;
 extern const char* const kFileSource;
 extern const char* const kThreadSource;
 extern const char* const kConsoleSource;
+extern const char* const kCompilerSource;
+extern const char* const kProgramPrintSource;
 
 namespace {
 
@@ -55,6 +57,8 @@ const char* embedded_module_source(const std::string& name) {
   if (name == "File") return kFileSource;
   if (name == "Thread") return kThreadSource;
   if (name == "Console") return kConsoleSource;
+  if (name == "Compiler") return kCompilerSource;
+  if (name == "Program_Print") return kProgramPrintSource;
   return nullptr;
 }
 
@@ -228,9 +232,9 @@ class Loader {
       tl.insert(tl.end(), stmts.begin(), stmts.end());
       return unit;
     }
-    if (name == "Compiler" || name == "POSIX") {
+    if (name == "POSIX") {
       fail(loc, "module \"", name, "\" is not available yet (built-in modules: Basic, Math, Hash_Table, String, "
-           "Random, File, Thread, Console, Hardware)");
+           "Random, File, Thread, Console, Compiler, Program_Print, Hardware)");
     }
     fail(loc, "module \"", name, "\" not found (searched ", dirs.size(), " director",
          dirs.size() == 1 ? "y" : "ies", "; use -I to add more)");

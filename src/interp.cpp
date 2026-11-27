@@ -151,6 +151,9 @@ struct Interpreter::Impl {
   std::vector<ProcLit*> procs;
   std::unordered_map<ProcLit*, u64> proc_ids;
   std::unordered_map<ProcLit*, int> slot_counts;  // locals numbered so far, per procedure
+  // Code_Node.ojay_syntax (index + 1): the syntax a node was made from, and
+  // the Code value it is part of.
+  std::vector<std::pair<Node*, int64_t>> syntax;
 
   Impl(TypeTable& t, const SourceManager& s, InterpHost& h) : T(t), sm(s), host(h) {}
 
@@ -974,6 +977,741 @@ class Machine {
     Type* storage = T.array_of(T.u8, ArrayKind::Fixed, size);
     in_.host.prepare_type(storage);
     return bake_object(base, storage, (int64_t)(v - base), path + ".*", loc);
+  }
+
+  // ------------------------------------------------------------------ Code_Node (module Compiler)
+  //
+  // compiler_get_nodes: the syntax of a Code value as Code_* structs in this
+  // machine's heap; compiler_get_code: such structs back to syntax. Each node
+  // records the syntax it was made from (ojay_syntax), so kinds without a
+  // node type of their own (.OTHER) go back unchanged.
+
+  enum NodeKind : u64 {
+    NK_OTHER = 0, NK_LITERAL, NK_IDENT, NK_UNARY, NK_BINARY, NK_CALL, NK_CAST, NK_BLOCK, NK_DECLARATION, NK_IF,
+    NK_WHILE, NK_FOR, NK_RETURN, NK_SUBSCRIPT, NK_IFX, NK_BREAK, NK_CONTINUE, NK_DEFER,
+  };
+  static constexpr u64 OP_DEREF = 0x120;
+
+  Type* node_type(const char* name) { return in_.host.code_node_type(name); }
+
+  // The offset of member `name` of struct t (through `using` / `#as using`
+  // members and anonymous structs and unions).
+  bool find_field(Type* t, const std::string& name, int64_t* off) {
+    for (const StructField& f : t->fields) {
+      if (f.name == name) { *off = f.offset; return true; }
+      if ((f.is_using || f.anonymous) && conc(f.type)->kind == TypeKind::Struct) {
+        int64_t sub;
+        if (find_field(conc(f.type), name, &sub)) { *off = f.offset + sub; return true; }
+      }
+    }
+    return false;
+  }
+  int64_t field(Type* t, const char* name) {
+    int64_t off;
+    if (!find_field(t, name, &off))
+      throw CompileError(SourceLoc{}, cat("internal error: ", t->name, " has no member '", name, "'"));
+    return off;
+  }
+  void put_u(u64 a, Type* t, const char* f, int64_t size, u64 v, SourceLoc loc) {
+    store_u(at(a + (u64)field(t, f), size, loc), size, v);
+  }
+  u64 get_u(u64 a, Type* t, const char* f, int64_t size, SourceLoc loc) {
+    return load_u(at(a + (u64)field(t, f), size, loc), size);
+  }
+  void put_str(u64 a, Type* t, const char* f, const std::string& s, SourceLoc loc) {
+    u64 p = a + (u64)field(t, f);
+    store_u(at(p, 8, loc), 8, s.size());
+    store_u(at(p + 8, ps_, loc), ps_, s.empty() ? 0 : intern(s, loc));
+  }
+  std::string get_str(u64 a, Type* t, const char* f, SourceLoc loc) {
+    u64 p = a + (u64)field(t, f);
+    i64 n = (i64)load_u(at(p, 8, loc), 8);
+    u64 d = load_u(at(p + 8, ps_, loc), ps_);
+    if (n <= 0 || !d) return "";
+    return std::string((const char*)at(d, n, loc), (size_t)n);
+  }
+  // A view member: (count, data) of `n` pointers to the nodes given.
+  void put_node_view(u64 a, Type* t, const char* f, const std::vector<u64>& nodes, SourceLoc loc) {
+    u64 data = 0;
+    if (!nodes.empty()) {
+      data = heap_alloc((i64)nodes.size() * ps_, loc, ps_);
+      for (size_t i = 0; i < nodes.size(); ++i) store_u(at(data + i * ps_, ps_, loc), ps_, nodes[i]);
+    }
+    u64 p = a + (u64)field(t, f);
+    store_u(at(p, 8, loc), 8, nodes.size());
+    store_u(at(p + 8, ps_, loc), ps_, data);
+  }
+
+  u64 new_node(const char* type_name_, u64 kind, const Node* src, int64_t code, SourceLoc loc) {
+    Type* t = node_type(type_name_);
+    u64 a = heap_alloc(sz(t), loc, al(t));
+    std::memset(at(a, sz(t), loc), 0, (size_t)sz(t));
+    Type* base = node_type("Code_Node");
+    put_u(a, base, "kind", sz(conc(field_type(base, "kind"))), kind, loc);
+    SourceLoc sl = src ? src->loc : loc;
+    put_u(a, base, "l0", 4, sl.line, loc);
+    put_u(a, base, "c0", 4, sl.col, loc);
+    put_u(a, base, "l1", 4, sl.line, loc);
+    put_u(a, base, "c1", 4, sl.col, loc);
+    if (src) {
+      in_.syntax.push_back({const_cast<Node*>(src), code});
+      put_u(a, base, "ojay_syntax", 8, in_.syntax.size(), loc);
+    }
+    return a;
+  }
+  Type* field_type(Type* t, const char* name) {
+    for (const StructField& f : t->fields)
+      if (f.name == name) return f.type;
+    throw CompileError(SourceLoc{}, cat("internal error: ", t->name, " has no member '", name, "'"));
+  }
+
+  static u64 binop_code(BinOp op) {
+    switch (op) {
+      case BinOp::Add: return '+'; case BinOp::Sub: return '-'; case BinOp::Mul: return '*';
+      case BinOp::Div: return '/'; case BinOp::Mod: return '%'; case BinOp::BitAnd: return '&';
+      case BinOp::BitOr: return '|'; case BinOp::BitXor: return '^'; case BinOp::Lt: return '<';
+      case BinOp::Gt: return '>'; case BinOp::Eq: return 0x100; case BinOp::Ne: return 0x101;
+      case BinOp::Le: return 0x102; case BinOp::Ge: return 0x103; case BinOp::LogAnd: return 0x104;
+      case BinOp::LogOr: return 0x105; case BinOp::Shl: return 0x106; case BinOp::Shr: return 0x107;
+    }
+    return 0;
+  }
+  static bool code_binop(u64 c, BinOp* op) {
+    static const std::pair<u64, BinOp> table[] = {
+        {'+', BinOp::Add}, {'-', BinOp::Sub}, {'*', BinOp::Mul}, {'/', BinOp::Div}, {'%', BinOp::Mod},
+        {'&', BinOp::BitAnd}, {'|', BinOp::BitOr}, {'^', BinOp::BitXor}, {'<', BinOp::Lt}, {'>', BinOp::Gt},
+        {0x100, BinOp::Eq}, {0x101, BinOp::Ne}, {0x102, BinOp::Le}, {0x103, BinOp::Ge}, {0x104, BinOp::LogAnd},
+        {0x105, BinOp::LogOr}, {0x106, BinOp::Shl}, {0x107, BinOp::Shr}};
+    for (auto& [k, v] : table)
+      if (k == c) { *op = v; return true; }
+    return false;
+  }
+  static const std::pair<u64, Tok>* assign_table(size_t* n) {
+    static const std::pair<u64, Tok> table[] = {
+        {'=', Tok::Eq}, {0x110, Tok::PlusEq}, {0x111, Tok::MinusEq}, {0x112, Tok::StarEq}, {0x113, Tok::SlashEq},
+        {0x114, Tok::PercentEq}, {0x115, Tok::AmpEq}, {0x116, Tok::PipeEq}, {0x117, Tok::CaretEq},
+        {0x118, Tok::ShlEq}, {0x119, Tok::ShrEq}};
+    *n = sizeof table / sizeof table[0];
+    return table;
+  }
+
+  u64 ident_node(const std::string& name, const Node* src, int64_t code, SourceLoc loc) {
+    u64 a = new_node("Code_Ident", NK_IDENT, src, code, loc);
+    put_str(a, node_type("Code_Ident"), "name", name, loc);
+    return a;
+  }
+
+  u64 expr_nodes(const Expr* e, int64_t code, SourceLoc loc) {
+    if (!e) return 0;
+    switch (e->kind) {
+      case NK::IntLit: case NK::FloatLit: case NK::StringLit: case NK::BoolLit: case NK::NullLit: {
+        u64 a = new_node("Code_Literal", NK_LITERAL, e, code, loc);
+        Type* t = node_type("Code_Literal");
+        u64 tag = 0;
+        switch (e->kind) {
+          case NK::IntLit: tag = 0; put_u(a, t, "_u64", 8, (u64) static_cast<const IntLit*>(e)->value, loc); break;
+          case NK::FloatLit: {
+            tag = 1;
+            double d = static_cast<const FloatLit*>(e)->value;
+            u64 bits;
+            std::memcpy(&bits, &d, 8);
+            put_u(a, t, "_u64", 8, bits, loc);
+            break;
+          }
+          case NK::BoolLit: tag = 2; put_u(a, t, "_u64", 8, static_cast<const BoolLit*>(e)->value ? 1 : 0, loc); break;
+          case NK::StringLit: tag = 3; put_str(a, t, "_string", static_cast<const StringLit*>(e)->value, loc); break;
+          default: tag = 4; break;  // null
+        }
+        put_u(a, t, "value_type", 4, tag, loc);
+        return a;
+      }
+      case NK::Ident: {
+        auto* id = static_cast<const Ident*>(e);
+        if (id->backtick || id->poly || id->constraint) break;
+        return ident_node(id->name, e, code, loc);
+      }
+      case NK::Unary: {
+        auto* u = static_cast<const Unary*>(e);
+        u64 op = 0;
+        switch (u->op) {
+          case UnOp::Neg: op = '-'; break; case UnOp::Plus: op = '+'; break; case UnOp::Not: op = '!'; break;
+          case UnOp::BitNot: op = '~'; break; case UnOp::AddrOf: op = '*'; break; case UnOp::Deref: op = OP_DEREF; break;
+        }
+        u64 a = new_node("Code_Unary_Operator", NK_UNARY, e, code, loc);
+        Type* t = node_type("Code_Unary_Operator");
+        put_u(a, t, "operator_type", 4, op, loc);
+        put_u(a, t, "subexpression", ps_, expr_nodes(u->operand, code, loc), loc);
+        return a;
+      }
+      case NK::Binary: {
+        auto* b = static_cast<const Binary*>(e);
+        u64 a = new_node("Code_Binary_Operator", NK_BINARY, e, code, loc);
+        Type* t = node_type("Code_Binary_Operator");
+        put_u(a, t, "operator_type", 4, binop_code(b->op), loc);
+        put_u(a, t, "left", ps_, expr_nodes(b->lhs, code, loc), loc);
+        put_u(a, t, "right", ps_, expr_nodes(b->rhs, code, loc), loc);
+        return a;
+      }
+      case NK::Member: {
+        auto* m = static_cast<const Member*>(e);
+        u64 a = new_node("Code_Binary_Operator", NK_BINARY, e, code, loc);
+        Type* t = node_type("Code_Binary_Operator");
+        put_u(a, t, "operator_type", 4, '.', loc);
+        put_u(a, t, "left", ps_, expr_nodes(m->base, code, loc), loc);
+        put_u(a, t, "right", ps_, ident_node(m->name, nullptr, code, m->loc), loc);
+        return a;
+      }
+      case NK::Call: {
+        auto* c = static_cast<const Call*>(e);
+        bool plain = true;
+        for (const Arg& x : c->args) plain = plain && !x.spread;
+        if (!plain) break;
+        u64 a = new_node("Code_Procedure_Call", NK_CALL, e, code, loc);
+        Type* t = node_type("Code_Procedure_Call");
+        Type* argt = node_type("Code_Argument");
+        put_u(a, t, "procedure_expression", ps_, expr_nodes(c->callee, code, loc), loc);
+        std::vector<u64> exprs;
+        u64 args = c->args.empty() ? 0 : heap_alloc((i64)c->args.size() * sz(argt), loc, al(argt));
+        for (size_t i = 0; i < c->args.size(); ++i) {
+          u64 ap = args + i * (u64)sz(argt);
+          std::memset(at(ap, sz(argt), loc), 0, (size_t)sz(argt));
+          u64 x = expr_nodes(c->args[i].value, code, loc);
+          exprs.push_back(x);
+          put_u(ap, argt, "expression", ps_, x, loc);
+          if (!c->args[i].name.empty())
+            put_u(ap, argt, "name", ps_, ident_node(c->args[i].name, nullptr, code, c->args[i].name_loc), loc);
+        }
+        u64 p = a + (u64)field(t, "arguments_unsorted");
+        store_u(at(p, 8, loc), 8, c->args.size());
+        store_u(at(p + 8, ps_, loc), ps_, args);
+        put_node_view(a, t, "arguments_sorted", exprs, loc);
+        return a;
+      }
+      case NK::Cast: case NK::AutoCast: {
+        u64 a = new_node("Code_Cast", NK_CAST, e, code, loc);
+        Type* t = node_type("Code_Cast");
+        if (e->kind == NK::AutoCast) {
+          put_u(a, t, "flags", 4, 1, loc);
+          put_u(a, t, "expression", ps_, expr_nodes(static_cast<const AutoCast*>(e)->operand, code, loc), loc);
+        } else {
+          auto* c = static_cast<const Cast*>(e);
+          put_u(a, t, "flags", 4, (c->truncate ? 2 : 0) | (c->no_check ? 4 : 0), loc);
+          put_u(a, t, "target_type", ps_, expr_nodes(c->type_expr, code, loc), loc);
+          put_u(a, t, "expression", ps_, expr_nodes(c->operand, code, loc), loc);
+        }
+        return a;
+      }
+      case NK::Index: {
+        auto* ix = static_cast<const Index*>(e);
+        u64 a = new_node("Code_Array_Subscript", NK_SUBSCRIPT, e, code, loc);
+        Type* t = node_type("Code_Array_Subscript");
+        put_u(a, t, "array_or_pointer_expression", ps_, expr_nodes(ix->base, code, loc), loc);
+        put_u(a, t, "subscript_expression", ps_, expr_nodes(ix->index, code, loc), loc);
+        return a;
+      }
+      case NK::Ifx: {
+        auto* x = static_cast<const Ifx*>(e);
+        u64 a = new_node("Code_If_Expression", NK_IFX, e, code, loc);
+        Type* t = node_type("Code_If_Expression");
+        put_u(a, t, "condition", ps_, expr_nodes(x->cond, code, loc), loc);
+        put_u(a, t, "then_expression", ps_, expr_nodes(x->then_e, code, loc), loc);
+        put_u(a, t, "else_expression", ps_, expr_nodes(x->else_e, code, loc), loc);
+        return a;
+      }
+      default:
+        break;
+    }
+    return new_node("Code_Node", NK_OTHER, e, code, loc);
+  }
+
+  u64 stmt_nodes(const Stmt* s, int64_t code, SourceLoc loc) {
+    if (!s) return 0;
+    switch (s->kind) {
+      case NK::Block: {
+        auto* b = static_cast<const Block*>(s);
+        u64 a = new_node("Code_Block", NK_BLOCK, s, code, loc);
+        std::vector<u64> st;
+        for (const Stmt* x : b->stmts) st.push_back(stmt_nodes(x, code, loc));
+        put_node_view(a, node_type("Code_Block"), "statements", st, loc);
+        return a;
+      }
+      case NK::ExprStmt: return expr_nodes(static_cast<const ExprStmt*>(s)->expr, code, loc);
+      case NK::Decl: {
+        auto* d = static_cast<const Decl*>(s);
+        if (d->names.size() != 1 || d->values.size() > 1 || d->is_using || d->backtick || d->is_vararg ||
+            d->is_baked || d->auto_bake || d->add_context || d->is_as || d->insert || !d->notes.empty() ||
+            !d->place_name.empty() || d->align)
+          break;
+        u64 a = new_node("Code_Declaration", NK_DECLARATION, s, code, loc);
+        Type* t = node_type("Code_Declaration");
+        put_str(a, t, "name", d->names[0].name, loc);
+        put_u(a, t, "type_inst", ps_, expr_nodes(d->type_expr, code, loc), loc);
+        if (!d->values.empty()) put_u(a, t, "expression", ps_, expr_nodes(d->values[0], code, loc), loc);
+        put_u(a, t, "flags", 4, (d->is_const ? 1 : 0) | (d->uninit ? 2 : 0), loc);
+        return a;
+      }
+      case NK::Assign: {
+        auto* as = static_cast<const Assign*>(s);
+        if (as->lhs.size() != 1 || as->rhs.size() != 1) break;
+        size_t n;
+        const auto* table = assign_table(&n);
+        u64 op = 0;
+        for (size_t i = 0; i < n; ++i)
+          if (table[i].second == as->op) op = table[i].first;
+        if (!op) break;
+        u64 a = new_node("Code_Binary_Operator", NK_BINARY, s, code, loc);
+        Type* t = node_type("Code_Binary_Operator");
+        put_u(a, t, "operator_type", 4, op, loc);
+        put_u(a, t, "left", ps_, expr_nodes(as->lhs[0], code, loc), loc);
+        put_u(a, t, "right", ps_, expr_nodes(as->rhs[0], code, loc), loc);
+        return a;
+      }
+      case NK::If: {
+        auto* i = static_cast<const If*>(s);
+        u64 a = new_node("Code_If", NK_IF, s, code, loc);
+        Type* t = node_type("Code_If");
+        put_u(a, t, "condition", ps_, expr_nodes(i->cond, code, loc), loc);
+        put_u(a, t, "then_block", ps_, stmt_nodes(i->then_s, code, loc), loc);
+        put_u(a, t, "else_block", ps_, stmt_nodes(i->else_s, code, loc), loc);
+        return a;
+      }
+      case NK::While: {
+        auto* w = static_cast<const While*>(s);
+        u64 a = new_node("Code_While", NK_WHILE, s, code, loc);
+        Type* t = node_type("Code_While");
+        put_u(a, t, "condition", ps_, expr_nodes(w->cond, code, loc), loc);
+        put_u(a, t, "block", ps_, stmt_nodes(w->body, code, loc), loc);
+        return a;
+      }
+      case NK::For: {
+        auto* f = static_cast<const For*>(s);
+        u64 a = new_node("Code_For", NK_FOR, s, code, loc);
+        Type* t = node_type("Code_For");
+        put_str(a, t, "ident_name", f->it_name, loc);
+        put_str(a, t, "index_name", f->index_name, loc);
+        put_u(a, t, "iteration_expression", ps_, expr_nodes(f->range_lo ? f->range_lo : f->iterable, code, loc), loc);
+        put_u(a, t, "iteration_expression_right", ps_, expr_nodes(f->range_hi, code, loc), loc);
+        put_u(a, t, "block", ps_, stmt_nodes(f->body, code, loc), loc);
+        put_u(a, t, "flags", 4, (f->by_pointer ? 1 : 0) | (f->reverse ? 2 : 0), loc);
+        return a;
+      }
+      case NK::Return: {
+        auto* r = static_cast<const Return*>(s);
+        if (r->backtick) break;
+        u64 a = new_node("Code_Return", NK_RETURN, s, code, loc);
+        Type* t = node_type("Code_Return");
+        Type* argt = node_type("Code_Argument");
+        u64 args = r->values.empty() ? 0 : heap_alloc((i64)r->values.size() * sz(argt), loc, al(argt));
+        for (size_t i = 0; i < r->values.size(); ++i) {
+          u64 ap = args + i * (u64)sz(argt);
+          std::memset(at(ap, sz(argt), loc), 0, (size_t)sz(argt));
+          put_u(ap, argt, "expression", ps_, expr_nodes(r->values[i], code, loc), loc);
+        }
+        u64 p = a + (u64)field(t, "arguments_unsorted");
+        store_u(at(p, 8, loc), 8, r->values.size());
+        store_u(at(p + 8, ps_, loc), ps_, args);
+        return a;
+      }
+      case NK::Break: case NK::Continue: {
+        auto* bc = static_cast<const BreakContinue*>(s);
+        if (bc->backtick) break;
+        u64 a = new_node("Code_Break_Continue", s->kind == NK::Break ? NK_BREAK : NK_CONTINUE, s, code, loc);
+        put_str(a, node_type("Code_Break_Continue"), "label", bc->label, loc);
+        return a;
+      }
+      case NK::Defer: {
+        auto* d = static_cast<const Defer*>(s);
+        if (d->backtick) break;
+        u64 a = new_node("Code_Defer", NK_DEFER, s, code, loc);
+        put_u(a, node_type("Code_Defer"), "statement", ps_, stmt_nodes(d->body, code, loc), loc);
+        return a;
+      }
+      default:
+        break;
+    }
+    return new_node("Code_Node", NK_OTHER, s, code, loc);
+  }
+
+  Val code_to_nodes(int64_t code, SourceLoc loc) {
+    Expr* e = nullptr;
+    Block* b = nullptr;
+    SourceLoc where;
+    in_.host.code_syntax(code, &e, &b, &where);
+    return make_ptr(e ? expr_nodes(e, code, loc) : stmt_nodes(b, code, loc));
+  }
+
+  // ---- back to syntax
+
+  struct NodeIn {
+    u64 kind = 0;
+    Node* src = nullptr;  // the syntax it was made from, or null
+    int64_t code = 0;     // the Code value that was part of
+    SourceLoc loc;
+  };
+  NodeIn read_node(u64 a, SourceLoc loc) {
+    Type* base = node_type("Code_Node");
+    NodeIn n;
+    n.kind = get_u(a, base, "kind", sz(conc(field_type(base, "kind"))), loc);
+    u64 sx = get_u(a, base, "ojay_syntax", 8, loc);
+    if (sx > 0 && sx <= in_.syntax.size()) {
+      n.src = in_.syntax[sx - 1].first;
+      n.code = in_.syntax[sx - 1].second;
+      n.loc = n.src->loc;
+    } else {
+      n.loc = loc;
+    }
+    if (n.kind > NK_DEFER) err(loc, "compiler_get_code: a Code_Node has kind ", n.kind, ", which is not a Code_Node.Kind");
+    return n;
+  }
+  AstContext& ast() { return in_.host.ast_context(); }
+  int64_t nodes_code_ = 0;  // the Code value the nodes being read came from (the first one found)
+
+  Expr* node_expr(u64 a, SourceLoc loc) {
+    if (!a) return nullptr;
+    NodeIn n = read_node(a, loc);
+    if (n.code && !nodes_code_) nodes_code_ = n.code;
+    SourceLoc l = n.loc;
+    switch (n.kind) {
+      case NK_OTHER:
+        if (!n.src) err(loc, "compiler_get_code: a Code_Node of kind .OTHER that compiler_get_nodes did not make");
+        if (n.src->kind >= NK::Block) err(loc, "compiler_get_code: a statement where an expression is needed");
+        return static_cast<Expr*>(n.src);
+      case NK_LITERAL: {
+        Type* t = node_type("Code_Literal");
+        u64 tag = get_u(a, t, "value_type", 4, loc);
+        u64 v = get_u(a, t, "_u64", 8, loc);
+        switch (tag) {
+          case 0: return ast().make<IntLit>(l, (unsigned __int128)v);
+          case 1: { double d; std::memcpy(&d, &v, 8); return ast().make<FloatLit>(l, d); }
+          case 2: return ast().make<BoolLit>(l, v != 0);
+          case 3: return ast().make<StringLit>(l, get_str(a, t, "_string", loc));
+          case 4: return ast().make<NullLit>(l);
+        }
+        err(loc, "compiler_get_code: a Code_Literal with value_type ", tag, " (INTEGER, FLOAT, BOOL, STRING or POINTER "
+            "for null are supported)");
+      }
+      case NK_IDENT: {
+        std::string name = get_str(a, node_type("Code_Ident"), "name", loc);
+        if (name.empty()) err(loc, "compiler_get_code: a Code_Ident without a name");
+        return ast().make<Ident>(l, name);
+      }
+      case NK_UNARY: {
+        Type* t = node_type("Code_Unary_Operator");
+        u64 op = get_u(a, t, "operator_type", 4, loc);
+        Expr* x = need_expr(get_u(a, t, "subexpression", ps_, loc), loc, "Code_Unary_Operator.subexpression");
+        UnOp u;
+        switch (op) {
+          case '-': u = UnOp::Neg; break; case '+': u = UnOp::Plus; break; case '!': u = UnOp::Not; break;
+          case '~': u = UnOp::BitNot; break; case '*': u = UnOp::AddrOf; break;
+          case OP_DEREF: u = UnOp::Deref; break;
+          default: err(loc, "compiler_get_code: unary operator ", op, " is not one ojay knows");
+        }
+        return ast().make<Unary>(l, u, x);
+      }
+      case NK_BINARY: {
+        Type* t = node_type("Code_Binary_Operator");
+        u64 op = get_u(a, t, "operator_type", 4, loc);
+        u64 left = get_u(a, t, "left", ps_, loc), right = get_u(a, t, "right", ps_, loc);
+        if (op == '.') {
+          if (!right || read_node(right, loc).kind != NK_IDENT)
+            err(loc, "compiler_get_code: the right side of a '.' operator must be a Code_Ident");
+          return ast().make<Member>(l, left ? node_expr(left, loc) : nullptr,
+                                    get_str(right, node_type("Code_Ident"), "name", loc));
+        }
+        BinOp b;
+        if (!code_binop(op, &b)) err(loc, "compiler_get_code: binary operator ", op, " where an expression is needed");
+        return ast().make<Binary>(l, b, need_expr(left, loc, "Code_Binary_Operator.left"),
+                                  need_expr(right, loc, "Code_Binary_Operator.right"));
+      }
+      case NK_CALL: {
+        Type* t = node_type("Code_Procedure_Call");
+        Type* argt = node_type("Code_Argument");
+        auto* c = ast().make<Call>(l, need_expr(get_u(a, t, "procedure_expression", ps_, loc), loc,
+                                                "Code_Procedure_Call.procedure_expression"));
+        u64 p = a + (u64)field(t, "arguments_unsorted");
+        i64 n = (i64)load_u(at(p, 8, loc), 8);
+        u64 data = load_u(at(p + 8, ps_, loc), ps_);
+        for (i64 i = 0; i < n; ++i) {
+          u64 ap = data + (u64)(i * sz(argt));
+          Arg x;
+          x.value = need_expr(get_u(ap, argt, "expression", ps_, loc), loc, "Code_Argument.expression");
+          u64 nm = get_u(ap, argt, "name", ps_, loc);
+          if (nm) {
+            x.name = get_str(nm, node_type("Code_Ident"), "name", loc);
+            x.name_loc = x.value->loc;
+          }
+          c->args.push_back(x);
+        }
+        return c;
+      }
+      case NK_CAST: {
+        Type* t = node_type("Code_Cast");
+        u64 flags = get_u(a, t, "flags", 4, loc);
+        Expr* x = need_expr(get_u(a, t, "expression", ps_, loc), loc, "Code_Cast.expression");
+        if (flags & 1) return ast().make<AutoCast>(l, x);
+        auto* c = ast().make<Cast>(l, need_expr(get_u(a, t, "target_type", ps_, loc), loc, "Code_Cast.target_type"), x);
+        c->truncate = flags & 2;
+        c->no_check = flags & 4;
+        return c;
+      }
+      case NK_SUBSCRIPT: {
+        Type* t = node_type("Code_Array_Subscript");
+        return ast().make<Index>(l, need_expr(get_u(a, t, "array_or_pointer_expression", ps_, loc), loc, "the array"),
+                                 need_expr(get_u(a, t, "subscript_expression", ps_, loc), loc, "the subscript"));
+      }
+      case NK_IFX: {
+        Type* t = node_type("Code_If_Expression");
+        return ast().make<Ifx>(l, need_expr(get_u(a, t, "condition", ps_, loc), loc, "the condition"),
+                               need_expr(get_u(a, t, "then_expression", ps_, loc), loc, "then_expression"),
+                               need_expr(get_u(a, t, "else_expression", ps_, loc), loc, "else_expression"));
+      }
+      default:
+        err(loc, "compiler_get_code: a statement node (kind ", n.kind, ") where an expression is needed");
+    }
+  }
+  Expr* need_expr(u64 a, SourceLoc loc, const char* what) {
+    if (!a) err(loc, "compiler_get_code: ", what, " is null");
+    return node_expr(a, loc);
+  }
+
+  Stmt* node_stmt(u64 a, SourceLoc loc) {
+    if (!a) return nullptr;
+    NodeIn n = read_node(a, loc);
+    if (n.code && !nodes_code_) nodes_code_ = n.code;
+    SourceLoc l = n.loc;
+    switch (n.kind) {
+      case NK_OTHER:
+        if (!n.src) err(loc, "compiler_get_code: a Code_Node of kind .OTHER that compiler_get_nodes did not make");
+        if (n.src->kind >= NK::Block) return static_cast<Stmt*>(n.src);
+        return ast().make<ExprStmt>(l, static_cast<Expr*>(n.src));
+      case NK_BLOCK: {
+        Type* t = node_type("Code_Block");
+        auto* b = ast().make<Block>(l);
+        u64 p = a + (u64)field(t, "statements");
+        i64 cnt = (i64)load_u(at(p, 8, loc), 8);
+        u64 data = load_u(at(p + 8, ps_, loc), ps_);
+        for (i64 i = 0; i < cnt; ++i)
+          if (Stmt* s = node_stmt(load_u(at(data + (u64)(i * ps_), ps_, loc), ps_), loc)) b->stmts.push_back(s);
+        return b;
+      }
+      case NK_DECLARATION: {
+        Type* t = node_type("Code_Declaration");
+        auto* d = ast().make<Decl>(l);
+        std::string name = get_str(a, t, "name", loc);
+        if (name.empty()) err(loc, "compiler_get_code: a Code_Declaration without a name");
+        d->names.push_back(DeclName{name, l});
+        u64 flags = get_u(a, t, "flags", 4, loc);
+        d->is_const = flags & 1;
+        d->uninit = flags & 2;
+        u64 ti = get_u(a, t, "type_inst", ps_, loc), ex = get_u(a, t, "expression", ps_, loc);
+        if (ti) d->type_expr = node_expr(ti, loc);
+        if (ex) d->values.push_back(node_expr(ex, loc));
+        if (!ti && !ex) err(loc, "compiler_get_code: a Code_Declaration needs a type_inst or an expression");
+        return d;
+      }
+      case NK_BINARY: {
+        Type* t = node_type("Code_Binary_Operator");
+        u64 op = get_u(a, t, "operator_type", 4, loc);
+        size_t cnt;
+        const auto* table = assign_table(&cnt);
+        for (size_t i = 0; i < cnt; ++i)
+          if (table[i].first == op) {
+            auto* as = ast().make<Assign>(l, table[i].second);
+            as->lhs.push_back(need_expr(get_u(a, t, "left", ps_, loc), loc, "the left side of an assignment"));
+            as->rhs.push_back(need_expr(get_u(a, t, "right", ps_, loc), loc, "the right side of an assignment"));
+            return as;
+          }
+        break;
+      }
+      case NK_IF: {
+        Type* t = node_type("Code_If");
+        Expr* c = need_expr(get_u(a, t, "condition", ps_, loc), loc, "Code_If.condition");
+        Stmt* th = node_stmt(get_u(a, t, "then_block", ps_, loc), loc);
+        if (!th) err(loc, "compiler_get_code: Code_If.then_block is null");
+        return ast().make<If>(l, c, th, node_stmt(get_u(a, t, "else_block", ps_, loc), loc));
+      }
+      case NK_WHILE: {
+        Type* t = node_type("Code_While");
+        Expr* c = need_expr(get_u(a, t, "condition", ps_, loc), loc, "Code_While.condition");
+        Stmt* body = node_stmt(get_u(a, t, "block", ps_, loc), loc);
+        if (!body) err(loc, "compiler_get_code: Code_While.block is null");
+        return ast().make<While>(l, c, body);
+      }
+      case NK_FOR: {
+        Type* t = node_type("Code_For");
+        auto* f = ast().make<For>(l);
+        std::string it = get_str(a, t, "ident_name", loc), ix = get_str(a, t, "index_name", loc);
+        f->it_name = it.empty() ? "it" : it;
+        f->index_name = ix.empty() ? "it_index" : ix;
+        f->named = f->it_name != "it" || f->index_name != "it_index";
+        u64 flags = get_u(a, t, "flags", 4, loc);
+        f->by_pointer = flags & 1;
+        f->reverse = flags & 2;
+        Expr* lo = need_expr(get_u(a, t, "iteration_expression", ps_, loc), loc, "Code_For.iteration_expression");
+        u64 hi = get_u(a, t, "iteration_expression_right", ps_, loc);
+        if (hi) {
+          f->range_lo = lo;
+          f->range_hi = node_expr(hi, loc);
+        } else {
+          f->iterable = lo;
+        }
+        f->body = node_stmt(get_u(a, t, "block", ps_, loc), loc);
+        if (!f->body) err(loc, "compiler_get_code: Code_For.block is null");
+        return f;
+      }
+      case NK_RETURN: {
+        Type* t = node_type("Code_Return");
+        Type* argt = node_type("Code_Argument");
+        auto* r = ast().make<Return>(l);
+        u64 p = a + (u64)field(t, "arguments_unsorted");
+        i64 cnt = (i64)load_u(at(p, 8, loc), 8);
+        u64 data = load_u(at(p + 8, ps_, loc), ps_);
+        for (i64 i = 0; i < cnt; ++i)
+          r->values.push_back(need_expr(get_u(data + (u64)(i * sz(argt)), argt, "expression", ps_, loc), loc,
+                                        "Code_Argument.expression"));
+        return r;
+      }
+      case NK_BREAK: case NK_CONTINUE:
+        return ast().make<BreakContinue>(n.kind == NK_BREAK ? NK::Break : NK::Continue, l,
+                                         get_str(a, node_type("Code_Break_Continue"), "label", loc));
+      case NK_DEFER: {
+        Stmt* body = node_stmt(get_u(a, node_type("Code_Defer"), "statement", ps_, loc), loc);
+        if (!body) err(loc, "compiler_get_code: Code_Defer.statement is null");
+        return ast().make<Defer>(l, body);
+      }
+      default:
+        break;
+    }
+    return ast().make<ExprStmt>(l, node_expr(a, loc));
+  }
+
+  Val nodes_to_code(u64 root, SourceLoc loc) {
+    if (!root) err(loc, "compiler_get_code: the root is null");
+    nodes_code_ = 0;
+    NodeIn n = read_node(root, loc);
+    Expr* e = nullptr;
+    Block* b = nullptr;
+    bool stmt = n.kind == NK_BLOCK || n.kind == NK_DECLARATION || n.kind == NK_IF || n.kind == NK_WHILE ||
+                n.kind == NK_FOR || n.kind == NK_RETURN || n.kind == NK_BREAK || n.kind == NK_CONTINUE ||
+                n.kind == NK_DEFER || (n.kind == NK_OTHER && n.src && n.src->kind >= NK::Block);
+    if (n.kind == NK_BINARY) {  // an assignment is a statement
+      u64 op = get_u(root, node_type("Code_Binary_Operator"), "operator_type", 4, loc);
+      BinOp ignored;
+      stmt = op != '.' && !code_binop(op, &ignored);
+    }
+    if (!stmt) {
+      e = node_expr(root, loc);
+    } else {
+      Stmt* s = node_stmt(root, loc);
+      if (s->kind == NK::Block) {
+        b = static_cast<Block*>(s);
+      } else {
+        b = ast().make<Block>(s->loc);
+        b->stmts.push_back(s);
+      }
+    }
+    Val v(8);
+    store_u(v.data(), 8, (u64)in_.host.make_code(e, b, nodes_code_));
+    return v;
+  }
+
+  // ---- the message loop (module Compiler)
+
+  // `[] *Code_Note` of `notes`, at member f of the struct at a.
+  void put_notes(u64 a, Type* t, const char* f, const std::vector<std::string>& notes, SourceLoc loc) {
+    std::vector<u64> ns;
+    for (const std::string& n : notes) {
+      u64 x = new_node("Code_Note", 18, nullptr, 0, loc);
+      put_str(x, node_type("Code_Note"), "text", n, loc);
+      ns.push_back(x);
+    }
+    put_node_view(a, t, f, ns, loc);
+  }
+
+  // A top-level declaration as a Code_Declaration (for .TYPECHECKED).
+  u64 declaration_node(Symbol* s, SourceLoc loc) {
+    Decl* d = s->decl;
+    u64 a = new_node("Code_Declaration", NK_DECLARATION, d, 0, loc);
+    Type* t = node_type("Code_Declaration");
+    Type* base = node_type("Code_Node");
+    if (d) {
+      put_u(a, base, "l0", 4, s->loc.line, loc);
+      put_u(a, base, "c0", 4, s->loc.col, loc);
+    }
+    put_str(a, t, "name", s->name, loc);
+    bool is_const = d && d->is_const;
+    put_u(a, t, "flags", 4, is_const ? 1 : 0, loc);
+    Expr* value = d && s->decl_index < d->values.size() ? d->values[s->decl_index] : nullptr;
+    std::vector<std::string> notes;
+    if (d) notes = d->notes;
+    switch (s->kind) {
+      case SymKind::Proc: case SymKind::PolyProc: {
+        ProcLit* p = s->kind == SymKind::Proc ? s->proc : (value && value->kind == NK::ProcLit ? static_cast<ProcLit*>(value) : nullptr);
+        u64 h = new_node("Code_Procedure_Header", 20, p, 0, loc);
+        Type* ht = node_type("Code_Procedure_Header");
+        put_str(h, ht, "name", s->name, loc);
+        uint32_t flags = s->kind == SymKind::PolyProc ? 1 : 0;
+        if (p) {
+          flags |= (p->is_macro ? 2 : 0) | (p->is_foreign ? 4 : 0) | (p->c_call ? 8 : 0) | (p->is_compiler ? 0x10 : 0);
+          notes.insert(notes.end(), p->notes.begin(), p->notes.end());
+          put_notes(h, ht, "notes", p->notes, loc);
+        }
+        put_u(h, ht, "procedure_flags", 4, flags, loc);
+        if (s->kind == SymKind::Proc && s->type) {
+          put_u(h, base, "type", ps_, in_.type_id(s->type), loc);
+          put_u(a, base, "type", ps_, in_.type_id(s->type), loc);
+        }
+        put_u(a, t, "expression", ps_, h, loc);
+        break;
+      }
+      case SymKind::Type: case SymKind::PolyStruct: {
+        put_u(a, base, "type", ps_, in_.type_id(in_.T.type_t), loc);
+        Type* defined = s->kind == SymKind::Type ? s->cv.t : nullptr;
+        if (defined) notes.insert(notes.end(), defined->struct_notes.begin(), defined->struct_notes.end());
+        if (defined && conc(defined)->kind == TypeKind::Struct) {
+          u64 x = new_node("Code_Struct", 19, value, 0, loc);
+          put_u(x, node_type("Code_Struct"), "defined_type", ps_, in_.type_id(defined), loc);
+          put_u(x, base, "type", ps_, in_.type_id(in_.T.type_t), loc);
+          put_u(a, t, "expression", ps_, x, loc);
+        } else if (value) {
+          put_u(a, t, "expression", ps_, expr_nodes(value, 0, loc), loc);
+        }
+        break;
+      }
+      default:
+        if (s->type) put_u(a, base, "type", ps_, in_.type_id(s->type), loc);
+        if (d && d->type_expr) put_u(a, t, "type_inst", ps_, expr_nodes(d->type_expr, 0, loc), loc);
+        if (value) put_u(a, t, "expression", ps_, expr_nodes(value, 0, loc), loc);
+        break;
+    }
+    put_notes(a, t, "notes", notes, loc);
+    return a;
+  }
+
+  Val wait_for_message(SourceLoc loc) {
+    InterpHost::CompilerMessage m = in_.host.compiler_next_message(loc);
+    const char* tn = m.kind == 4 ? "Message_Typechecked" : m.kind == 3 ? "Message_Phase" : "Message_Complete";
+    Type* t = node_type(tn);
+    u64 a = heap_alloc(sz(t), loc, al(t));
+    std::memset(at(a, sz(t), loc), 0, (size_t)sz(t));
+    Type* base = node_type("Message");
+    put_u(a, base, "kind", 4, (u64)m.kind, loc);
+    put_u(a, base, "workspace", 8, 1, loc);
+    if (m.kind == 3) put_u(a, t, "phase", 4, (u64)m.phase, loc);
+    if (m.kind == 4) {
+      Type* item = conc(field_type(t, "declarations"))->elem;  // Typechecked(Code_Declaration)
+      int64_t isz = sz(item);
+      u64 items = m.declarations.empty() ? 0 : heap_alloc((i64)m.declarations.size() * isz, loc, al(item));
+      for (size_t i = 0; i < m.declarations.size(); ++i) {
+        u64 ip = items + i * (u64)isz;
+        std::memset(at(ip, isz, loc), 0, (size_t)isz);
+        put_u(ip, item, "expression", ps_, declaration_node(m.declarations[i], loc), loc);
+      }
+      u64 p = a + (u64)field(t, "declarations");
+      store_u(at(p, 8, loc), 8, m.declarations.size());
+      store_u(at(p + 8, ps_, loc), ps_, items);
+    }
+    return make_ptr(a);
   }
 
   // ------------------------------------------------------------------ default values
@@ -2340,6 +3078,20 @@ class Machine {
         return make_ptr(heap_alloc(n, loc, (i64)get_int(eval(a[1]), a[1]->type)));
       }
       case Builtin::RawFree: heap_free(get_ptr(eval(a[0])), loc); return Val();
+      case Builtin::CodeToNodes: return code_to_nodes((int64_t)load_u(eval(a[0]).data(), 8), loc);
+      case Builtin::NodesToCode: return nodes_to_code(get_ptr(eval(a[0])), loc);
+      case Builtin::CompilerIntercept:
+        in_.host.compiler_intercept(load_u(eval(a[0]).data(), 1) != 0, loc);
+        return Val();
+      case Builtin::CompilerWaitForMessage: return wait_for_message(loc);
+      case Builtin::AddBuildString: {
+        Val v = eval(a[0]);
+        i64 n = (i64)load_u(v.data(), 8);
+        u64 d = load_u(v.data() + 8, ps_);
+        std::string text = n > 0 ? std::string((const char*)at(d, n, loc), (size_t)n) : std::string();
+        in_.host.compiler_add_build_string(text, loc);
+        return Val();
+      }
       case Builtin::RawRealloc: {
         u64 p = get_ptr(eval(a[0]));
         i64 n = (i64)get_int(eval(a[1]), a[1]->type);

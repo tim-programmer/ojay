@@ -176,6 +176,9 @@ enum class Builtin {
   Sqrt, Sin, Cos, Tan, Atan2, Pow, Floor, Ceil, Round, Exp, Log,
   // Hardware (ojay extension for memory-mapped I/O)
   VolatileLoad, VolatileStore,
+  // Module Compiler (compile time only): Code <-> Code_Node trees
+  CodeToNodes, NodesToCode,
+  CompilerIntercept, CompilerWaitForMessage, AddBuildString,
 };
 
 struct Call : Expr {
@@ -273,9 +276,11 @@ struct ProcLit : Expr {
   bool always_inline = false;  // `f :: inline (...) {...}`: every call is inlined
   bool must = false;        // `-> T #must`: a call's result must be used
   bool deprecated = false;  // #deprecated "note": each call is warned about
+  bool is_compiler = false; // #compiler: runs only at compile time (#run, #insert, #modify), never in the program
   std::string deprecated_note;
   Block* modify = nullptr;  // #modify { ... }: runs when a polymorphic procedure is instantiated
   std::string name;       // bound name, for diagnostics and symbol names
+  std::vector<std::string> notes;  // `f :: () @note { ... }`: the notes, without '@'
   // sema
   Scope* scope = nullptr;
   bool signature_done = false;
@@ -363,6 +368,11 @@ struct DirectiveExpr : Expr {
   Expr* operand = nullptr;
   int module_id = -1;  // `#import` (named import): driver's index into Program::modules
   Expr* message = nullptr;  // `#assert cond, "message";`
+  // `#insert,scope(target) x`: the code is checked where Code `target` was
+  // written (`scope()`: right here) instead of where x was written.
+  bool insert_scope = false;
+  Expr* scope_target = nullptr;
+  bool stallable = false;  // `#run,stallable`: runs once the rest of the program is typechecked (message loop)
   DirectiveExpr(SourceLoc l, std::string n, Expr* e) : Expr(NK::Directive, l), name(std::move(n)), operand(e) {}
 };
 
@@ -559,6 +569,8 @@ struct StaticIf : Stmt {
 struct Insert : Stmt {
   Expr* operand;
   Block* remove_code = nullptr;  // `#insert (remove = { ... }) body;`: what `remove it` in the body does
+  bool insert_scope = false;     // `#insert,scope(target) x;` (see DirectiveExpr)
+  Expr* scope_target = nullptr;
   Block* result = nullptr;
   Insert(SourceLoc l, Expr* e) : Stmt(NK::Insert, l), operand(e) {}
 };

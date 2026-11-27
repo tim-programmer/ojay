@@ -1,0 +1,4 @@
+ok: x + y == 7
+check failed: x * y > 20 && foo(x, scale = 2) != 0
+z = 12
+10 nodes

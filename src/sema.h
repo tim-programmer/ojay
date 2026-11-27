@@ -60,6 +60,9 @@ struct Scope {
   bool is_module = false;        // top-level scope of the program or of a module
   std::vector<Scope*> imports;   // module scopes made visible by #import (not transitive)
   Type* this_type = nullptr;     // a struct body's scope (its constants): the struct, which #this names
+  // `#insert,scope()`: names not found from this scope outwards are looked up
+  // from `also` (where the inserted code was written).
+  Scope* also = nullptr;
 };
 
 // The main program or an imported module: its files' top-level statements.
